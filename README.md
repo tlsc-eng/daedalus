@@ -515,7 +515,9 @@ information rather than triggering the install dialog).
 
 **Workspace**
 
-- Find and replace in project (`cmd-shift-f`): a Search drawer tab honouring `.gitignore` and
+- Search everything (`cmd-shift-f`): one picker for files (5), workspace symbols (5) and commands (3)
+  under group headers; `tab` and `shift-tab` jump between groups, Enter runs a row as `cmd-p` does.
+- Find and replace in project (View menu, or the palette's Find in project): a Search drawer tab honouring `.gitignore` and
   skipping binary files and files over 1 MB; up to 2000 matches. Up/Down walk the matches, Enter
   opens one. It has the editor's three toggles and keys (`cmd-alt-c`, `cmd-alt-w`, `cmd-alt-r`);
   with Match Case off, case does not matter even when the query has capitals, as in VS Code. The
@@ -1027,7 +1029,7 @@ Keys use GPUI's binding syntax as written in the source. `1…9` means each digi
 | `cmd-alt-b` | Toggle project sidebar |
 | `cmd-shift-s` | Save as |
 | `cmd-shift-v` | Markdown preview beside the editor / back to the source |
-| `cmd-shift-f` | Find in project |
+| `cmd-shift-f` | Search everything: files, symbols and commands |
 | `cmd-,` | Settings tab |
 | `cmd-k cmd-s` | Keyboard Shortcuts tab (not in a terminal, where `cmd-k` clears the scrollback at once) |
 | `cmd-alt-shift-g` | Toggle inline blame |

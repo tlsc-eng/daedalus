@@ -19,6 +19,8 @@ use super::send_selection::{Mention, SendTo};
 use crate::actions;
 use daedalus_term::ClaudeState;
 
+mod spotlight;
+
 const MAX_FILES: usize = 20_000;
 const MAX_ROWS: usize = 50;
 /// A file's whole outline is listed, as VS Code does, up to this many symbols.
@@ -111,6 +113,8 @@ pub(super) enum Mode {
     ReviewComments,
     /// The Claude sessions that can take the editor's selection.
     SendSelection,
+    /// Files, workspace symbols and commands at once, under group headers.
+    Everything,
 }
 
 fn now_secs() -> i64 {
@@ -151,6 +155,7 @@ fn placeholder_hint(mode: Mode) -> &'static str {
         Mode::BringCommit => "Type a commit message",
         Mode::BringBack => "No matching choices",
         Mode::SendSelection => "No matching sessions",
+        Mode::Everything => "Nothing matches",
         _ => "No matching commands",
     }
 }
@@ -195,6 +200,7 @@ pub(super) const TERMINAL_COMMANDS: &[(&str, &str)] = &[
 /// Commands offered for starting Claude; typing anything else offers that too.
 const CLAUDE_COMMANDS: &[&str] = &["claude", "claude-tlsc", "claude-ai"];
 
+#[derive(Clone)]
 pub(super) struct Entry {
     label: String,
     detail: Option<String>,
@@ -221,6 +227,7 @@ pub(super) struct Palette {
     /// Bumped per symbol request so a slow answer never replaces a newer one.
     asked: u64,
     symbols_task: Option<Task<()>>,
+    spotlight: Option<spotlight::State>,
     _subscription: Subscription,
 }
 
@@ -260,6 +267,7 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
             Box::new(actions::RevealInTree),
         ),
         ("Find in project", Box::new(actions::FindInProject)),
+        ("Search everything", Box::new(actions::SearchEverything)),
         ("Run task…", Box::new(actions::RunTask)),
         ("Tests", Box::new(actions::ShowTests)),
         (
@@ -696,6 +704,7 @@ impl Shell {
             Mode::BringCommit => "Commit message for the worktree's changes…",
             Mode::BringBack => "Bring the worktree's changes back as…",
             Mode::SendSelection => "Send the selection to…",
+            Mode::Everything => "Search files, symbols and commands…",
         };
         let input = cx.new(|cx| TextInput::new(placeholder, cx));
         let subscription = cx.subscribe_in(
@@ -731,7 +740,8 @@ impl Shell {
             | Mode::BringCommit
             | Mode::BringBack
             | Mode::Symbols
-            | Mode::WorkspaceSymbols => Vec::new(),
+            | Mode::WorkspaceSymbols
+            | Mode::Everything => Vec::new(),
             Mode::Claude => claude_entries(""),
             Mode::Commands => self.command_entries(window, cx),
             Mode::Recent => self.recent_entries(),
@@ -741,7 +751,16 @@ impl Shell {
             Mode::ReviewComments => self.review_comment_entries(cx),
             Mode::SendSelection => self.send_selection_entries(cx),
         };
-        let files = matches!(mode, Mode::Files | Mode::FilesBeside);
+        let files = matches!(mode, Mode::Files | Mode::FilesBeside | Mode::Everything);
+        let commands = (mode == Mode::Everything).then(|| self.command_entries(window, cx));
+        let seed = (mode == Mode::Everything)
+            .then(|| {
+                self.focused_editor()
+                    .and_then(|e| e.read(cx).cursor())
+                    .and_then(|(_, _, selection)| selection)
+                    .filter(|s| !s.contains('\n'))
+            })
+            .flatten();
         window.focus(&input.focus_handle(cx));
         self.palette_closing = None;
         self.palette = Some(Palette {
@@ -756,6 +775,10 @@ impl Shell {
             origin: None,
             asked: 0,
             symbols_task: None,
+            spotlight: commands.map(|commands| spotlight::State {
+                commands,
+                ..Default::default()
+            }),
             _subscription: subscription,
         });
         if files {
@@ -763,6 +786,15 @@ impl Shell {
         }
         if mode == Mode::Symbols {
             self.load_document_symbols(cx);
+        }
+        if let Some(seed) = seed
+            && let Some(palette) = &self.palette
+        {
+            // Selected, as in the project search, so typing replaces the seed.
+            palette.input.update(cx, |i, cx| {
+                i.set_text(seed, cx);
+                i.select_all(cx);
+            });
         }
         self.filter_palette(cx);
         cx.notify();
@@ -1034,26 +1066,16 @@ impl Shell {
         let Some(palette) = self
             .palette
             .as_mut()
-            .filter(|p| matches!(p.mode, Mode::Files | Mode::FilesBeside))
+            .filter(|p| matches!(p.mode, Mode::Files | Mode::FilesBeside | Mode::Everything))
         else {
             return;
         };
-        palette.entries = files
-            .iter()
-            .map(|rel| {
-                let (dir, name) = match rel.rfind('/') {
-                    Some(i) => (Some(rel[..i].to_string()), rel[i + 1..].to_string()),
-                    None => (None, rel.clone()),
-                };
-                Entry {
-                    label: name,
-                    detail: dir,
-                    kind: None,
-                    key: rel.clone(),
-                    target: Target::File(root.join(rel)),
-                }
-            })
-            .collect();
+        if let Some(spotlight) = palette.spotlight.as_mut() {
+            spotlight.files = file_entries(root, files);
+            self.refresh_spotlight(true, cx);
+            return;
+        }
+        palette.entries = file_entries(root, files);
         self.filter_palette(cx);
     }
 
@@ -1069,8 +1091,10 @@ impl Shell {
                 self.switch_palette(wanted, window, cx);
             }
         }
-        if self.palette.as_ref().map(|p| p.mode) == Some(Mode::WorkspaceSymbols) {
-            self.request_workspace_symbols(cx);
+        match self.palette.as_ref().map(|p| p.mode) {
+            Some(Mode::WorkspaceSymbols) => self.request_workspace_symbols(cx),
+            Some(Mode::Everything) => self.request_everything_symbols(cx),
+            _ => {}
         }
         self.filter_palette(cx);
     }
@@ -1187,13 +1211,7 @@ impl Shell {
         palette.status = palette.entries.is_empty().then_some("Searching symbols…");
         palette.symbols_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SYMBOL_QUERY_DELAY).await;
-            let mut symbols = Vec::new();
-            for client in clients {
-                match client.workspace_symbols(&query).await {
-                    Ok(found) => symbols.extend(found),
-                    Err(why) => tracing::debug!("workspace symbols failed: {why}"),
-                }
-            }
+            let symbols = fetch_workspace_symbols(clients, &query).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(palette) = this.palette.as_mut().filter(|p| p.asked == asked) else {
                     return;
@@ -1203,6 +1221,60 @@ impl Shell {
                 this.filter_palette(cx);
             });
         }));
+    }
+
+    /// Search Everything's symbols: asked for once typing pauses, from the second character on.
+    fn request_everything_symbols(&mut self, cx: &mut Context<Self>) {
+        let root = self.active_root();
+        let clients = root
+            .as_ref()
+            .map(|r| self.project_clients(r))
+            .unwrap_or_default();
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        let query = Self::palette_needle(palette, cx);
+        palette.asked += 1;
+        let asked = palette.asked;
+        if query.chars().count() < 2 || clients.is_empty() {
+            palette.symbols_task = None;
+            if let Some(spotlight) = palette.spotlight.as_mut() {
+                spotlight.symbols.clear();
+            }
+            return;
+        }
+        palette.symbols_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SYMBOL_QUERY_DELAY).await;
+            let symbols = fetch_workspace_symbols(clients, &query).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(palette) = this.palette.as_mut().filter(|p| p.asked == asked) else {
+                    return;
+                };
+                if let Some(spotlight) = palette.spotlight.as_mut() {
+                    spotlight.symbols = symbol_entries(symbols, None, root.as_deref());
+                }
+                this.refresh_spotlight(true, cx);
+            });
+        }));
+    }
+
+    /// Re-ranks Search Everything; rows that arrive late keep the selection where it was.
+    fn refresh_spotlight(&mut self, keep_selection: bool, cx: &mut Context<Self>) {
+        let selected = self.palette.as_ref().map_or(0, |p| p.selected);
+        self.filter_palette(cx);
+        if keep_selection && let Some(palette) = self.palette.as_mut() {
+            palette.selected = selected.min(palette.hits.len().saturating_sub(1));
+        }
+    }
+
+    /// Tab and Shift-Tab in Search Everything: the first row of the next or previous group.
+    fn jump_spotlight_group(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(p) = self.palette.as_mut()
+            && let Some(spotlight) = &p.spotlight
+        {
+            p.selected = spotlight::jump(&spotlight.sections, p.selected, step);
+            cx.notify();
+        }
     }
 
     /// Moves the editor to the selected symbol while the list is open, as VS Code previews it.
@@ -1337,6 +1409,18 @@ impl Shell {
                     target: Target::Branch(b.pick),
                 })
                 .collect();
+        }
+        if let Some(spotlight) = palette.spotlight.as_mut() {
+            let (entries, hits, sections) = spotlight::arrange(spotlight, &query);
+            palette.entries = entries;
+            palette.hits = hits;
+            spotlight.sections = sections;
+            palette.selected = 0;
+            palette.status = query
+                .is_empty()
+                .then_some("Search files, symbols, commands and text");
+            cx.notify();
+            return;
         }
         let limit = match palette.mode {
             Mode::Symbols | Mode::WorkspaceSymbols => MAX_SYMBOL_ROWS,
@@ -1477,7 +1561,12 @@ impl Shell {
                         )
                     })
                     .collect();
-                div()
+                let header = palette
+                    .spotlight
+                    .as_ref()
+                    .and_then(|s| s.sections.iter().find(|(_, rows)| rows.start == row))
+                    .map(|(group, _)| group.title());
+                let row_el = div()
                     .id(("palette-row", row))
                     .h(t.ui(32.))
                     .px(t.ui(12.))
@@ -1542,17 +1631,46 @@ impl Shell {
                                     .text_color(t.color.content_muted)
                                     .child(k)
                             }),
-                    )
-                    .into_any_element()
+                    );
+                match header {
+                    Some(title) => div()
+                        .child(
+                            div()
+                                .h(t.ui(24.))
+                                .px(t.ui(12.))
+                                .flex()
+                                .items_center()
+                                .text_size(t.typography.caption)
+                                .text_color(t.color.content_muted)
+                                .child(title),
+                        )
+                        .child(row_el)
+                        .into_any_element(),
+                    None => row_el.into_any_element(),
+                }
             })
             .collect();
 
         let empty = palette.hits.is_empty() && !palette.input.read(cx).text().is_empty();
         let message = palette.status.or(empty.then_some(palette.placeholder_hint));
+        let everything = palette.spotlight.is_some();
         let panel = div()
             .id("palette")
-            .w(t.ui(560.))
-            .max_h(t.ui(44. + 32. * 8.5))
+            .when(everything, |el| {
+                el.key_context("Spotlight")
+                    .on_action(cx.listener(|this, _: &actions::NextGroup, _, cx| {
+                        this.jump_spotlight_group(1, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &actions::PrevGroup, _, cx| {
+                        this.jump_spotlight_group(-1, cx)
+                    }))
+            })
+            .w(t.ui(if everything { 640. } else { 560. }))
+            .max_h(t.ui(if everything {
+                44. + 32. * 14.
+            } else {
+                44. + 32. * 8.5
+            }))
             .flex()
             .flex_col()
             .bg(t.color.surface)
@@ -1676,6 +1794,40 @@ fn symbol_entries(symbols: Vec<Symbol>, file: Option<&Path>, root: Option<&Path>
             }
         })
         .collect()
+}
+
+fn file_entries(root: &Path, files: &[String]) -> Vec<Entry> {
+    files
+        .iter()
+        .map(|rel| {
+            let (dir, name) = match rel.rfind('/') {
+                Some(i) => (Some(rel[..i].to_string()), rel[i + 1..].to_string()),
+                None => (None, rel.clone()),
+            };
+            Entry {
+                label: name,
+                detail: dir,
+                kind: None,
+                key: rel.clone(),
+                target: Target::File(root.join(rel)),
+            }
+        })
+        .collect()
+}
+
+/// Every ready server's symbols matching `query`; a server that fails is skipped.
+async fn fetch_workspace_symbols(
+    clients: Vec<Rc<daedalus_lsp::Client>>,
+    query: &str,
+) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    for client in clients {
+        match client.workspace_symbols(query).await {
+            Ok(found) => symbols.extend(found),
+            Err(why) => tracing::debug!("workspace symbols failed: {why}"),
+        }
+    }
+    symbols
 }
 
 fn claude_entries(query: &str) -> Vec<Entry> {
