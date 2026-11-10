@@ -537,6 +537,25 @@ impl Shell {
         self.refresh_settings_views(cx);
     }
 
+    /// Like `write_setting`, but a failed write changes nothing and reports false.
+    pub(super) fn write_setting_strict(
+        &mut self,
+        keys: &[&str],
+        value: Value,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let written = settings::write(keys, &value)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|text| settings::parse(&text));
+        let ok = written.is_ok();
+        match written {
+            Ok((file, _)) => self.apply_settings(file, None, cx),
+            Err(why) => self.transient_notice("settings.json was not updated", why, cx),
+        }
+        self.refresh_settings_views(cx);
+        ok
+    }
+
     /// Removes a setting from settings.json, as the Settings tab's Reset does.
     fn unset_setting(&mut self, keys: &[&str], cx: &mut Context<Self>) {
         let unset = settings::ensure_file()

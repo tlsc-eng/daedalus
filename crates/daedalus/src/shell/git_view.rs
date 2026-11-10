@@ -1101,8 +1101,9 @@ impl Shell {
     /// and keeps the choice in settings.json.
     pub(super) fn toggle_blame(&mut self, cx: &mut Context<Self>) {
         let on = !self.git.blame_on;
-        self.set_inline_blame(on, cx);
-        self.write_setting(&["git", "inline_blame"], on.into(), cx);
+        if !self.write_setting_strict(&["git", "inline_blame"], on.into(), cx) {
+            return;
+        }
         let (title, body) = if on {
             (
                 "Inline blame is on",
