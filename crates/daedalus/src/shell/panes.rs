@@ -861,12 +861,7 @@ impl Shell {
             let programs = self.running_programs(&root, [item], cx);
             if !programs.is_empty() {
                 return self.confirm_end_programs(programs, window, cx, move |this, window, cx| {
-                    // The project may have changed while the prompt was up; ids repeat across projects.
-                    if this.active_root().as_deref() == Some(root.as_path()) {
-                        this.close_pane_item(pane, item, window, cx);
-                    } else {
-                        this.remove_item_from(&root, item, window, cx);
-                    }
+                    this.close_after_prompt(&root, pane, item, window, cx);
                 });
             }
         }
@@ -879,15 +874,31 @@ impl Shell {
                 if !close {
                     return;
                 }
-                // The project may have changed while the prompt was up; ids repeat across projects.
-                if this.active_root().as_deref() == Some(root.as_path()) {
-                    this.close_pane_item(pane, item, window, cx);
-                } else {
-                    this.remove_item_from(&root, item, window, cx);
-                }
+                this.close_after_prompt(&root, pane, item, window, cx);
             });
         }
         self.close_pane_item(pane, item, window, cx);
+    }
+
+    /// The project may have changed, or the phone closed the tab, while the prompt was up; ids repeat across projects.
+    fn close_after_prompt(
+        &mut self,
+        root: &Path,
+        pane: PaneId,
+        item: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let still_there = self.active_root().as_deref() == Some(root)
+            && self
+                .active_layout()
+                .and_then(|l| l.pane(pane))
+                .is_some_and(|p| p.items.iter().any(|i| i.id == item));
+        if still_there {
+            self.close_pane_item(pane, item, window, cx);
+        } else {
+            self.remove_item_from(root, item, window, cx);
+        }
     }
 
     /// Before an editor with unsaved changes closes: saves it quietly when auto save is on (as VS Code

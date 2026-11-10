@@ -403,10 +403,8 @@ impl TerminalView {
 
     /// The program in the foreground when it is not a shell prompt and the shell is still alive.
     pub fn running_program(&self) -> Option<String> {
-        if self.terminal.as_ref().is_some_and(|t| t.exit.is_some()) {
-            return None;
-        }
-        self.foreground.as_ref().and_then(running_name)
+        let exited = self.terminal.as_ref().is_some_and(|t| t.exit.is_some());
+        running_program_of(exited, self.foreground.as_ref())
     }
 
     /// An older session daemon still runs this terminal's shell, so it cannot attach.
@@ -1967,6 +1965,13 @@ fn is_claude_process(p: &Process) -> bool {
         || p.path.to_string_lossy().contains("/claude/versions/")
 }
 
+fn running_program_of(exited: bool, fg: Option<&Process>) -> Option<String> {
+    if exited {
+        return None;
+    }
+    fg.and_then(running_name)
+}
+
 fn running_name(p: &Process) -> Option<String> {
     if is_shell(&p.name) {
         None
@@ -2220,6 +2225,16 @@ mod tests {
     fn running_name_names_claude() {
         let p = process("2.1.294", "/home/u/.local/share/claude/versions/2.1.294");
         assert_eq!(running_name(&p).as_deref(), Some("Claude"));
+    }
+
+    #[test]
+    fn exited_shell_with_stale_claude_foreground_is_not_running() {
+        let p = process("2.1.294", "/home/u/.local/share/claude/versions/2.1.294");
+        assert_eq!(running_program_of(true, Some(&p)), None);
+        assert_eq!(
+            running_program_of(false, Some(&p)).as_deref(),
+            Some("Claude")
+        );
     }
 
     #[test]
