@@ -403,7 +403,7 @@ impl Shell {
             .projects
             .insert(root.to_path_buf(), ProjectSettings { settings, stamps });
         if asks {
-            self.ask_project_trust(root, cx);
+            self.ask_project_trust(root, None, cx);
         }
         true
     }

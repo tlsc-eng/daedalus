@@ -373,6 +373,18 @@ fn trust_question(project: &str, found: &[&str], settings: bool) -> (String, Str
     (message, detail)
 }
 
+/// The server whose start raised the question is named even when no marker found its project.
+fn name_asking_server(found: &mut Vec<&'static str>, asking: Option<ServerKind>) {
+    let name = match asking {
+        Some(ServerKind::Rust) => "rust-analyzer",
+        Some(ServerKind::Python) => "basedpyright",
+        _ => return,
+    };
+    if !found.contains(&name) {
+        found.push(name);
+    }
+}
+
 fn has_rust_project(root: &Path) -> bool {
     root.join("Cargo.toml").is_file()
         || std::fs::read_dir(root).is_ok_and(|entries| {
@@ -552,9 +564,7 @@ impl Shell {
             Some(client) => push_triggers(editor, &client, cx),
             None => {
                 editor.update(cx, |e, cx| e.set_definitions(false, cx));
-                if main.is_none() {
-                    super::snippets::attach_snippets(editor, cx);
-                }
+                super::snippets::attach_snippets(editor, cx);
             }
         }
     }
@@ -690,7 +700,7 @@ impl Shell {
                 match self.linter_trust(&key.0)? {
                     LinterTrust::Allowed => Some(program),
                     LinterTrust::NotAsked => {
-                        self.ask_project_trust(&key.0, cx);
+                        self.ask_project_trust(&key.0, None, cx);
                         return None;
                     }
                     LinterTrust::Denied => return None,
@@ -701,7 +711,11 @@ impl Shell {
         if key.1 == ServerKind::TypeScript && !self.typescript_may_start(&key.0, cx) {
             return None;
         }
-        if key.1.runs_project_code() && !self.project_code_may_run(&key.0, cx) {
+        // A server that is not installed fails with its install hint instead of a trust prompt.
+        if key.1.runs_project_code()
+            && daedalus_lsp::find_program(key.1.program()).is_some()
+            && !self.project_code_may_run(&key.0, key.1, cx)
+        {
             return None;
         }
         tracing::info!(root = %key.0.display(), ?local, "starting {}", key.1.program());
@@ -742,11 +756,16 @@ impl Shell {
     }
 
     /// Whether a server that runs the project's code may start: only once the project is allowed.
-    fn project_code_may_run(&mut self, root: &Path, cx: &mut Context<Self>) -> bool {
+    fn project_code_may_run(
+        &mut self,
+        root: &Path,
+        kind: ServerKind,
+        cx: &mut Context<Self>,
+    ) -> bool {
         match self.linter_trust(root) {
             Some(LinterTrust::Allowed) => true,
             Some(LinterTrust::NotAsked) => {
-                self.ask_project_trust(root, cx);
+                self.ask_project_trust(root, Some(kind), cx);
                 false
             }
             _ => false,
@@ -762,7 +781,7 @@ impl Shell {
             return true;
         }
         if trust == Some(LinterTrust::NotAsked) {
-            self.ask_project_trust(root, cx);
+            self.ask_project_trust(root, None, cx);
         }
         if daedalus_lsp::global_typescript(root).is_some() {
             return true;
@@ -784,7 +803,12 @@ impl Shell {
     /// Asks once per project whether the code it brings may run: the linters and TypeScript it
     /// installs, and settings that choose what language servers run, as VS Code asks before
     /// trusting a workspace.
-    pub(super) fn ask_project_trust(&mut self, root: &Path, cx: &mut Context<Self>) {
+    pub(super) fn ask_project_trust(
+        &mut self,
+        root: &Path,
+        asking: Option<ServerKind>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.lsp.asking_trust.insert(root.to_path_buf()) {
             return;
         }
@@ -802,6 +826,7 @@ impl Shell {
         if has_python_project(root) {
             found.push("basedpyright");
         }
+        name_asking_server(&mut found, asking);
         let settings = self.project_changes_programs(root);
         let project = project_name(root);
         let (message, detail) = trust_question(&project, &found, settings);
@@ -2756,6 +2781,21 @@ mod tests {
             python_default_settings()["basedpyright"]["analysis"]["typeCheckingMode"],
             "standard"
         );
+    }
+
+    #[test]
+    fn the_server_that_asked_is_named_once_even_without_markers() {
+        let mut found = Vec::new();
+        name_asking_server(&mut found, Some(ServerKind::Python));
+        assert_eq!(found, ["basedpyright"]);
+        name_asking_server(&mut found, Some(ServerKind::Python));
+        assert_eq!(found, ["basedpyright"], "a marker already named it");
+        name_asking_server(&mut found, Some(ServerKind::Rust));
+        assert_eq!(found, ["basedpyright", "rust-analyzer"]);
+        name_asking_server(&mut found, None);
+        assert_eq!(found.len(), 2);
+        let (message, _) = trust_question("scripts", &["basedpyright"], false);
+        assert_eq!(message, "Run basedpyright for scripts?");
     }
 
     #[test]

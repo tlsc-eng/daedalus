@@ -15,11 +15,12 @@ fn next_event(events: &async_channel::Receiver<Event>, deadline: Instant) -> Opt
 
 /// The rustup proxy exists on PATH even without the component, and then exits non-zero.
 fn usable() -> bool {
-    daedalus_lsp::find_program("rust-analyzer").is_some()
-        && Command::new("rust-analyzer")
+    daedalus_lsp::find_program("rust-analyzer").is_some_and(|program| {
+        Command::new(program)
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
+    })
 }
 
 #[test]
@@ -43,19 +44,13 @@ fn rust_analyzer_answers_definition_in_a_tiny_crate() {
     let (client, events) = Client::start(ServerKind::Rust, dir.clone());
     client.did_open(&file, "rust", 1, source.into());
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match next_event(&events, deadline) {
             Some(Event::Ready) => break,
-            Some(Event::Stopped(why)) => {
-                eprintln!("rust-analyzer stopped ({why}); skipping");
-                return;
-            }
+            Some(Event::Stopped(why)) => panic!("rust-analyzer stopped: {why}"),
             Some(_) => {}
-            None => {
-                eprintln!("rust-analyzer not ready in time; skipping");
-                return;
-            }
+            None => panic!("rust-analyzer not ready in time"),
         }
     }
     let at = Position {

@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use daedalus_lsp::{Client, Event, Position, ServerKind};
@@ -13,18 +12,10 @@ fn next_event(events: &async_channel::Receiver<Event>, deadline: Instant) -> Opt
     None
 }
 
-fn usable() -> bool {
-    daedalus_lsp::find_program("basedpyright-langserver").is_some()
-        && Command::new("basedpyright-langserver")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-}
-
 #[test]
 fn basedpyright_answers_definition_in_a_tiny_project() {
-    if !usable() {
-        eprintln!("basedpyright not usable; skipping");
+    if daedalus_lsp::find_program("basedpyright-langserver").is_none() {
+        eprintln!("basedpyright not installed; skipping");
         return;
     }
     let dir = std::env::temp_dir().join(format!("daedalus-lsp-py-{}", std::process::id()));
@@ -38,26 +29,20 @@ fn basedpyright_answers_definition_in_a_tiny_project() {
     let (client, events) = Client::start(ServerKind::Python, dir.clone());
     client.did_open(&file, "python", 1, source.into());
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match next_event(&events, deadline) {
             Some(Event::Ready) => break,
-            Some(Event::Stopped(why)) => {
-                eprintln!("basedpyright stopped ({why}); skipping");
-                return;
-            }
+            Some(Event::Stopped(why)) => panic!("basedpyright stopped: {why}"),
             Some(_) => {}
-            None => {
-                eprintln!("basedpyright not ready in time; skipping");
-                return;
-            }
+            None => panic!("basedpyright not ready in time"),
         }
     }
     let at = Position {
         line: 4,
         character: 9,
     };
-    let end = Instant::now() + Duration::from_secs(120);
+    let end = Instant::now() + Duration::from_secs(60);
     while Instant::now() < end {
         let found = block_on(client.definition(&file, at)).unwrap_or_default();
         if found.iter().any(|l| l.range.start.line == 0) {
