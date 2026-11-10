@@ -210,6 +210,11 @@ pub(super) struct Reference {
     snippet: String,
 }
 
+/// True when the one definition found is the symbol under `at`, so Go to Definition has nowhere to go.
+fn is_own_definition(doc: &Path, at: Position, found: &[Location]) -> bool {
+    matches!(found, [only] if document_key(&only.path) == doc && only.range.start <= at && at <= only.range.end)
+}
+
 /// Reads each file once, off the main thread, for the line every reference sits on.
 fn with_snippets(mut found: Vec<Location>) -> Vec<Reference> {
     found.sort_by(|a, b| (&a.path, a.range.start).cmp(&(&b.path, b.range.start)));
@@ -1359,25 +1364,30 @@ impl Shell {
             return self.lsp_failed("No definition found", NO_SERVER.into(), cx);
         };
         tracing::debug!(path = %doc.display(), line = at.line, character = at.character, "definition");
+        let editor = editor.clone();
         cx.spawn(async move |this, cx| {
             let found = client.definition(&doc, at).await;
             match &found {
                 Ok(list) => tracing::debug!("definition → {} locations", list.len()),
                 Err(why) => tracing::warn!("definition failed: {why}"),
             }
-            let _ = this.update(cx, |this, cx| {
-                match found.map(|list| list.into_iter().next()) {
-                    Ok(Some(target)) => {
+            let _ = this.update(cx, |this, cx| match found {
+                Ok(list) if is_own_definition(&doc, at, &list) => {
+                    this.lsp_references(&editor, at, cx)
+                }
+                Ok(list) if list.len() > 1 => this.show_locations(list, "definition", cx),
+                Ok(list) => match list.into_iter().next() {
+                    Some(target) => {
                         this.lsp.jump = Some((target.path, target.range.start));
                         cx.notify();
                     }
-                    Ok(None) => this.lsp_failed(
+                    None => this.lsp_failed(
                         "No definition found",
                         "Nothing is defined under the cursor.".into(),
                         cx,
                     ),
-                    Err(why) => this.lsp_failed("Go to definition failed", why, cx),
-                }
+                },
+                Err(why) => this.lsp_failed("Go to definition failed", why, cx),
             });
         })
         .detach();
@@ -2120,7 +2130,12 @@ impl Shell {
 
     /// Lists `found` in the References tab, or goes straight to it if it is the only one, as a
     /// lens that carries its references asks.
-    pub(super) fn show_locations(&mut self, found: Vec<Location>, cx: &mut Context<Self>) {
+    pub(super) fn show_locations(
+        &mut self,
+        found: Vec<Location>,
+        noun: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         if let [target] = found.as_slice() {
             self.lsp.jump = Some((target.path.clone(), target.range.start));
             cx.notify();
@@ -2136,7 +2151,7 @@ impl Shell {
                 this.lsp.references_asked += 1;
                 this.lsp.showing_calls = false;
                 this.lsp.reference_opened = None;
-                this.lsp.references_noun = "reference";
+                this.lsp.references_noun = noun;
                 this.lsp.references_root = root;
                 this.lsp.references = References::Found(Rc::new(list));
                 this.show_drawer_tab(DrawerTab::References, cx);
@@ -2338,6 +2353,52 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn place(path: &str, line: u32, from: u32, to: u32) -> Location {
+        Location {
+            path: PathBuf::from(path),
+            range: Range {
+                start: at(line, from),
+                end: at(line, to),
+            },
+        }
+    }
+
+    #[test]
+    fn own_definition_contains_position() {
+        let doc = Path::new("/nonexistent/a.rs");
+        assert!(is_own_definition(
+            doc,
+            at(3, 6),
+            &[place("/nonexistent/a.rs", 3, 4, 9)]
+        ));
+        assert!(is_own_definition(
+            doc,
+            at(3, 9),
+            &[place("/nonexistent/a.rs", 3, 4, 9)]
+        ));
+    }
+
+    #[test]
+    fn own_definition_rejects_other_places() {
+        let doc = Path::new("/nonexistent/a.rs");
+        let here = place("/nonexistent/a.rs", 3, 4, 9);
+        assert!(!is_own_definition(
+            doc,
+            at(5, 6),
+            std::slice::from_ref(&here)
+        ));
+        assert!(!is_own_definition(
+            doc,
+            at(3, 6),
+            &[place("/nonexistent/b.rs", 3, 4, 9)]
+        ));
+        assert!(!is_own_definition(doc, at(3, 6), &[here.clone(), here]));
+    }
 
     fn unstarted() -> (Rc<Client>, Server) {
         let (client, _) = Client::start_local(

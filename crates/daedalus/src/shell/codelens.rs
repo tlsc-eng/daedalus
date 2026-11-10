@@ -119,7 +119,7 @@ impl Shell {
         };
         let places = lens.locations();
         if !places.is_empty() {
-            return self.show_locations(places, cx);
+            return self.show_locations(places, "reference", cx);
         }
         let (Some(command), Some(client)) = (lens.command, client.upgrade()) else {
             return;

@@ -1107,8 +1107,8 @@ take them before Daedalus sees them; Quick Fix… in the editor's right-click me
 | `cmd-shift-g` | Find previous |
 | `cmd-/` | Toggle comment |
 | `f12`, `cmd-alt-g` | Go to definition |
-| `cmd`-click | Go to definition |
 | hold `cmd` over a symbol | Underline it; `cmd`-click goes to its definition |
+| `cmd`-click | Go to definition; on a definition it lists the references instead |
 | `shift-f12`, `cmd-alt-r` | Find references |
 | `f9` | Toggle breakpoint on the cursor's line |
 | `shift-alt-h` | Show call hierarchy |
