@@ -473,6 +473,10 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
             "Disallow project code (linters, TypeScript, project settings)",
             Box::new(super::lsp::DisallowProjectLinters),
         ),
+        (
+            "Restart language servers",
+            Box::new(super::lsp::RestartLanguageServers),
+        ),
         ("Toggle file tree", Box::new(actions::ToggleFileTree)),
         ("Toggle project sidebar", Box::new(actions::ToggleSidebar)),
         (

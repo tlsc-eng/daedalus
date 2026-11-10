@@ -11,7 +11,7 @@ use gpui::{
 
 use super::Shell;
 use super::drawer::DrawerTab;
-use super::lsp::{NO_SERVER, document_key};
+use super::lsp::document_key;
 
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 16.;
@@ -170,7 +170,10 @@ impl Shell {
         let doc = document_key(editor.read(cx).path());
         self.flush_change(&doc, &editor, cx);
         let Some(client) = self.document_client(&doc) else {
-            return self.lsp_failed(title, NO_SERVER.into(), cx);
+            return {
+                let why = self.no_server_reason(&editor, cx);
+                self.lsp_failed(title, why, cx)
+            };
         };
         if !client.supports(capability) {
             return self.lsp_failed(title, offered.into(), cx);

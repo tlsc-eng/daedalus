@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -236,6 +236,7 @@ impl Client {
             events: events_tx.clone(),
             pending: pending.clone(),
             child: child.clone(),
+            stderr: Arc::default(),
         };
         let waiters = pending.clone();
         let spawned = thread::Builder::new()
@@ -824,9 +825,132 @@ struct Session {
     events: async_channel::Sender<Event>,
     pending: Pending,
     child: Arc<Mutex<Option<Child>>>,
+    stderr: Arc<Stderr>,
     triggers: Arc<OnceLock<Vec<String>>>,
     signature_triggers: Arc<OnceLock<Vec<String>>>,
     capabilities: Arc<OnceLock<Value>>,
+}
+
+const STDERR_LINES: usize = 8;
+const STDERR_LINE_CHARS: usize = 200;
+const STDERR_TAIL_CHARS: usize = 600;
+const STDERR_WAIT: Duration = Duration::from_millis(300);
+const EXIT_WAIT: Duration = Duration::from_millis(200);
+
+/// The last lines a server wrote to stderr, drained so a chatty server never blocks on a full pipe.
+#[derive(Default)]
+struct Stderr {
+    state: Mutex<StderrState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct StderrState {
+    tail: VecDeque<String>,
+    done: bool,
+    read_error: Option<String>,
+}
+
+impl Stderr {
+    fn drain(self: &Arc<Self>, pipe: impl Read + Send + 'static) -> Result<()> {
+        let this = self.clone();
+        // Detached: a grandchild holding the pipe open must not be able to stall anyone's join.
+        thread::Builder::new()
+            .name("lsp-stderr".into())
+            .spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let mut state = this.state.lock().expect("stderr lock");
+                    if state.tail.len() == STDERR_LINES {
+                        state.tail.pop_front();
+                    }
+                    state.tail.push_back(cap(line.trim(), STDERR_LINE_CHARS));
+                }
+                this.state.lock().expect("stderr lock").done = true;
+                this.changed.notify_all();
+            })?;
+        Ok(())
+    }
+
+    fn set_read_error(&self, error: String) {
+        self.state.lock().expect("stderr lock").read_error = Some(error);
+    }
+
+    /// Waits briefly for the pipe to close so the message carries what the server said before dying.
+    fn exit_reason(&self, child: &Mutex<Option<Child>>) -> String {
+        let state = self.state.lock().expect("stderr lock");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, STDERR_WAIT, |state| !state.done)
+            .expect("stderr lock");
+        let tail: Vec<String> = state.tail.iter().cloned().collect();
+        let read_error = state.read_error.clone();
+        drop(state);
+        let how = match exit_status(child, read_error.is_none()) {
+            Some(status) => status,
+            None => match read_error {
+                Some(error) => format!("sent a message Daedalus couldn't read: {error}"),
+                None => "closed its output".into(),
+            },
+        };
+        exit_reason(&how, &tail)
+    }
+}
+
+fn exit_status(child: &Mutex<Option<Child>>, poll: bool) -> Option<String> {
+    let deadline = Instant::now() + if poll { EXIT_WAIT } else { Duration::ZERO };
+    loop {
+        let status = child
+            .lock()
+            .expect("child lock")
+            .as_ref()
+            .and_then(|c| peek_exit(c.id()));
+        if status.is_some() || Instant::now() >= deadline {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Reads a dead child's status without reaping it, so the reaper's killpg still targets a pid nobody else can reuse.
+fn peek_exit(pid: u32) -> Option<String> {
+    // SAFETY: waitid only writes into the zeroed siginfo_t it is given.
+    let (code, status) = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() == 0
+        {
+            return None;
+        }
+        (info.si_code, info.si_status())
+    };
+    Some(match code {
+        libc::CLD_EXITED => format!("exited with status {status}"),
+        libc::CLD_KILLED | libc::CLD_DUMPED => format!("killed by signal {status}"),
+        _ => "exited".into(),
+    })
+}
+
+fn cap(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+fn exit_reason(how: &str, tail: &[String]) -> String {
+    let lines: Vec<&str> = tail
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        format!("the language server {how}")
+    } else {
+        format!(
+            "the language server {how}: {}",
+            cap(&lines.join(" "), STDERR_TAIL_CHARS)
+        )
+    }
 }
 
 impl Session {
@@ -853,11 +977,14 @@ impl Session {
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not start {}", program.display()))?;
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
+        if let Some(stderr) = child.stderr.take() {
+            self.stderr.drain(stderr)?;
+        }
         *self.child.lock().expect("child lock") = Some(child);
         self.serve(stdin, stdout)
     }
@@ -887,6 +1014,8 @@ impl Session {
             outgoing: self.outgoing.clone(),
             pending: self.pending.clone(),
             events: self.events.clone(),
+            stderr: self.stderr.clone(),
+            child: self.child.clone(),
         };
         thread::Builder::new()
             .name("lsp-reader".into())
@@ -900,7 +1029,7 @@ impl Session {
         send(&writer, request(0, "initialize", self.initialize_params()))?;
         let result = init
             .recv_blocking()
-            .context("the server stopped while starting")?
+            .map_err(|_| anyhow!(self.stderr.exit_reason(&self.child)))?
             .map_err(anyhow::Error::msg)?;
         if result.is_null() {
             bail!("{} refused to start", self.kind.program());
@@ -1055,21 +1184,29 @@ struct Reader {
     outgoing: async_channel::Receiver<Outgoing>,
     pending: Pending,
     events: async_channel::Sender<Event>,
+    stderr: Arc<Stderr>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl Reader {
     fn run(self, stdout: impl Read) {
         let mut input = BufReader::new(stdout);
-        while let Ok(Some(message)) = read_message(&mut input) {
-            self.handle(message);
+        loop {
+            match read_message(&mut input) {
+                Ok(Some(message)) => self.handle(message),
+                Ok(None) => break,
+                Err(error) => {
+                    self.stderr.set_read_error(error.to_string());
+                    break;
+                }
+            }
         }
+        let reason = self.stderr.exit_reason(&self.child);
         // Waiters see a closed channel instead of hanging; closing the queue first means a
         // request that misses this clear is refused by the queue instead.
         self.outgoing.close();
         self.pending.lock().expect("pending lock").clear();
-        let _ = self
-            .events
-            .send_blocking(Event::Stopped("the language server exited".into()));
+        let _ = self.events.send_blocking(Event::Stopped(reason));
     }
 
     fn handle(&self, message: Value) {
@@ -1272,12 +1409,120 @@ fn read_message(input: &mut impl BufRead) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
     fn write_message(out: &mut impl Write, message: &Value) {
         let body = serde_json::to_vec(message).unwrap();
         write!(out, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
         out.write_all(&body).unwrap();
+    }
+
+    fn stopped_within(events: &async_channel::Receiver<Event>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.try_recv() {
+                Ok(Event::Stopped(why)) => return why,
+                Ok(_) => {}
+                Err(_) if Instant::now() >= deadline => panic!("no Stopped event within 5s"),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_exits_reports_its_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("daedalus-lsp-stderr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'boom: no toolchain' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_client, events) = Client::start_local(
+            ServerKind::Go,
+            script,
+            dir.clone(),
+            Arc::new(RwLock::new(json!({}))),
+        );
+        let why = stopped_within(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(why.contains("boom"), "{why}");
+    }
+
+    fn stop_reason(name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("daedalus-lsp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (client, events) = Client::start_local(
+            ServerKind::Go,
+            script,
+            dir.clone(),
+            Arc::new(RwLock::new(json!({}))),
+        );
+        let started = Instant::now();
+        let why = stopped_within(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        let pid = client.child.lock().unwrap().as_ref().map(Child::id);
+        if let Some(pid) = pid {
+            // SAFETY: the child is still held by the client, so its group id is not reused.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped late");
+        why
+    }
+
+    #[test]
+    fn a_bad_message_still_stops_the_client() {
+        let why = stop_reason(
+            "badframe",
+            "printf 'Content-Length: abc\\r\\n\\r\\n'\nsleep 30",
+        );
+        assert!(why.contains("couldn't read"), "{why}");
+    }
+
+    #[test]
+    fn peeking_at_an_exit_leaves_the_child_unreaped() {
+        let mut child = Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let said = loop {
+            if let Some(said) = peek_exit(child.id()) {
+                break said;
+            }
+            assert!(Instant::now() < deadline, "child never exited");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(said.contains("status 3"), "{said}");
+        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
+    }
+
+    #[test]
+    fn a_silent_exit_reports_its_status() {
+        let why = stop_reason("silent", "exit 3");
+        assert!(why.contains("status 3"), "{why}");
+    }
+
+    #[test]
+    fn the_stderr_tail_is_capped_on_char_boundaries() {
+        let long: String = std::iter::repeat_n('é', 300).collect();
+        let cut = cap(&long, STDERR_LINE_CHARS);
+        assert_eq!(cut.chars().count(), STDERR_LINE_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cap("short", STDERR_LINE_CHARS), "short");
+
+        let tail: Vec<String> = (0..STDERR_LINES)
+            .map(|_| std::iter::repeat_n('日', STDERR_LINE_CHARS).collect())
+            .collect();
+        let reason = exit_reason("exited", &tail);
+        let message = reason.strip_prefix("the language server exited: ").unwrap();
+        assert_eq!(message.chars().count(), STDERR_TAIL_CHARS + 1);
+        assert!(message.ends_with('…'));
     }
 
     #[test]
@@ -1337,6 +1582,7 @@ mod tests {
             events: events_tx,
             pending: Arc::default(),
             child: Arc::default(),
+            stderr: Arc::default(),
             triggers: Arc::default(),
             signature_triggers: Arc::default(),
             capabilities: Arc::default(),
@@ -1417,6 +1663,7 @@ mod tests {
             events: events_tx,
             pending: pending.clone(),
             child: Arc::default(),
+            stderr: Arc::default(),
             triggers: Arc::default(),
             signature_triggers: Arc::default(),
             capabilities: capabilities_slot.clone(),

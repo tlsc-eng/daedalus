@@ -75,7 +75,7 @@ impl ServerKind {
     pub fn install_hint(self) -> &'static str {
         match self {
             Self::Go => "go install golang.org/x/tools/gopls@latest",
-            Self::TypeScript => "npm install -g typescript-language-server typescript",
+            Self::TypeScript => "npm install -g typescript-language-server typescript@6",
             Self::Eslint => "npm install -D vscode-langservers-extracted",
             Self::Biome => "npm install -D @biomejs/biome",
             Self::Json => "npm install -g vscode-langservers-extracted",

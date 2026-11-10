@@ -921,6 +921,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &lsp::DisallowProjectLinters, _, cx| {
                 this.change_linter_trust(false, cx)
             }))
+            .on_action(cx.listener(|this, _: &lsp::RestartLanguageServers, _, cx| {
+                this.restart_project_servers(cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleIdeIntegration, w, cx| {
                 this.toggle_ide_integration(w, cx)
             }))

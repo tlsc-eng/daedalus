@@ -799,7 +799,9 @@ grammar, so emphasis is italic, strong text bold, code spans coloured and links 
 Language servers are started only for Go and TypeScript/JavaScript, when `gopls` or
 `typescript-language-server` is on your login shell's `PATH`; with one, names are coloured again
 from its semantic tokens. Other languages get highlighting, folding and bracket matching without
-one.
+one. Install the TypeScript one with `npm install -g typescript-language-server typescript@6`
+(TypeScript 7 ships no `tsserver.js`). A server that could not start is not retried until you run
+"Restart language servers" from the palette, and the reason it failed shows when a lookup finds no server.
 
 Linters run beside them when the project installs them: `vscode-eslint-language-server` (from
 `vscode-langservers-extracted`) or `biome` (from `@biomejs/biome`). They are the project's own
