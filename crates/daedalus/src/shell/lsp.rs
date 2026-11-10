@@ -36,6 +36,7 @@ const SETTINGS_SETTLE: Duration = Duration::from_millis(300);
 /// Longest line excerpt shown for a reference.
 const SNIPPET_CHARS: usize = 160;
 
+const RETRY: &str = "Then run Restart language servers.";
 pub(super) const NO_SERVER: &str = "No language server runs for this file.";
 
 actions!(
@@ -360,7 +361,8 @@ fn restarted_on_trust_change<'a>(
 
 fn failure_for(failed: &HashMap<ServerKey, String>, root: &Path, lang: Lang) -> Option<String> {
     let (kind, _) = server_for(lang)?;
-    failed.get(&(root.to_path_buf(), kind)).cloned()
+    let why = failed.get(&(root.to_path_buf(), kind))?;
+    Some(format!("{}: {why}\n{RETRY}", kind.program()))
 }
 
 fn server_for(lang: Lang) -> Option<(ServerKind, &'static str)> {
@@ -947,7 +949,7 @@ impl Shell {
                 };
                 let body = match server.ready {
                     true => why,
-                    false => format!("{why} Then run Restart language servers."),
+                    false => format!("{why}\n{RETRY}"),
                 };
                 self.local_notice(NoticeKind::Message { title, body }, cx);
             }
@@ -2187,7 +2189,6 @@ impl Shell {
         .detach();
     }
 
-    /// Says why a lookup went nowhere, so a click or key press is never silently ignored.
     /// Why the editor's file has no server: the failure that stopped it, else the generic line.
     pub(super) fn no_server_reason(
         &self,
@@ -2204,6 +2205,7 @@ impl Shell {
             .unwrap_or_else(|| NO_SERVER.into())
     }
 
+    /// Says why a lookup went nowhere, so a click or key press is never silently ignored.
     pub(super) fn lsp_failed(&mut self, title: &str, body: String, cx: &mut Context<Self>) {
         self.transient_notice(title, body, cx);
     }
@@ -2308,6 +2310,7 @@ impl Shell {
             .servers
             .keys()
             .chain(self.lsp.failed.keys())
+            .chain(self.lsp.restarts.keys())
             .filter(|(r, _)| *r == root)
             .cloned()
             .collect();
@@ -2486,7 +2489,7 @@ mod tests {
         );
         assert_eq!(
             failure_for(&failed, &root, Lang::Tsx).as_deref(),
-            Some("not installed")
+            Some("typescript-language-server: not installed\nThen run Restart language servers.")
         );
         assert_eq!(
             failure_for(&failed, Path::new("/work/other"), Lang::Tsx),

@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -832,58 +832,113 @@ struct Session {
 }
 
 const STDERR_LINES: usize = 8;
+const STDERR_LINE_CHARS: usize = 200;
+const STDERR_TAIL_CHARS: usize = 600;
+const STDERR_WAIT: Duration = Duration::from_millis(300);
+const EXIT_WAIT: Duration = Duration::from_millis(200);
 
 /// The last lines a server wrote to stderr, drained so a chatty server never blocks on a full pipe.
 #[derive(Default)]
 struct Stderr {
-    tail: Mutex<VecDeque<String>>,
-    reader: Mutex<Option<thread::JoinHandle<()>>>,
+    state: Mutex<StderrState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct StderrState {
+    tail: VecDeque<String>,
+    done: bool,
+    read_error: Option<String>,
 }
 
 impl Stderr {
     fn drain(self: &Arc<Self>, pipe: impl Read + Send + 'static) -> Result<()> {
         let this = self.clone();
-        let handle = thread::Builder::new()
+        // Detached: a grandchild holding the pipe open must not be able to stall anyone's join.
+        thread::Builder::new()
             .name("lsp-stderr".into())
             .spawn(move || {
                 for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    let mut tail = this.tail.lock().expect("stderr lock");
-                    if tail.len() == STDERR_LINES {
-                        tail.pop_front();
+                    let mut state = this.state.lock().expect("stderr lock");
+                    if state.tail.len() == STDERR_LINES {
+                        state.tail.pop_front();
                     }
-                    tail.push_back(line);
+                    state.tail.push_back(cap(line.trim(), STDERR_LINE_CHARS));
                 }
+                this.state.lock().expect("stderr lock").done = true;
+                this.changed.notify_all();
             })?;
-        *self.reader.lock().expect("stderr lock") = Some(handle);
         Ok(())
     }
 
-    /// Waits for the pipe to close so the message carries everything the server said before dying.
-    fn exit_reason(&self) -> String {
-        if let Some(handle) = self.reader.lock().expect("stderr lock").take() {
-            let _ = handle.join();
-        }
-        let tail: Vec<String> = self
-            .tail
-            .lock()
-            .expect("stderr lock")
-            .iter()
-            .cloned()
-            .collect();
-        exit_reason(&tail)
+    fn set_read_error(&self, error: String) {
+        self.state.lock().expect("stderr lock").read_error = Some(error);
+    }
+
+    /// Waits briefly for the pipe to close so the message carries what the server said before dying.
+    fn exit_reason(&self, child: &Mutex<Option<Child>>) -> String {
+        let state = self.state.lock().expect("stderr lock");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, STDERR_WAIT, |state| !state.done)
+            .expect("stderr lock");
+        let tail: Vec<String> = state.tail.iter().cloned().collect();
+        let read_error = state.read_error.clone();
+        drop(state);
+        let how = match exit_status(child, read_error.is_none()) {
+            Some(status) => describe_status(status),
+            None => match read_error {
+                Some(error) => format!("sent a message Daedalus couldn't read: {error}"),
+                None => "closed its output".into(),
+            },
+        };
+        exit_reason(&how, &tail)
     }
 }
 
-fn exit_reason(tail: &[String]) -> String {
+fn exit_status(child: &Mutex<Option<Child>>, poll: bool) -> Option<ExitStatus> {
+    let deadline = Instant::now() + if poll { EXIT_WAIT } else { Duration::ZERO };
+    loop {
+        let status = child
+            .lock()
+            .expect("child lock")
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten());
+        if status.is_some() || Instant::now() >= deadline {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn describe_status(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exited with status {code}"),
+        (None, Some(signal)) => format!("killed by signal {signal}"),
+        _ => "exited".into(),
+    }
+}
+
+fn cap(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+fn exit_reason(how: &str, tail: &[String]) -> String {
     let lines: Vec<&str> = tail
         .iter()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect();
     if lines.is_empty() {
-        "the language server exited".into()
+        format!("the language server {how}")
     } else {
-        format!("the language server exited: {}", lines.join(" "))
+        format!(
+            "the language server {how}: {}",
+            cap(&lines.join(" "), STDERR_TAIL_CHARS)
+        )
     }
 }
 
@@ -949,6 +1004,7 @@ impl Session {
             pending: self.pending.clone(),
             events: self.events.clone(),
             stderr: self.stderr.clone(),
+            child: self.child.clone(),
         };
         thread::Builder::new()
             .name("lsp-reader".into())
@@ -962,7 +1018,7 @@ impl Session {
         send(&writer, request(0, "initialize", self.initialize_params()))?;
         let result = init
             .recv_blocking()
-            .map_err(|_| anyhow!(self.stderr.exit_reason()))?
+            .map_err(|_| anyhow!(self.stderr.exit_reason(&self.child)))?
             .map_err(anyhow::Error::msg)?;
         if result.is_null() {
             bail!("{} refused to start", self.kind.program());
@@ -1118,15 +1174,23 @@ struct Reader {
     pending: Pending,
     events: async_channel::Sender<Event>,
     stderr: Arc<Stderr>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl Reader {
     fn run(self, stdout: impl Read) {
         let mut input = BufReader::new(stdout);
-        while let Ok(Some(message)) = read_message(&mut input) {
-            self.handle(message);
+        loop {
+            match read_message(&mut input) {
+                Ok(Some(message)) => self.handle(message),
+                Ok(None) => break,
+                Err(error) => {
+                    self.stderr.set_read_error(error.to_string());
+                    break;
+                }
+            }
         }
-        let reason = self.stderr.exit_reason();
+        let reason = self.stderr.exit_reason(&self.child);
         // Waiters see a closed channel instead of hanging; closing the queue first means a
         // request that misses this clear is refused by the queue instead.
         self.outgoing.close();
@@ -1334,7 +1398,6 @@ fn read_message(input: &mut impl BufRead) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
     fn write_message(out: &mut impl Write, message: &Value) {
         let body = serde_json::to_vec(message).unwrap();
@@ -1369,6 +1432,64 @@ mod tests {
         };
         let _ = std::fs::remove_dir_all(&dir);
         assert!(why.contains("boom"), "{why}");
+    }
+
+    fn stop_reason(name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("daedalus-lsp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_client, events) = Client::start_local(
+            ServerKind::Go,
+            script,
+            dir.clone(),
+            Arc::new(RwLock::new(json!({}))),
+        );
+        let started = Instant::now();
+        let why = loop {
+            match events.recv_blocking().unwrap() {
+                Event::Stopped(why) => break why,
+                _ => continue,
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped late");
+        why
+    }
+
+    #[test]
+    fn a_bad_message_still_stops_the_client() {
+        let why = stop_reason(
+            "badframe",
+            "printf 'Content-Length: abc\\r\\n\\r\\n'\nsleep 30",
+        );
+        assert!(why.contains("couldn't read"), "{why}");
+    }
+
+    #[test]
+    fn a_silent_exit_reports_its_status() {
+        let why = stop_reason("silent", "exit 3");
+        assert!(why.contains("status 3"), "{why}");
+    }
+
+    #[test]
+    fn the_stderr_tail_is_capped_on_char_boundaries() {
+        let long: String = std::iter::repeat_n('é', 300).collect();
+        let cut = cap(&long, STDERR_LINE_CHARS);
+        assert_eq!(cut.chars().count(), STDERR_LINE_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cap("short", STDERR_LINE_CHARS), "short");
+
+        let tail: Vec<String> = (0..STDERR_LINES)
+            .map(|_| std::iter::repeat_n('日', STDERR_LINE_CHARS).collect())
+            .collect();
+        let reason = exit_reason("exited", &tail);
+        let message = reason.strip_prefix("the language server exited: ").unwrap();
+        assert_eq!(message.chars().count(), STDERR_TAIL_CHARS + 1);
+        assert!(message.ends_with('…'));
     }
 
     #[test]
