@@ -51,7 +51,7 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 block2 = "0.6"
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKNavigationDelegate", "WKNavigationAction", "WKNavigation", "WKUIDelegate", "WKFrameInfo", "WKWindowFeatures"] }
 raw-window-handle = "0.6"
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "io-std", "time", "sync", "net"] }
 schemars = "1"
 sha2 = "0.11"
