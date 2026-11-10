@@ -7,8 +7,8 @@ use daedalus_lsp::Position;
 use daedalus_ui::motion::Closing;
 use daedalus_ui::{ActiveTheme, Theme, icon_for};
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, HighlightStyle, MouseButton, SharedString,
-    StyledText, Task, Window, div, prelude::*, px, svg,
+    AnyElement, Bounds, ClickEvent, Context, FontWeight, HighlightStyle, MouseButton, SharedString,
+    StyledText, Task, Window, canvas, div, fill, point, prelude::*, px, size, svg,
 };
 
 use super::{Entry, MAX_ROWS, Mode, Palette, Target, label_highlights, rank_entries};
@@ -191,6 +191,22 @@ pub(super) fn keep_selection(selected: usize, on_search_row: bool, rows: usize) 
     }
 }
 
+/// Top and height in px of the overlay scrollbar thumb inside a track, or `None` when the rows fit.
+pub(super) fn scroll_thumb(
+    view: f32,
+    max_offset: f32,
+    offset: f32,
+    track: f32,
+    min_h: f32,
+) -> Option<(f32, f32)> {
+    if view <= 0. || max_offset <= 0.5 || track <= 0. {
+        return None;
+    }
+    let height = (track * view / (view + max_offset)).max(min_h).min(track);
+    let top = (offset / max_offset).clamp(0., 1.) * (track - height);
+    Some((top, height))
+}
+
 /// The first row of the section after (or, with a negative step, before) the one holding
 /// `selected`, wrapping around.
 pub(super) fn jump(sections: &[(Group, Range<usize>)], selected: usize, step: isize) -> usize {
@@ -302,6 +318,35 @@ impl Shell {
                     .map(|group| chip(group.chip_id(), group.title(), Some(*group))),
             );
 
+        let scroll = state.scroll.clone();
+        let (thumb_color, thumb_w, thumb_gap) = (t.color.border_strong, t.ui(4.), t.ui(4.));
+        let (inset_top, inset_bottom, min_h) = (t.ui(4.), t.ui(12.), f32::from(t.ui(24.)));
+        let thumb = canvas(
+            move |bounds, _, _| {
+                let track = f32::from(bounds.size.height - inset_top - inset_bottom);
+                let (top, height) = scroll_thumb(
+                    f32::from(scroll.bounds().size.height),
+                    f32::from(scroll.max_offset().height),
+                    -f32::from(scroll.offset().y),
+                    track,
+                    min_h,
+                )?;
+                Some(Bounds::new(
+                    point(
+                        bounds.right() - thumb_w - thumb_gap,
+                        bounds.top() + inset_top + px(top),
+                    ),
+                    size(thumb_w, px(height)),
+                ))
+            },
+            move |_, thumb, window, _| {
+                if let Some(thumb) = thumb {
+                    window.paint_quad(fill(thumb, thumb_color).corner_radii(thumb_w / 2.));
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
         let nothing = !query_empty && palette.hits.is_empty();
         let panel =
             div()
@@ -366,22 +411,31 @@ impl Shell {
                     .child(chips)
                     .child(
                         div()
-                            .id("palette-rows")
+                            .relative()
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&state.scroll)
-                            .pb(t.ui(8.))
-                            .children(rows)
-                            .children(nothing.then(|| {
+                            .flex()
+                            .flex_col()
+                            .child(
                                 div()
-                                    .h(t.ui(52.))
-                                    .px(t.ui(18.))
-                                    .flex()
-                                    .items_center()
-                                    .text_color(t.color.content_muted)
-                                    .child("Nothing matches")
-                            })),
+                                    .id("palette-rows")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&state.scroll)
+                                    .pb(t.ui(8.))
+                                    .children(rows)
+                                    .children(nothing.then(|| {
+                                        div()
+                                            .h(t.ui(52.))
+                                            .px(t.ui(18.))
+                                            .flex()
+                                            .items_center()
+                                            .text_color(t.color.content_muted)
+                                            .child("Nothing matches")
+                                    })),
+                            )
+                            .child(thumb),
                     )
                 });
         self.palette_layer(panel, closing, viewport.height * 0.18, &t, cx)
@@ -527,6 +581,47 @@ mod tests {
 
     use super::*;
     use crate::shell::palette::Target;
+
+    #[test]
+    fn scroll_thumb_hides_when_rows_fit() {
+        assert_eq!(scroll_thumb(300., 0., 0., 300., 24.), None);
+        assert_eq!(scroll_thumb(0., 300., 0., 0., 24.), None);
+    }
+
+    #[test]
+    fn scroll_thumb_spans_proportionally_at_top_and_bottom() {
+        assert_eq!(scroll_thumb(300., 300., 0., 300., 24.), Some((0., 150.)));
+        assert_eq!(
+            scroll_thumb(300., 300., 300., 300., 24.),
+            Some((150., 150.))
+        );
+    }
+
+    #[test]
+    fn scroll_thumb_keeps_min_height_on_long_lists() {
+        assert_eq!(scroll_thumb(300., 30000., 0., 300., 24.), Some((0., 24.)));
+        assert_eq!(
+            scroll_thumb(300., 30000., 30000., 300., 24.),
+            Some((276., 24.))
+        );
+    }
+
+    #[test]
+    fn scroll_thumb_stays_inside_a_shorter_track() {
+        assert_eq!(
+            scroll_thumb(300., 300., 300., 284., 24.),
+            Some((142., 142.))
+        );
+    }
+
+    #[test]
+    fn scroll_thumb_clamps_overscroll() {
+        assert_eq!(scroll_thumb(300., 300., -50., 300., 24.), Some((0., 150.)));
+        assert_eq!(
+            scroll_thumb(300., 300., 400., 300., 24.),
+            Some((150., 150.))
+        );
+    }
 
     fn rows(prefix: &str, n: usize) -> Vec<Entry> {
         (0..n)
