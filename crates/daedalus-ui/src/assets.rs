@@ -94,11 +94,15 @@ assets!(
     "icons/zip.svg",
     "ui/bell.svg",
     "ui/chevron.svg",
+    "ui/command.svg",
+    "ui/search.svg",
     "ui/session-ask.svg",
     "ui/session-done-outline.svg",
     "ui/session-done.svg",
     "ui/session-idle.svg",
     "ui/session-running.svg",
+    "ui/symbol.svg",
+    "ui/text.svg",
 );
 
 /// The `'static` name of a bundled asset.

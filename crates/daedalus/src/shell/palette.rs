@@ -1367,7 +1367,7 @@ impl Shell {
     /// Tab and Shift-Tab in Search Everything: the first row of the next or previous group.
     fn jump_spotlight_group(&mut self, step: isize, cx: &mut Context<Self>) {
         if let Some(p) = self.palette.as_mut()
-            && let Some(spotlight) = &p.spotlight
+            && let Some(spotlight) = p.spotlight.as_ref().filter(|s| s.scope.is_none())
         {
             p.selected = spotlight::jump(&spotlight.sections, p.selected, step);
             p.reveal_selected();
@@ -1509,7 +1509,12 @@ impl Shell {
                 .collect();
         }
         if let Some(spotlight) = palette.spotlight.as_mut() {
-            let (entries, hits, sections) = spotlight::arrange(spotlight, &query);
+            if query.is_empty() {
+                spotlight.scope = None;
+            }
+            let (entries, hits, sections) = spotlight::arrange(spotlight, &query, spotlight.scope);
+            let all = spotlight::arrange(spotlight, &query, None).2;
+            spotlight.chips = spotlight::chips(&all, spotlight.scope);
             palette.entries = entries;
             palette.hits = hits;
             spotlight.sections = sections;
@@ -1632,12 +1637,19 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn render_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_palette(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let (palette, closing) = match (&self.palette, &self.palette_closing) {
             (Some(palette), _) => (palette, None),
             (None, Some((palette, closing))) => (palette, Some(*closing)),
             (None, None) => return None,
         };
+        if palette.spotlight.is_some() {
+            return Some(self.render_spotlight(palette, closing, window, cx));
+        }
         let t = cx.theme().clone();
         let rows: Vec<AnyElement> = palette
             .hits
@@ -1662,11 +1674,6 @@ impl Shell {
                         )
                     })
                     .collect();
-                let header = palette
-                    .spotlight
-                    .as_ref()
-                    .and_then(|s| s.sections.iter().find(|(_, rows)| rows.start == row))
-                    .map(|(group, _)| group.title());
                 let row_el = div()
                     .id(("palette-row", row))
                     .h(t.ui(32.))
@@ -1733,50 +1740,16 @@ impl Shell {
                                     .child(k)
                             }),
                     );
-                match header {
-                    Some(title) => div()
-                        .child(
-                            div()
-                                .h(t.ui(24.))
-                                .px(t.ui(12.))
-                                .flex()
-                                .items_center()
-                                .text_size(t.typography.caption)
-                                .text_color(t.color.content_muted)
-                                .child(title),
-                        )
-                        .child(row_el)
-                        .into_any_element(),
-                    None => row_el.into_any_element(),
-                }
+                row_el.into_any_element()
             })
             .collect();
 
         let empty = palette.hits.is_empty() && !palette.input.read(cx).text().is_empty();
         let message = palette.status.or(empty.then_some(palette.placeholder_hint));
-        let everything = palette.spotlight.is_some();
         let panel = div()
             .id("palette")
-            .when(everything, |el| {
-                el.key_context("Spotlight")
-                    .on_action(cx.listener(|this, _: &actions::NextGroup, _, cx| {
-                        this.jump_spotlight_group(1, cx)
-                    }))
-                    .on_action(cx.listener(|this, _: &actions::PrevGroup, _, cx| {
-                        this.jump_spotlight_group(-1, cx)
-                    }))
-                    .on_action(
-                        cx.listener(|this, _: &actions::OpenInSearchPanel, window, cx| {
-                            this.open_in_search_panel(window, cx)
-                        }),
-                    )
-            })
-            .w(t.ui(if everything { 640. } else { 560. }))
-            .max_h(t.ui(if everything {
-                44. + 32. * 14.
-            } else {
-                44. + 32. * 8.5
-            }))
+            .w(t.ui(560.))
+            .max_h(t.ui(44. + 32. * 8.5))
             .flex()
             .flex_col()
             .bg(t.color.surface)
@@ -1806,9 +1779,6 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .when_some(palette.spotlight.as_ref(), |el, s| {
-                        el.track_scroll(&s.scroll)
-                    })
                     .py(t.ui(4.))
                     .when(palette.status.is_none(), |el| el.children(rows))
                     .children(message.map(|message| {
@@ -1821,6 +1791,17 @@ impl Shell {
                             .child(message)
                     })),
             );
+        Some(self.palette_layer(panel, closing, px(96.), &t, cx))
+    }
+
+    fn palette_layer(
+        &self,
+        panel: gpui::Stateful<gpui::Div>,
+        closing: Option<Closing>,
+        top: gpui::Pixels,
+        t: &daedalus_ui::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let panel = match closing {
             Some(closing) => motion::animate_exit(
                 t.motion.reduced,
@@ -1837,24 +1818,22 @@ impl Shell {
                 |el, d| el.opacity(d).top(px(2. * (1. - d))),
             ),
         };
-        Some(
-            div()
-                .id("palette-layer")
-                .absolute()
-                .inset_0()
-                .flex()
-                .justify_center()
-                .items_start()
-                .pt(px(96.))
-                .when(closing.is_none(), |el| {
-                    el.on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
-                    )
-                })
-                .child(panel)
-                .into_any_element(),
-        )
+        div()
+            .id("palette-layer")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(top)
+            .when(closing.is_none(), |el| {
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
+                )
+            })
+            .child(panel)
+            .into_any_element()
     }
 }
 
