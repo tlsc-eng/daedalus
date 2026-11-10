@@ -516,8 +516,10 @@ information rather than triggering the install dialog).
 
 **Workspace**
 
-- Search everything (`cmd-shift-f`): one picker for files (5), workspace symbols (5) and commands (3)
-  under group headers; `tab` and `shift-tab` jump between groups, Enter runs a row as `cmd-p` does.
+- Search everything (`cmd-shift-f`): one picker for files (5), workspace symbols (5), commands (3)
+  and matching lines (8, from three characters) under group headers; `tab` and `shift-tab` jump
+  between groups, Enter runs a row as `cmd-p` does. The last row, or `cmd-shift-f` again, opens
+  the Search drawer tab with the query typed in.
 - Find and replace in project (View menu, or the palette's Find in project): a Search drawer tab honouring `.gitignore` and
   skipping binary files and files over 1 MB; up to 2000 matches. Up/Down walk the matches, Enter
   opens one. It has the editor's three toggles and keys (`cmd-alt-c`, `cmd-alt-w`, `cmd-alt-r`);
