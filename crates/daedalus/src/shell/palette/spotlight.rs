@@ -319,7 +319,7 @@ impl Shell {
             );
 
         let scroll = state.scroll.clone();
-        let (thumb_color, thumb_w) = (t.color.border_strong, t.ui(4.));
+        let (thumb_color, thumb_w, thumb_gap) = (t.color.border_strong, t.ui(4.), t.ui(4.));
         let (inset_top, inset_bottom, min_h) = (t.ui(4.), t.ui(12.), f32::from(t.ui(24.)));
         let thumb = canvas(
             move |bounds, _, _| {
@@ -333,7 +333,7 @@ impl Shell {
                 )?;
                 Some(Bounds::new(
                     point(
-                        bounds.right() - thumb_w - px(4.),
+                        bounds.right() - thumb_w - thumb_gap,
                         bounds.top() + inset_top + px(top),
                     ),
                     size(thumb_w, px(height)),
