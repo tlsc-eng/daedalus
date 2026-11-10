@@ -814,24 +814,25 @@ fixes join the `cmd-.` menu. `"eslint": { "fixOnSave": true }` makes `cmd-s` app
 fix-all first (off by default).
 
 Since running them runs the project's code, Daedalus asks once per project folder before the first
-start whether to allow the project's code: "Run ESLint, Biome and TypeScript for proj?" (naming
-only what it installs or what makes it a Rust or Python project, as rust-analyzer and basedpyright), or "Use proj's language server settings?" for a project that brings only
-such settings. One answer covers everything the project brings: its linters, its own TypeScript,
-rust-analyzer and basedpyright for a Rust or Python project, and project settings that choose what language servers run (see [Project
-settings](#project-settings)); until it is allowed, the project's editor settings still apply.
-The same answer covers what builds or runs the project's code: debugging, and the server commands
-behind code lenses and code actions (gopls's **run go generate**, **run test**, `go mod tidy`,
-add dependency). Those ask in any project not yet asked, with **Cancel** and **Allow and Debug**
-or **Allow and Run**, and a refused code action changes nothing.
-Only a project that brings one of them is asked, and the answer is kept with the project in
-`workspace.json`. The buttons are **Don't Allow** and **Allow**: Escape is Don't Allow, Return
-answers neither, and only a click (or Space on the focused button) allows. Deleting a worktree
-with changes, updating imports on a rename and reverting a Claude edit ask the same way.
-**Allow project code (linters, TypeScript, Rust, Python, project settings)** and **Disallow
-project code (linters, TypeScript, Rust, Python, project settings)** in the palette change the answer for the active
-project: allowing starts its linters for its open files, disallowing stops them and clears what
-they reported, and either answer restarts the project's language servers with the settings it
-allows.
+start whether to allow the project's code: "Run ESLint, Biome and TypeScript for proj?" (naming only
+what it installs or what makes it a Rust or Python project, as rust-analyzer and basedpyright), or
+"Use proj's language server settings?" for a project that brings only such settings. One answer
+covers everything the project brings: its linters, its own TypeScript, rust-analyzer and
+basedpyright for a Rust or Python project, and project settings that choose what language servers
+run (see [Project settings](#project-settings)); until it is allowed, the project's editor settings
+still apply. The same answer covers what builds or runs the project's code: debugging, and the
+server commands behind code lenses and code actions (gopls's **run go generate**, **run test**,
+`go mod tidy`, add dependency). Those ask in any project not yet asked, with **Cancel** and
+**Allow and Debug** or **Allow and Run**, and a refused code action changes nothing. Only a project
+that brings one of them is asked, and the answer is kept with the project in `workspace.json`. The
+buttons are **Don't Allow** and **Allow**: Escape is Don't Allow, Return answers neither, and only a
+click (or Space on the focused button) allows. Deleting a worktree with changes, updating imports on
+a rename and reverting a Claude edit ask the same way.
+**Allow project code (linters, TypeScript, Rust, Python, project settings)** and
+**Disallow project code (linters, TypeScript, Rust, Python, project settings)** in the palette
+change the answer for the active project: allowing starts its linters for its open files,
+disallowing stops them and clears what they reported, and either answer restarts the project's
+language servers with the settings it allows.
 They start without `SSH_AUTH_SOCK`, `NODE_OPTIONS` and `NODE_PATH` from your environment, ESLint
 resolves its library only from the project's own `node_modules`, and each server's whole process
 group is stopped with it (Biome's background daemon exits once its proxy is gone).
@@ -1362,9 +1363,9 @@ that beat the global `"editor"` settings and lose to your own `"[lang]"` block: 
 and keeps trailing whitespace, Go formats on save (and indents with tabs). So a global
 `"format_on_save": false` leaves gofmt on, and `"[go]": { "format_on_save": false }` turns it off.
 `lsp` entries are keyed by the server's program name (`gopls`, `typescript-language-server`,
-`vscode-eslint-language-server`, `biome`, `rust-analyzer`, `basedpyright-langserver`; `tsserver` is read as `typescript-language-server`); the
-ESLint entry is laid over the settings the server needs (`validate`, `run`, `workingDirectory`
-and the rest, as the VS Code extension sends them).
+`vscode-eslint-language-server`, `biome`, `rust-analyzer`, `basedpyright-langserver`; `tsserver` is
+read as `typescript-language-server`); the ESLint entry is laid over the settings the server needs
+(`validate`, `run`, `workingDirectory` and the rest, as the VS Code extension sends them).
 
 #### Project settings
 
