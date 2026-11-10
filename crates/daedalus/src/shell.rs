@@ -1013,7 +1013,7 @@ impl Render for Shell {
             .children(self.render_usage_popover(cx))
             .children(self.render_bell_popover(window, cx))
             .children(self.render_toasts(cx))
-            .children(self.render_palette(cx))
+            .children(self.render_palette(window, cx))
             .children(self.render_pairing(cx))
             .children(self.context_menu.as_ref().map(|(menu, _)| menu.clone()))
             .children(self.render_splash(cx))
