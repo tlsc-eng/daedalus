@@ -50,6 +50,8 @@ pub enum ServerKind {
     Biome,
     /// VS Code's JSON server, used when installed; it checks files against their schemas.
     Json,
+    Rust,
+    Python,
 }
 
 impl ServerKind {
@@ -60,13 +62,15 @@ impl ServerKind {
             Self::Eslint => "vscode-eslint-language-server",
             Self::Biome => "biome",
             Self::Json => "vscode-json-language-server",
+            Self::Rust => "rust-analyzer",
+            Self::Python => "basedpyright-langserver",
         }
     }
 
     pub fn args(self) -> &'static [&'static str] {
         match self {
-            Self::Go => &[],
-            Self::TypeScript | Self::Eslint | Self::Json => &["--stdio"],
+            Self::Go | Self::Rust => &[],
+            Self::TypeScript | Self::Eslint | Self::Json | Self::Python => &["--stdio"],
             Self::Biome => &["lsp-proxy"],
         }
     }
@@ -79,6 +83,8 @@ impl ServerKind {
             Self::Eslint => "npm install -D vscode-langservers-extracted",
             Self::Biome => "npm install -D @biomejs/biome",
             Self::Json => "npm install -g vscode-langservers-extracted",
+            Self::Rust => "rustup component add rust-analyzer",
+            Self::Python => "uv tool install basedpyright",
         }
     }
 
@@ -87,11 +93,38 @@ impl ServerKind {
         matches!(self, Self::Eslint | Self::Biome)
     }
 
+    /// Whether starting it runs code from the project, so it waits for the project to be trusted.
+    pub fn runs_project_code(self) -> bool {
+        matches!(self, Self::Rust | Self::Python)
+    }
+
     /// The name its diagnostics are labelled with when they carry none.
     pub fn label(self) -> &'static str {
         match self {
             Self::Eslint => "eslint",
+            Self::Python => "basedpyright",
             other => other.program(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_kind_tests {
+    use super::ServerKind;
+
+    #[test]
+    fn only_rust_and_python_wait_for_project_trust() {
+        for kind in [ServerKind::Rust, ServerKind::Python] {
+            assert!(kind.runs_project_code() && !kind.is_project_local());
+        }
+        for kind in [
+            ServerKind::Go,
+            ServerKind::TypeScript,
+            ServerKind::Json,
+            ServerKind::Eslint,
+            ServerKind::Biome,
+        ] {
+            assert!(!kind.runs_project_code());
         }
     }
 }

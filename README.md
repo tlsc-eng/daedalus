@@ -779,8 +779,8 @@ information rather than triggering the install dialog).
 | JSON | `.json`, `.jsonc`, `.json5`, `.prettierrc`, `.eslintrc`, `.babelrc` | `vscode-json-language-server` if installed (optional), plus the project's Biome |
 | TOML | `.toml`, `Cargo.lock`, `uv.lock`, `poetry.lock` | |
 | Shell | `.sh`, `.bash`, `.zsh`, `.zshrc`, `.bashrc`, `.profile`, `.envrc` and similar, `#!` scripts | |
-| Rust | `.rs` | |
-| Python | `.py`, `.pyi` | |
+| Rust | `.rs` | `rust-analyzer` (`rustup component add rust-analyzer`), once the project's code is allowed |
+| Python | `.py`, `.pyi` | `basedpyright-langserver` (`uv tool install basedpyright`), type checking in `standard` mode unless your `basedpyright` settings say otherwise, once the project's code is allowed |
 | CSS | `.css` | the project's Biome |
 | HTML | `.html`, `.htm` | |
 | Markdown | `.md`, `.markdown` | |
@@ -796,8 +796,8 @@ information rather than triggering the install dialog).
 Highlighting uses tree-sitter grammars, except Dockerfile, `.env` and Mermaid, which use a line
 scanner; Markdown's paragraphs, headings, lists and quotes are parsed again with the inline
 grammar, so emphasis is italic, strong text bold, code spans coloured and links underlined.
-Language servers are started only for Go and TypeScript/JavaScript, when `gopls` or
-`typescript-language-server` is on your login shell's `PATH`; with one, names are coloured again
+Language servers are started only for Go, TypeScript/JavaScript, Rust and Python, when `gopls`,
+`typescript-language-server`, `rust-analyzer` or `basedpyright-langserver` is on your login shell's `PATH`; with one, names are coloured again
 from its semantic tokens. Other languages get highlighting, folding and bracket matching without
 one. Install the TypeScript one with `npm install -g typescript-language-server typescript@6`
 (TypeScript 7 ships no `tsserver.js`). A server that could not start is not retried until you run

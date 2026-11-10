@@ -466,11 +466,11 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
             Box::new(super::review_comments::ClaudeCancelQueuedComments),
         ),
         (
-            "Allow project code (linters, TypeScript, project settings)",
+            "Allow project code (linters, TypeScript, Rust, Python, project settings)",
             Box::new(super::lsp::AllowProjectLinters),
         ),
         (
-            "Disallow project code (linters, TypeScript, project settings)",
+            "Disallow project code (linters, TypeScript, Rust, Python, project settings)",
             Box::new(super::lsp::DisallowProjectLinters),
         ),
         (
