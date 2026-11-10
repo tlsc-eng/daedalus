@@ -697,6 +697,7 @@ impl Element for EditorElement {
                 (a..b.max(a), m.severity)
             })
             .collect();
+        let link = view.link.clone();
         let x0 = text_left - px(scroll_x);
         let guides = guides_for(&buffer, &shown, head_line);
         let guide_step = cell * buffer.indent.size() as f32;
@@ -852,6 +853,20 @@ impl Element for EditorElement {
                 frame.overlay.push(fill(
                     Bounds::new(point(x0 + xa, y + lh - px(2.)), size(width, px(1.))),
                     crate::view::marker_color(*severity, &theme),
+                ));
+            }
+
+            if let Some(range) = &link
+                && range.start < seg_end
+                && range.end > seg_start
+            {
+                let a = range.start.max(seg_start);
+                let b = range.end.min(seg_end);
+                let xa = r.x_for(a - start);
+                let xb = r.x_for(b - start);
+                frame.overlay.push(fill(
+                    Bounds::new(point(x0 + xa, y + lh - px(1.)), size(xb - xa, px(1.))),
+                    theme.color.accent,
                 ));
             }
 

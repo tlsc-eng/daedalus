@@ -49,7 +49,7 @@ pub(crate) struct Hovering {
 
 impl EditorView {
     /// The identifier under a window position, from last frame's layout; none past a line's end.
-    fn word_at_position(&self, position: Point<Pixels>) -> Option<Range<usize>> {
+    pub(crate) fn word_at_position(&self, position: Point<Pixels>) -> Option<Range<usize>> {
         if self.sticky_at(position).is_some() {
             return None;
         }
@@ -70,6 +70,19 @@ impl EditorView {
         }
         let col = layout.row(row)?.col_under(x)?;
         b.word_at(b.line_start(line) + col)
+    }
+
+    /// Marks the identifier under the pointer as a definition link while cmd is held.
+    pub(crate) fn hover_link(&mut self, pos: Point<Pixels>, cmd: bool, cx: &mut Context<Self>) {
+        let link = if cmd && self.definitions {
+            self.word_at_position(pos)
+        } else {
+            None
+        };
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
     }
 
     /// Window position of the top-left of `char`, if its line was drawn last frame.
