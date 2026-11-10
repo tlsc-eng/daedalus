@@ -370,8 +370,9 @@ information rather than triggering the install dialog).
   `filter` attribute (Git LFS, git-crypt) or a `working-tree-encoding` attribute (git keeps it as
   UTF-8 and writes it out in another encoding) gets a message to stage or revert the whole file
   instead, as hunk staging does.
-- Inline blame (`cmd-alt-shift-g`, off by default): "author · 3 days ago · summary" after the
-  cursor's line, "Not committed yet" for edited lines.
+- Inline blame (on by default; `cmd-alt-shift-g` or `"git.inline_blame": false` in
+  [settings.json](#settings) turns it off): "author · 3 days ago · summary" after the cursor's
+  line, "Not committed yet" for edited lines.
 - File blame (**Git: Toggle file blame** in the palette, or View > Toggle File Blame) adds a
   column to the focused editor, like GitLens: an age bar on every line, brighter for newer
   commits, and the author and age where each commit's lines start. Hovering shows the commit's
@@ -1307,6 +1308,7 @@ Daedalus applies it as soon as you save:
   "theme": "system",                 // "system", "light" or "dark"
   "ide_integration": false,
   "git": { "autofetch": true },      // fetch every three minutes; off by default, as in VS Code
+  "git.inline_blame": false,         // hide the blame caption on the cursor line; on by default
   "eslint": { "fixOnSave": true },   // cmd-s applies ESLint's fixes first; off by default
   "explorer": { "confirmDragAndDrop": false },   // move tree entries without asking
   "explorer.excludeGitIgnore": true, // hide git-ignored entries in the tree rather than dim them

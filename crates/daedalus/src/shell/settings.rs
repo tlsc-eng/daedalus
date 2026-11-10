@@ -282,6 +282,7 @@ impl Shell {
             now.ide_integration = before.ide_integration;
         }
         self.workspace.set_preferences(now);
+        self.set_inline_blame(self.settings.file.git_inline_blame(), cx);
         if let Some(window) = window {
             if now.theme != before.theme {
                 daedalus_ui::set_appearance(super::appearance::resolve(now.theme, window), cx);

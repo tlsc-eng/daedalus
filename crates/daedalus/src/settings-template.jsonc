@@ -27,6 +27,7 @@
   // "theme": "system",                 // "system", "light" or "dark"
   // "ide_integration": false,          // Claude Code connects to Daedalus as its IDE
   // "git": { "autofetch": true },      // fetch the active project every three minutes
+  // "git.inline_blame": false,        // hide the blame caption on the cursor line
   // "git.worktree_dir": "~/worktrees", // new worktrees go here, not beside their repository
   // "explorer": { "confirmDragAndDrop": false }, // move tree entries without asking
   // "explorer.excludeGitIgnore": true, // hide git-ignored entries rather than dim them
