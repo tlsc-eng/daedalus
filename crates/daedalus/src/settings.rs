@@ -32,6 +32,8 @@ pub struct Settings {
     pub ide_integration: Option<bool>,
     /// VS Code's `git.autofetch`: fetch the active project every three minutes.
     pub autofetch: Option<bool>,
+    /// `git.inline_blame`: the cursor line's blame caption at the end of the line.
+    pub inline_blame: Option<bool>,
     /// `git.worktree_dir`: where new worktrees go instead of beside their repository.
     pub worktree_dir: Option<String>,
     /// Each language server's settings by program name, sent as it starts and when they change.
@@ -268,6 +270,10 @@ impl Settings {
         self.autofetch.unwrap_or(false)
     }
 
+    pub fn git_inline_blame(&self) -> bool {
+        self.inline_blame.unwrap_or(true)
+    }
+
     /// The folder new worktrees go in, `~` expanded; `None` puts them beside their repository.
     pub fn git_worktree_dir(&self) -> Option<std::path::PathBuf> {
         let dir = self.worktree_dir.as_deref()?.trim();
@@ -427,7 +433,8 @@ pub fn merge_json(base: &mut Value, over: &Value) {
 fn git_block(settings: &mut Settings, value: &Value) -> Result<(), String> {
     let Some(object) = value.as_object().filter(|o| !o.is_empty()) else {
         return Err(
-            "must be {\"autofetch\": true or false, \"worktree_dir\": \"~/folder\"}".into(),
+            "must be {\"autofetch\": true or false, \"inline_blame\": true or false, \"worktree_dir\": \"~/folder\"}"
+                .into(),
         );
     };
     // Every key that is right applies, even beside one that is not.
@@ -438,6 +445,10 @@ fn git_block(settings: &mut Settings, value: &Value) -> Result<(), String> {
                 .as_bool()
                 .map(|on| settings.autofetch = Some(on))
                 .ok_or_else(|| "autofetch must be true or false".to_string()),
+            "inline_blame" => value
+                .as_bool()
+                .map(|on| settings.inline_blame = Some(on))
+                .ok_or_else(|| "inline_blame must be true or false".to_string()),
             "worktree_dir" => worktree_dir(value).map(|dir| settings.worktree_dir = Some(dir)),
             other => Err(format!("has no setting \"{other}\"")),
         };
@@ -509,6 +520,7 @@ pub fn parse_project(text: &str) -> Result<(Settings, Vec<String>), String> {
         ("theme", s.theme.take().is_some()),
         ("ide_integration", s.ide_integration.take().is_some()),
         ("git.autofetch", s.autofetch.take().is_some()),
+        ("git.inline_blame", s.inline_blame.take().is_some()),
         ("git.worktree_dir", s.worktree_dir.take().is_some()),
         (
             "explorer.confirmDragAndDrop",
@@ -798,6 +810,10 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 Some(("git", "autofetch")) => value
                     .as_bool()
                     .map(|on| settings.autofetch = Some(on))
+                    .ok_or_else(|| "must be true or false".to_string()),
+                Some(("git", "inline_blame")) => value
+                    .as_bool()
+                    .map(|on| settings.inline_blame = Some(on))
                     .ok_or_else(|| "must be true or false".to_string()),
                 Some(("git", "worktree_dir")) => {
                     worktree_dir(value).map(|dir| settings.worktree_dir = Some(dir))
@@ -1610,6 +1626,21 @@ pub(crate) mod tests {
         );
         let (dotted, _) = parse(r#"{"git.autofetch": true}"#).unwrap();
         assert!(dotted.git_autofetch());
+        assert!(Settings::default().git_inline_blame(), "on by default");
+        let (off, problems) = parse(r#"{"git": {"inline_blame": false}}"#).unwrap();
+        assert!(
+            problems.is_empty() && !off.git_inline_blame(),
+            "{problems:?}"
+        );
+        let (off, problems) = parse(r#"{"git.inline_blame": false}"#).unwrap();
+        assert!(
+            problems.is_empty() && !off.git_inline_blame(),
+            "{problems:?}"
+        );
+        let (_, problems) = parse(r#"{"git": {"inline_blame": 1}}"#).unwrap();
+        assert_eq!(problems.len(), 1);
+        let (_, problems) = parse(r#"{"git.inline_blame": "no"}"#).unwrap();
+        assert_eq!(problems.len(), 1);
         let (dir, problems) =
             parse(r#"{"git": {"autofetch": false, "worktree_dir": "/w"}}"#).unwrap();
         assert!(problems.is_empty(), "{problems:?}");

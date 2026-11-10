@@ -307,6 +307,7 @@ impl Shell {
         ));
         self.git.commit_input = Some(input);
         self.set_autofetch(self.settings.file.git_autofetch(), window, cx);
+        self.set_inline_blame(self.settings.file.git_inline_blame(), cx);
         self.start_github(window, cx);
         self.group_worktrees();
         self.refresh_worktree_lists(cx);
@@ -1096,29 +1097,14 @@ impl Shell {
         }
     }
 
-    /// Cmd+Alt+Shift+G: turns the faded author/date caption on the cursor's line on or off.
+    /// Cmd+Alt+Shift+G: turns the faded author/date caption on the cursor's line on or off,
+    /// and keeps the choice in settings.json.
     pub(super) fn toggle_blame(&mut self, cx: &mut Context<Self>) {
-        self.git.blame_on = !self.git.blame_on;
-        let editors: Vec<_> = self
-            .items
-            .values()
-            .filter_map(|v| match v {
-                ItemView::Editor(e) => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
-        if self.git.blame_on {
-            if let Some(editor) = self.focused_editor() {
-                let line = editor.read(cx).cursor_line();
-                self.git_cursor_moved(&editor, line as u32, cx);
-            }
-        } else {
-            self.git.blame = None;
-            for editor in editors {
-                editor.update(cx, |e, cx| e.set_blame(None, cx));
-            }
+        let on = !self.git.blame_on;
+        if !self.write_setting_strict(&["git", "inline_blame"], on.into(), cx) {
+            return;
         }
-        let (title, body) = if self.git.blame_on {
+        let (title, body) = if on {
             (
                 "Inline blame is on",
                 "The cursor's line shows who changed it last.",
@@ -1127,6 +1113,32 @@ impl Shell {
             ("Inline blame is off", "")
         };
         self.transient_notice(title, body, cx);
+    }
+
+    pub(super) fn set_inline_blame(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.git.blame_on == on {
+            return;
+        }
+        self.git.blame_on = on;
+        if on {
+            if let Some(editor) = self.focused_editor() {
+                let line = editor.read(cx).cursor_line();
+                self.git_cursor_moved(&editor, line as u32, cx);
+            }
+        } else {
+            self.git.blame = None;
+            let editors: Vec<_> = self
+                .items
+                .values()
+                .filter_map(|v| match v {
+                    ItemView::Editor(e) => Some(e.clone()),
+                    _ => None,
+                })
+                .collect();
+            for editor in editors {
+                editor.update(cx, |e, cx| e.set_blame(None, cx));
+            }
+        }
     }
 
     pub(super) fn git_cursor_moved(
@@ -1146,6 +1158,14 @@ impl Shell {
         else {
             return;
         };
+        if self
+            .git
+            .repos
+            .get(&root)
+            .is_some_and(|r| r.checked && r.prefix.is_none())
+        {
+            return;
+        }
         let weak = editor.downgrade();
         let line = line as usize;
         let cancel = git::Cancel::default();

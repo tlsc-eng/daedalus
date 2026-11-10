@@ -282,6 +282,7 @@ impl Shell {
             now.ide_integration = before.ide_integration;
         }
         self.workspace.set_preferences(now);
+        self.set_inline_blame(self.settings.file.git_inline_blame(), cx);
         if let Some(window) = window {
             if now.theme != before.theme {
                 daedalus_ui::set_appearance(super::appearance::resolve(now.theme, window), cx);
@@ -534,6 +535,25 @@ impl Shell {
             }
         }
         self.refresh_settings_views(cx);
+    }
+
+    /// Like `write_setting`, but a failed write changes nothing and reports false.
+    pub(super) fn write_setting_strict(
+        &mut self,
+        keys: &[&str],
+        value: Value,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let written = settings::write(keys, &value)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|text| settings::parse(&text));
+        let ok = written.is_ok();
+        match written {
+            Ok((file, _)) => self.apply_settings(file, None, cx),
+            Err(why) => self.transient_notice("settings.json was not updated", why, cx),
+        }
+        self.refresh_settings_views(cx);
+        ok
     }
 
     /// Removes a setting from settings.json, as the Settings tab's Reset does.
