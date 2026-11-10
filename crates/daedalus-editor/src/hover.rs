@@ -74,13 +74,21 @@ impl EditorView {
 
     /// Marks the identifier under the pointer as a definition link while cmd is held.
     pub(crate) fn hover_link(&mut self, pos: Point<Pixels>, cmd: bool, cx: &mut Context<Self>) {
-        let link = if cmd && self.definitions {
+        let word = if cmd && self.definitions {
             self.word_at_position(pos)
         } else {
             None
         };
+        let link = link_for(cmd, self.definitions, word);
         if link != self.link {
             self.link = link;
+            cx.notify();
+        }
+    }
+
+    /// Drops the link, whose offsets no longer match the text or the pointer.
+    pub(crate) fn clear_link(&mut self, cx: &mut Context<Self>) {
+        if self.link.take().is_some() {
             cx.notify();
         }
     }
@@ -278,5 +286,38 @@ impl EditorView {
             .with_priority(1)
             .into_any_element(),
         )
+    }
+}
+
+fn link_for(
+    cmd: bool,
+    definitions: bool,
+    word: Option<std::ops::Range<usize>>,
+) -> Option<std::ops::Range<usize>> {
+    if cmd && definitions { word } else { None }
+}
+
+#[cfg(test)]
+mod link_for_tests {
+    use super::link_for;
+
+    #[test]
+    fn cmd_released_gives_no_link() {
+        assert_eq!(link_for(false, true, Some(1..4)), None);
+    }
+
+    #[test]
+    fn a_server_without_definitions_gives_no_link() {
+        assert_eq!(link_for(true, false, Some(1..4)), None);
+    }
+
+    #[test]
+    fn cmd_over_a_word_with_definitions_links_it() {
+        assert_eq!(link_for(true, true, Some(1..4)), Some(1..4));
+    }
+
+    #[test]
+    fn cmd_over_no_word_gives_no_link() {
+        assert_eq!(link_for(true, true, None), None);
     }
 }

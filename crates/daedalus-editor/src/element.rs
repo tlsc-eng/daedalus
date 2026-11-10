@@ -697,7 +697,7 @@ impl Element for EditorElement {
                 (a..b.max(a), m.severity)
             })
             .collect();
-        let link = view.link.clone();
+        let link = view.link.clone().filter(|_| window.modifiers().platform);
         let x0 = text_left - px(scroll_x);
         let guides = guides_for(&buffer, &shown, head_line);
         let guide_step = cell * buffer.indent.size() as f32;

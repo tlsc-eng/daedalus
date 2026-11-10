@@ -407,7 +407,9 @@ fn completion(item: CompletionItem, resolve: bool) -> Completion {
 fn push_triggers(editor: &Entity<EditorView>, client: &Client, cx: &mut Context<Shell>) {
     let completion = client.completion_triggers().to_vec();
     let signature = client.signature_triggers().to_vec();
+    let definitions = client.supports("/definitionProvider");
     editor.update(cx, |e, cx| {
+        e.set_definitions(definitions, cx);
         e.set_completion_triggers(Some(completion));
         e.set_signature_triggers(signature);
         // A file shown before its server was ready asks for its hints and tokens now.
@@ -477,8 +479,12 @@ impl Shell {
         }
         match self.document_client(&doc) {
             Some(client) => push_triggers(editor, &client, cx),
-            None if main.is_none() => super::snippets::attach_snippets(editor, cx),
-            None => {}
+            None => {
+                editor.update(cx, |e, cx| e.set_definitions(false, cx));
+                if main.is_none() {
+                    super::snippets::attach_snippets(editor, cx);
+                }
+            }
         }
     }
 
@@ -876,13 +882,20 @@ impl Shell {
                 let Some(server) = self.lsp.servers.remove(&key) else {
                     return;
                 };
+                let mut dropped = Vec::new();
                 self.lsp.documents.retain(|doc, k| {
                     let keep = *k != key;
                     if !keep {
                         self.lsp.changes.remove(doc);
+                        dropped.push(doc.clone());
                     }
                     keep
                 });
+                for doc in dropped {
+                    for editor in self.editors_showing(&doc, cx) {
+                        editor.update(cx, |e, cx| e.set_definitions(false, cx));
+                    }
+                }
                 self.lsp.linters.retain(|_, keys| {
                     keys.retain(|k| *k != key);
                     !keys.is_empty()

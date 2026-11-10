@@ -939,6 +939,7 @@ impl EditorView {
         if dirty != self.was_dirty {
             self.was_dirty = dirty;
         }
+        self.link = None;
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -1134,6 +1135,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_review_on_scroll(window, cx);
+        self.clear_link(cx);
         let lh = self.layout.as_ref().map_or(px(20.), |l| l.line_height);
         let delta = event.delta.pixel_delta(lh);
         let lines = self
@@ -1785,7 +1787,7 @@ impl Render for EditorView {
                     .min_h_0()
                     .track_focus(&self.focus)
                     .key_context("Editor")
-                    .cursor(if self.link.is_some() {
+                    .cursor(if self.link.is_some() && window.modifiers().platform {
                         CursorStyle::PointingHand
                     } else {
                         CursorStyle::IBeam
