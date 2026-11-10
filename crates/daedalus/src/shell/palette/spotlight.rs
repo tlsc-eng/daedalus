@@ -32,6 +32,7 @@ pub(super) struct State {
     pub(super) symbols: Vec<Entry>,
     pub(super) commands: Vec<Entry>,
     pub(super) sections: Vec<(Group, Range<usize>)>,
+    pub(super) scroll: gpui::ScrollHandle,
 }
 
 type Hits = Vec<(usize, Vec<usize>)>;
@@ -102,6 +103,7 @@ mod tests {
             symbols: rows("item", symbols),
             commands: rows("item", commands),
             sections: Vec::new(),
+            scroll: Default::default(),
         }
     }
 

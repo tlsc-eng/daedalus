@@ -231,6 +231,15 @@ pub(super) struct Palette {
     _subscription: Subscription,
 }
 
+impl Palette {
+    /// Child index in the rows list equals the hit index, so the selection is the item to reveal.
+    fn reveal_selected(&self) {
+        if let Some(spotlight) = &self.spotlight {
+            spotlight.scroll.scroll_to_item(self.selected);
+        }
+    }
+}
+
 /// Only a linked worktree has changes to bring back, so the palette hides it elsewhere.
 const BRING_BACK: &str = "Git: Bring Worktree Changes Back…";
 
@@ -1072,7 +1081,7 @@ impl Shell {
         };
         if let Some(spotlight) = palette.spotlight.as_mut() {
             spotlight.files = file_entries(root, files);
-            self.refresh_spotlight(true, cx);
+            self.refresh_spotlight(cx);
             return;
         }
         palette.entries = file_entries(root, files);
@@ -1253,17 +1262,18 @@ impl Shell {
                 if let Some(spotlight) = palette.spotlight.as_mut() {
                     spotlight.symbols = symbol_entries(symbols, None, root.as_deref());
                 }
-                this.refresh_spotlight(true, cx);
+                this.refresh_spotlight(cx);
             });
         }));
     }
 
     /// Re-ranks Search Everything; rows that arrive late keep the selection where it was.
-    fn refresh_spotlight(&mut self, keep_selection: bool, cx: &mut Context<Self>) {
+    fn refresh_spotlight(&mut self, cx: &mut Context<Self>) {
         let selected = self.palette.as_ref().map_or(0, |p| p.selected);
         self.filter_palette(cx);
-        if keep_selection && let Some(palette) = self.palette.as_mut() {
+        if let Some(palette) = self.palette.as_mut() {
             palette.selected = selected.min(palette.hits.len().saturating_sub(1));
+            palette.reveal_selected();
         }
     }
 
@@ -1273,6 +1283,7 @@ impl Shell {
             && let Some(spotlight) = &p.spotlight
         {
             p.selected = spotlight::jump(&spotlight.sections, p.selected, step);
+            p.reveal_selected();
             cx.notify();
         }
     }
@@ -1416,6 +1427,7 @@ impl Shell {
             palette.hits = hits;
             spotlight.sections = sections;
             palette.selected = 0;
+            palette.reveal_selected();
             palette.status = query
                 .is_empty()
                 .then_some("Search files, symbols, commands and text");
@@ -1444,6 +1456,7 @@ impl Shell {
             && !p.hits.is_empty()
         {
             p.selected = (p.selected as isize + step).rem_euclid(p.hits.len() as isize) as usize;
+            p.reveal_selected();
             self.preview_palette_symbol(cx);
             cx.notify();
         }
@@ -1700,6 +1713,9 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .when_some(palette.spotlight.as_ref(), |el, s| {
+                        el.track_scroll(&s.scroll)
+                    })
                     .py(t.ui(4.))
                     .when(palette.status.is_none(), |el| el.children(rows))
                     .children(message.map(|message| {
