@@ -91,7 +91,6 @@ pub struct Glide {
     to: f32,
     since: Instant,
     duration: Duration,
-    pub generation: u64,
 }
 
 impl Glide {
@@ -101,7 +100,6 @@ impl Glide {
             to: at,
             since: Instant::now(),
             duration,
-            generation: 0,
         }
     }
 
@@ -116,7 +114,6 @@ impl Glide {
         self.from = self.value_at(now);
         self.to = to;
         self.since = now;
-        self.generation += 1;
     }
 
     pub fn value(&self) -> f32 {
@@ -133,7 +130,11 @@ impl Glide {
     }
 
     pub fn running(&self) -> bool {
-        self.from != self.to && self.since.elapsed() < self.duration
+        self.running_at(Instant::now())
+    }
+
+    fn running_at(&self, now: Instant) -> bool {
+        self.from != self.to && now.saturating_duration_since(self.since) < self.duration
     }
 }
 
@@ -315,7 +316,8 @@ mod tests {
         assert!(shown > 0. && shown < 10.);
         g.retarget_at(20., now);
         assert_eq!(g.from, shown);
-        assert_eq!(g.generation, 2);
+        assert!(g.running_at(now + Duration::from_millis(100)));
+        assert!(!g.running_at(now + Duration::from_millis(200)));
     }
 
     #[test]

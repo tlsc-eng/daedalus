@@ -392,15 +392,16 @@ impl Shell {
         } else {
             t.motion.base
         };
-        let max = f32::from(viewport.height) * 0.6 / s - 60. - 2.;
+        let max = (f32::from(viewport.height) * 0.6 - 2.) / s - 60.;
         let target = if query_empty {
             0.
         } else {
-            (1. + 40. + list_height(&state.sections, scoped, palette.hits.len(), nothing)).min(max)
+            (1. / s + 40. + list_height(&state.sections, scoped, palette.hits.len(), nothing))
+                .min(max)
         };
         let height = Palette::glide_to(&palette.list_height, target, glide_for);
         let highlight_y = row_top(&state.sections, scoped, palette.selected);
-        let highlight = Palette::glide_to(&palette.selection, highlight_y, glide_for);
+        let highlight = palette.highlight_to(highlight_y, !palette.hits.is_empty(), glide_for);
         if height.running() || highlight.running() || stagger.is_some() {
             window.request_animation_frame();
         }

@@ -263,6 +263,16 @@ impl Palette {
         glide
     }
 
+    /// Like `glide_to` for the highlight, but forgets it while no row exists so it lands on the first row.
+    fn highlight_to(&self, target: f32, has_rows: bool, duration: Duration) -> Glide {
+        if has_rows {
+            Self::glide_to(&self.selection, target, duration)
+        } else {
+            self.selection.set(None);
+            Glide::settled(target, duration)
+        }
+    }
+
     /// Time since the rows appeared while the stagger is still running, `None` once it is over.
     fn stagger_elapsed(&self, rows_now: bool, reduced: bool) -> Option<Duration> {
         if rows_now && !self.had_rows.get() {
@@ -1813,7 +1823,7 @@ impl Shell {
         };
         let height = Palette::glide_to(&palette.list_height, target, glide_for);
         let highlight_y = 4. + 32. * palette.selected as f32;
-        let highlight = Palette::glide_to(&palette.selection, highlight_y, glide_for);
+        let highlight = palette.highlight_to(highlight_y, rows_shown > 0, glide_for);
         if height.running() || highlight.running() || stagger.is_some() {
             window.request_animation_frame();
         }
