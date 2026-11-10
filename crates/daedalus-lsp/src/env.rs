@@ -14,8 +14,10 @@ const INHERITED: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// Toolchain settings the servers need: Go's module and proxy config, nodenv and goenv.
-const TOOLCHAIN_PREFIXES: &[&str] = &["GO", "NODENV_", "NODE_", "NVM_", "LC_"];
+/// Toolchain settings the servers need: Go's module and proxy config, nodenv, goenv, rustup, cargo and pyenv.
+const TOOLCHAIN_PREFIXES: &[&str] = &[
+    "GO", "NODENV_", "NODE_", "NVM_", "LC_", "RUSTUP_", "CARGO_", "PYENV_",
+];
 
 /// Kept from a project's own linters: an SSH agent, preloaded modules or extra module folders
 /// would hand the project's code more than it needs to lint.

@@ -294,6 +294,10 @@ fn needs_restart(kind: ServerKind, old: &serde_json::Value, new: &serde_json::Va
     pointers.iter().any(|p| old.pointer(p) != new.pointer(p))
 }
 
+fn python_default_settings() -> serde_json::Value {
+    serde_json::json!({"basedpyright": {"analysis": {"typeCheckingMode": "standard"}}})
+}
+
 fn project_name(root: &Path) -> String {
     root.file_name().map_or_else(
         || root.display().to_string(),
@@ -301,8 +305,8 @@ fn project_name(root: &Path) -> String {
     )
 }
 
-/// The question and its detail for a project bringing `found` (ESLint, Biome, TypeScript) and,
-/// with `settings`, settings that choose what language servers run.
+/// The question and its detail for a project bringing `found` (ESLint, Biome, TypeScript,
+/// rust-analyzer, basedpyright) and, with `settings`, settings that choose what language servers run.
 fn trust_question(project: &str, found: &[&str], settings: bool) -> (String, String) {
     let names = match found {
         [] => String::new(),
@@ -311,11 +315,32 @@ fn trust_question(project: &str, found: &[&str], settings: bool) -> (String, Str
     };
     let message = match found.is_empty() {
         true => format!("Use {project}'s language server settings?"),
-        false => format!("Run {names} from {project}?"),
+        false => format!("Run {names} for {project}?"),
     };
+    let node: Vec<&str> = found
+        .iter()
+        .copied()
+        .filter(|n| !matches!(*n, "rust-analyzer" | "basedpyright"))
+        .collect();
     let mut brings = Vec::new();
-    if !found.is_empty() {
-        brings.push(format!("installs {names} in node_modules"));
+    if !node.is_empty() {
+        let node_names = match node.as_slice() {
+            [one] => one.to_string(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+            [] => String::new(),
+        };
+        brings.push(format!("installs {node_names} in node_modules"));
+    }
+    if found.contains(&"rust-analyzer") {
+        brings.push(
+            "is a Rust project, which rust-analyzer builds, running its build scripts and proc \
+             macros"
+                .to_string(),
+        );
+    }
+    if found.contains(&"basedpyright") {
+        brings
+            .push("is a Python project, whose environment's Python basedpyright runs".to_string());
     }
     if settings {
         brings.push("has settings that choose what its language servers run".to_string());
@@ -326,12 +351,19 @@ fn trust_question(project: &str, found: &[&str], settings: bool) -> (String, Str
             "Running them runs the project's own code, with its config and plugins, on this Mac"
         }
     };
-    let meanwhile = match found.contains(&"TypeScript") {
-        true => {
-            "Until then TypeScript uses your global install, and the project's editor settings \
-                 still apply"
-        }
-        false => "Until then the project's editor settings still apply",
+    let mut waits = Vec::new();
+    if found.contains(&"TypeScript") {
+        waits.push("TypeScript uses your global install");
+    }
+    if found.contains(&"rust-analyzer") || found.contains(&"basedpyright") {
+        waits.push("its Rust and Python files have no language server");
+    }
+    let meanwhile = match waits.is_empty() {
+        true => "Until then the project's editor settings still apply".to_string(),
+        false => format!(
+            "Until then {}, and the project's editor settings still apply",
+            waits.join(" and ")
+        ),
     };
     let detail = format!(
         "{project} {}. {risk}; allow it only for a project you trust. {meanwhile}. The command \
@@ -341,9 +373,37 @@ fn trust_question(project: &str, found: &[&str], settings: bool) -> (String, Str
     (message, detail)
 }
 
+/// The server whose start raised the question is named even when no marker found its project.
+fn name_asking_server(found: &mut Vec<&'static str>, asking: Option<ServerKind>) {
+    let name = match asking {
+        Some(ServerKind::Rust) => "rust-analyzer",
+        Some(ServerKind::Python) => "basedpyright",
+        _ => return,
+    };
+    if !found.contains(&name) {
+        found.push(name);
+    }
+}
+
+fn has_rust_project(root: &Path) -> bool {
+    root.join("Cargo.toml").is_file()
+        || std::fs::read_dir(root).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().is_dir() && e.path().join("Cargo.toml").is_file())
+        })
+}
+
+fn has_python_project(root: &Path) -> bool {
+    ["pyproject.toml", "setup.py", "requirements.txt", ".venv"]
+        .iter()
+        .any(|marker| root.join(marker).exists())
+}
+
 /// The servers a trust answer for `root` starts afresh: settings a server reads only at start,
 /// such as gopls' environment, would otherwise outlive the trust that chose them, and
-/// TypeScript goes back through the held-back check even when it is not running.
+/// TypeScript, rust-analyzer and basedpyright go back through their trust check even when they
+/// are not running.
 fn restarted_on_trust_change<'a>(
     running: impl Iterator<Item = &'a ServerKey>,
     root: &Path,
@@ -352,9 +412,11 @@ fn restarted_on_trust_change<'a>(
         .filter(|(r, kind)| r == root && !kind.is_project_local())
         .cloned()
         .collect();
-    let typescript = (root.to_path_buf(), ServerKind::TypeScript);
-    if !keys.contains(&typescript) {
-        keys.push(typescript);
+    for kind in [ServerKind::TypeScript, ServerKind::Rust, ServerKind::Python] {
+        let key = (root.to_path_buf(), kind);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
     keys
 }
@@ -372,6 +434,8 @@ fn server_for(lang: Lang) -> Option<(ServerKind, &'static str)> {
         Lang::Tsx => (ServerKind::TypeScript, "typescriptreact"),
         Lang::JavaScript => (ServerKind::TypeScript, "javascript"),
         Lang::Json => (ServerKind::Json, "json"),
+        Lang::Rust => (ServerKind::Rust, "rust"),
+        Lang::Python => (ServerKind::Python, "python"),
         _ => return None,
     })
 }
@@ -500,9 +564,7 @@ impl Shell {
             Some(client) => push_triggers(editor, &client, cx),
             None => {
                 editor.update(cx, |e, cx| e.set_definitions(false, cx));
-                if main.is_none() {
-                    super::snippets::attach_snippets(editor, cx);
-                }
+                super::snippets::attach_snippets(editor, cx);
             }
         }
     }
@@ -574,6 +636,11 @@ impl Shell {
                 crate::settings::merge_json(&mut settings, &user);
                 settings
             }
+            ServerKind::Python => {
+                let mut settings = python_default_settings();
+                crate::settings::merge_json(&mut settings, &user);
+                settings
+            }
             _ => user,
         }
     }
@@ -633,7 +700,7 @@ impl Shell {
                 match self.linter_trust(&key.0)? {
                     LinterTrust::Allowed => Some(program),
                     LinterTrust::NotAsked => {
-                        self.ask_project_trust(&key.0, cx);
+                        self.ask_project_trust(&key.0, None, cx);
                         return None;
                     }
                     LinterTrust::Denied => return None,
@@ -642,6 +709,13 @@ impl Shell {
             false => None,
         };
         if key.1 == ServerKind::TypeScript && !self.typescript_may_start(&key.0, cx) {
+            return None;
+        }
+        // A server that is not installed fails with its install hint instead of a trust prompt.
+        if key.1.runs_project_code()
+            && daedalus_lsp::find_program(key.1.program()).is_some()
+            && !self.project_code_may_run(&key.0, key.1, cx)
+        {
             return None;
         }
         tracing::info!(root = %key.0.display(), ?local, "starting {}", key.1.program());
@@ -681,6 +755,23 @@ impl Shell {
         Some(project.linters)
     }
 
+    /// Whether a server that runs the project's code may start: only once the project is allowed.
+    fn project_code_may_run(
+        &mut self,
+        root: &Path,
+        kind: ServerKind,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.linter_trust(root) {
+            Some(LinterTrust::Allowed) => true,
+            Some(LinterTrust::NotAsked) => {
+                self.ask_project_trust(root, Some(kind), cx);
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Whether typescript-language-server may start for the project at `root`: always once the
     /// project is trusted, else only when a global TypeScript can stand in for any it could reach.
     fn typescript_may_start(&mut self, root: &Path, cx: &mut Context<Self>) -> bool {
@@ -690,7 +781,7 @@ impl Shell {
             return true;
         }
         if trust == Some(LinterTrust::NotAsked) {
-            self.ask_project_trust(root, cx);
+            self.ask_project_trust(root, None, cx);
         }
         if daedalus_lsp::global_typescript(root).is_some() {
             return true;
@@ -712,7 +803,12 @@ impl Shell {
     /// Asks once per project whether the code it brings may run: the linters and TypeScript it
     /// installs, and settings that choose what language servers run, as VS Code asks before
     /// trusting a workspace.
-    pub(super) fn ask_project_trust(&mut self, root: &Path, cx: &mut Context<Self>) {
+    pub(super) fn ask_project_trust(
+        &mut self,
+        root: &Path,
+        asking: Option<ServerKind>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.lsp.asking_trust.insert(root.to_path_buf()) {
             return;
         }
@@ -724,6 +820,13 @@ impl Shell {
         if daedalus_lsp::reachable_typescript(root).is_some() {
             found.push("TypeScript");
         }
+        if has_rust_project(root) {
+            found.push("rust-analyzer");
+        }
+        if has_python_project(root) {
+            found.push("basedpyright");
+        }
+        name_asking_server(&mut found, asking);
         let settings = self.project_changes_programs(root);
         let project = project_name(root);
         let (message, detail) = trust_question(&project, &found, settings);
@@ -833,8 +936,9 @@ impl Shell {
                 LinterTrust::Allowed,
                 "Project code allowed",
                 format!(
-                    "ESLint, Biome and TypeScript from {name}'s node_modules run for its files, \
-                     and its settings choose what language servers run."
+                    "ESLint, Biome and TypeScript from {name}'s node_modules, rust-analyzer and \
+                     basedpyright run for its files, and its settings choose what language \
+                     servers run."
                 ),
             ),
             false => (
@@ -842,7 +946,8 @@ impl Shell {
                 "Project code disallowed",
                 format!(
                     "Daedalus no longer runs ESLint, Biome or TypeScript from {name}'s \
-                     node_modules, nor its settings for language servers."
+                     node_modules, nor rust-analyzer or basedpyright for it, nor its settings \
+                     for language servers."
                 ),
             ),
         };
@@ -2582,7 +2687,7 @@ mod tests {
     #[test]
     fn the_trust_question_names_what_the_project_brings() {
         let (message, detail) = trust_question("web", &["ESLint", "Biome", "TypeScript"], true);
-        assert_eq!(message, "Run ESLint, Biome and TypeScript from web?");
+        assert_eq!(message, "Run ESLint, Biome and TypeScript for web?");
         assert!(
             detail.starts_with(
                 "web installs ESLint, Biome and TypeScript in node_modules and has settings"
@@ -2590,9 +2695,23 @@ mod tests {
             "{detail}"
         );
         let (message, detail) = trust_question("api", &["ESLint"], false);
-        assert_eq!(message, "Run ESLint from api?");
+        assert_eq!(message, "Run ESLint for api?");
         assert!(!detail.contains("settings that"), "{detail}");
         assert!(!detail.contains("TypeScript"), "{detail}");
+        let (message, detail) = trust_question("crab", &["rust-analyzer"], false);
+        assert_eq!(message, "Run rust-analyzer for crab?");
+        assert!(detail.contains("proc macros"), "{detail}");
+        assert!(!detail.contains("node_modules"), "{detail}");
+        assert!(detail.contains("no language server"), "{detail}");
+        let (message, detail) = trust_question("snake", &["basedpyright"], false);
+        assert_eq!(message, "Run basedpyright for snake?");
+        assert!(detail.contains("whose environment's Python"), "{detail}");
+        let (message, detail) = trust_question("mix", &["ESLint", "rust-analyzer"], false);
+        assert_eq!(message, "Run ESLint and rust-analyzer for mix?");
+        assert!(
+            detail.starts_with("mix installs ESLint in node_modules and is a Rust project"),
+            "{detail}"
+        );
         let (message, detail) = trust_question("go-svc", &[], true);
         assert_eq!(message, "Use go-svc's language server settings?");
         assert!(detail.starts_with("go-svc has settings"), "{detail}");
@@ -2627,14 +2746,74 @@ mod tests {
             [
                 (root.to_path_buf(), ServerKind::Go),
                 (root.to_path_buf(), ServerKind::TypeScript),
+                (root.to_path_buf(), ServerKind::Rust),
+                (root.to_path_buf(), ServerKind::Python),
             ]
         );
-        let running = [(root.to_path_buf(), ServerKind::TypeScript)];
+        let running = [
+            (root.to_path_buf(), ServerKind::Python),
+            (root.to_path_buf(), ServerKind::TypeScript),
+            (root.to_path_buf(), ServerKind::Rust),
+        ];
         assert_eq!(
             restarted_on_trust_change(running.iter(), root),
             running,
             "once"
         );
+    }
+
+    #[test]
+    fn rust_and_python_files_get_their_servers_and_python_starts_in_standard_mode() {
+        assert_eq!(server_for(Lang::Rust), Some((ServerKind::Rust, "rust")));
+        assert_eq!(
+            server_for(Lang::Python),
+            Some((ServerKind::Python, "python"))
+        );
+        let mut settings = python_default_settings();
+        let user =
+            serde_json::json!({"basedpyright": {"analysis": {"typeCheckingMode": "strict"}}});
+        crate::settings::merge_json(&mut settings, &user);
+        assert_eq!(
+            settings["basedpyright"]["analysis"]["typeCheckingMode"],
+            "strict"
+        );
+        assert_eq!(
+            python_default_settings()["basedpyright"]["analysis"]["typeCheckingMode"],
+            "standard"
+        );
+    }
+
+    #[test]
+    fn the_server_that_asked_is_named_once_even_without_markers() {
+        let mut found = Vec::new();
+        name_asking_server(&mut found, Some(ServerKind::Python));
+        assert_eq!(found, ["basedpyright"]);
+        name_asking_server(&mut found, Some(ServerKind::Python));
+        assert_eq!(found, ["basedpyright"], "a marker already named it");
+        name_asking_server(&mut found, Some(ServerKind::Rust));
+        assert_eq!(found, ["basedpyright", "rust-analyzer"]);
+        name_asking_server(&mut found, None);
+        assert_eq!(found.len(), 2);
+        let (message, _) = trust_question("scripts", &["basedpyright"], false);
+        assert_eq!(message, "Run basedpyright for scripts?");
+    }
+
+    #[test]
+    fn project_markers_find_rust_and_python_projects() {
+        let dir = std::env::temp_dir().join(format!("daedalus-markers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(!has_rust_project(&dir) && !has_python_project(&dir));
+        std::fs::write(dir.join("sub/Cargo.toml"), "").unwrap();
+        assert!(has_rust_project(&dir), "child dir");
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert!(has_rust_project(&dir), "root");
+        std::fs::create_dir(dir.join(".venv")).unwrap();
+        assert!(has_python_project(&dir), ".venv");
+        std::fs::remove_dir(dir.join(".venv")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+        assert!(has_python_project(&dir), "pyproject");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

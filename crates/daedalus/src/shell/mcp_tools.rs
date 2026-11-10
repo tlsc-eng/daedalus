@@ -343,7 +343,8 @@ impl Shell {
 
 fn no_server(doc: &Path) -> String {
     format!(
-        "no language server has {} open; Daedalus runs gopls and typescript-language-server",
+        "no language server has {} open; Daedalus runs gopls, typescript-language-server, \
+         rust-analyzer and basedpyright",
         doc.display()
     )
 }

@@ -338,7 +338,7 @@ impl Bridge {
     }
 
     #[tool(
-        description = "Errors and warnings from Daedalus's language servers (gopls, typescript-language-server). Covers files open in Daedalus's editor and, for Go, the rest of their packages. Lines are 1-based; columns count UTF-16 units."
+        description = "Errors and warnings from Daedalus's language servers (gopls, typescript-language-server, rust-analyzer, basedpyright). Covers files open in Daedalus's editor and, for Go, the rest of their packages. Lines are 1-based; columns count UTF-16 units."
     )]
     async fn get_diagnostics(
         &self,
