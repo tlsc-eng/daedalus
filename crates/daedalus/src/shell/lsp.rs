@@ -38,7 +38,14 @@ const SNIPPET_CHARS: usize = 160;
 
 pub(super) const NO_SERVER: &str = "No language server runs for this file.";
 
-actions!(daedalus, [AllowProjectLinters, DisallowProjectLinters]);
+actions!(
+    daedalus,
+    [
+        AllowProjectLinters,
+        DisallowProjectLinters,
+        RestartLanguageServers
+    ]
+);
 
 const PROJECT_LINTERS: [ServerKind; 2] = [ServerKind::Eslint, ServerKind::Biome];
 
@@ -70,7 +77,7 @@ struct Server {
 #[derive(Default)]
 pub(super) struct LspState {
     servers: HashMap<ServerKey, Server>,
-    /// Servers that failed to start, not retried until Daedalus restarts.
+    /// Servers that failed to start, not retried until Daedalus restarts or the user restarts them.
     failed: HashMap<ServerKey, String>,
     /// Each file's diagnostics, by the server that published them.
     pub(super) diagnostics: HashMap<PathBuf, Vec<(ServerKey, Vec<Diagnostic>)>>,
@@ -349,6 +356,11 @@ fn restarted_on_trust_change<'a>(
         keys.push(typescript);
     }
     keys
+}
+
+fn failure_for(failed: &HashMap<ServerKey, String>, root: &Path, lang: Lang) -> Option<String> {
+    let (kind, _) = server_for(lang)?;
+    failed.get(&(root.to_path_buf(), kind)).cloned()
 }
 
 fn server_for(lang: Lang) -> Option<(ServerKind, &'static str)> {
@@ -933,7 +945,11 @@ impl Shell {
                         format!("{program} could not start")
                     }
                 };
-                self.local_notice(NoticeKind::Message { title, body: why }, cx);
+                let body = match server.ready {
+                    true => why,
+                    false => format!("{why} Then run Restart language servers."),
+                };
+                self.local_notice(NoticeKind::Message { title, body }, cx);
             }
             Event::RefreshInlayHints => self.refresh_inlay_hints(&key, cx),
             Event::RefreshSemanticTokens => {
@@ -1361,7 +1377,10 @@ impl Shell {
             .and_then(|k| self.lsp.servers.get(k))
             .map(|s| s.client.clone())
         else {
-            return self.lsp_failed("No definition found", NO_SERVER.into(), cx);
+            return {
+                let why = self.no_server_reason(editor, cx);
+                self.lsp_failed("No definition found", why, cx)
+            };
         };
         tracing::debug!(path = %doc.display(), line = at.line, character = at.character, "definition");
         let editor = editor.downgrade();
@@ -1408,7 +1427,10 @@ impl Shell {
             false => ("implementation", "No implementation found"),
         };
         let Some(client) = self.document_client(&doc) else {
-            return self.lsp_failed(title, NO_SERVER.into(), cx);
+            return {
+                let why = self.no_server_reason(&editor, cx);
+                self.lsp_failed(title, why, cx)
+            };
         };
         let Some((line, character)) = editor.read(cx).cursor_utf16() else {
             return;
@@ -1829,7 +1851,10 @@ impl Shell {
         let doc = document_key(editor.read(cx).path());
         self.flush_change(&doc, editor, cx);
         let Some(client) = self.document_client(&doc) else {
-            return self.lsp_failed(TITLE, NO_SERVER.into(), cx);
+            return {
+                let why = self.no_server_reason(editor, cx);
+                self.lsp_failed(TITLE, why, cx)
+            };
         };
         if !client.supports("/documentRangeFormattingProvider") {
             let program = self
@@ -1956,7 +1981,7 @@ impl Shell {
             .and_then(|k| self.lsp.servers.get(k))
             .map(|s| s.client.clone())
         else {
-            self.lsp.references = References::Failed(NO_SERVER.into());
+            self.lsp.references = References::Failed(self.no_server_reason(editor, cx));
             return;
         };
         self.lsp.references = References::Loading;
@@ -2163,6 +2188,22 @@ impl Shell {
     }
 
     /// Says why a lookup went nowhere, so a click or key press is never silently ignored.
+    /// Why the editor's file has no server: the failure that stopped it, else the generic line.
+    pub(super) fn no_server_reason(
+        &self,
+        editor: &Entity<EditorView>,
+        cx: &Context<Self>,
+    ) -> String {
+        let root = self.items.iter().find_map(|((root, _), view)| match view {
+            ItemView::Editor(e) if e == editor => Some(root),
+            _ => None,
+        });
+        let lang = editor.read(cx).lang();
+        root.zip(lang)
+            .and_then(|(root, lang)| failure_for(&self.lsp.failed, root, lang))
+            .unwrap_or_else(|| NO_SERVER.into())
+    }
+
     pub(super) fn lsp_failed(&mut self, title: &str, body: String, cx: &mut Context<Self>) {
         self.transient_notice(title, body, cx);
     }
@@ -2254,6 +2295,39 @@ impl Shell {
                 server.client.did_close(&doc);
             }
         }
+    }
+
+    /// Starts the active project's servers again, including those that failed to start, so a
+    /// newly installed one is picked up without restarting Daedalus.
+    pub(super) fn restart_project_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.active_root() else {
+            return;
+        };
+        let mut keys: Vec<ServerKey> = self
+            .lsp
+            .servers
+            .keys()
+            .chain(self.lsp.failed.keys())
+            .filter(|(r, _)| *r == root)
+            .cloned()
+            .collect();
+        keys.sort_by_key(|(_, kind)| kind.program());
+        keys.dedup();
+        self.lsp.held_back.remove(&root);
+        self.lsp.failed.retain(|(r, _), _| *r != root);
+        self.lsp.crashes.retain(|(r, _), _| *r != root);
+        self.lsp.restarts.retain(|(r, _), _| *r != root);
+        for key in &keys {
+            match self.lsp.servers.contains_key(key) {
+                true => self.replace_server(key, cx),
+                false => self.restart_lsp(key, cx),
+            }
+        }
+        let body = match keys.len() {
+            1 => "Restarted 1 language server".to_string(),
+            n => format!("Restarted {n} language servers"),
+        };
+        self.transient_notice("Language servers", body, cx);
     }
 
     pub(super) fn lsp_project_closed(&mut self, root: &Path) {
@@ -2400,6 +2474,25 @@ mod tests {
             &[place("/nonexistent/b.rs", 3, 4, 9)]
         ));
         assert!(!is_own_definition(doc, at(3, 6), &[here.clone(), here]));
+    }
+
+    #[test]
+    fn a_failure_is_found_for_its_project_and_language_only() {
+        let root = PathBuf::from("/work/app");
+        let mut failed = HashMap::new();
+        failed.insert(
+            (root.clone(), ServerKind::TypeScript),
+            "not installed".to_string(),
+        );
+        assert_eq!(
+            failure_for(&failed, &root, Lang::Tsx).as_deref(),
+            Some("not installed")
+        );
+        assert_eq!(
+            failure_for(&failed, Path::new("/work/other"), Lang::Tsx),
+            None
+        );
+        assert_eq!(failure_for(&failed, &root, Lang::Go), None);
     }
 
     fn unstarted() -> (Rc<Client>, Server) {

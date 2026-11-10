@@ -11,7 +11,7 @@ use gpui::{Context, Entity, EntityId, PromptLevel, Subscription, Task, WeakEntit
 
 use super::Shell;
 use super::edits::AskedAt;
-use super::lsp::{CONFIRMED, NO_SERVER, confirm_buttons, document_key};
+use super::lsp::{CONFIRMED, confirm_buttons, document_key};
 use crate::actions::ApplyCodeAction;
 use crate::settings::Lightbulb;
 
@@ -286,7 +286,10 @@ impl Shell {
         let asked = self.versions_for_request(cx);
         let servers = self.document_servers(&doc);
         if servers.is_empty() {
-            return self.lsp_failed("No code actions", NO_SERVER.into(), cx);
+            return {
+                let why = self.no_server_reason(&editor, cx);
+                self.lsp_failed("No code actions", why, cx)
+            };
         }
         let Some((line, character)) = editor.read(cx).cursor_utf16() else {
             return;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -236,6 +236,7 @@ impl Client {
             events: events_tx.clone(),
             pending: pending.clone(),
             child: child.clone(),
+            stderr: Arc::default(),
         };
         let waiters = pending.clone();
         let spawned = thread::Builder::new()
@@ -824,9 +825,66 @@ struct Session {
     events: async_channel::Sender<Event>,
     pending: Pending,
     child: Arc<Mutex<Option<Child>>>,
+    stderr: Arc<Stderr>,
     triggers: Arc<OnceLock<Vec<String>>>,
     signature_triggers: Arc<OnceLock<Vec<String>>>,
     capabilities: Arc<OnceLock<Value>>,
+}
+
+const STDERR_LINES: usize = 8;
+
+/// The last lines a server wrote to stderr, drained so a chatty server never blocks on a full pipe.
+#[derive(Default)]
+struct Stderr {
+    tail: Mutex<VecDeque<String>>,
+    reader: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Stderr {
+    fn drain(self: &Arc<Self>, pipe: impl Read + Send + 'static) -> Result<()> {
+        let this = self.clone();
+        let handle = thread::Builder::new()
+            .name("lsp-stderr".into())
+            .spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let mut tail = this.tail.lock().expect("stderr lock");
+                    if tail.len() == STDERR_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            })?;
+        *self.reader.lock().expect("stderr lock") = Some(handle);
+        Ok(())
+    }
+
+    /// Waits for the pipe to close so the message carries everything the server said before dying.
+    fn exit_reason(&self) -> String {
+        if let Some(handle) = self.reader.lock().expect("stderr lock").take() {
+            let _ = handle.join();
+        }
+        let tail: Vec<String> = self
+            .tail
+            .lock()
+            .expect("stderr lock")
+            .iter()
+            .cloned()
+            .collect();
+        exit_reason(&tail)
+    }
+}
+
+fn exit_reason(tail: &[String]) -> String {
+    let lines: Vec<&str> = tail
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        "the language server exited".into()
+    } else {
+        format!("the language server exited: {}", lines.join(" "))
+    }
 }
 
 impl Session {
@@ -853,11 +911,14 @@ impl Session {
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not start {}", program.display()))?;
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
+        if let Some(stderr) = child.stderr.take() {
+            self.stderr.drain(stderr)?;
+        }
         *self.child.lock().expect("child lock") = Some(child);
         self.serve(stdin, stdout)
     }
@@ -887,6 +948,7 @@ impl Session {
             outgoing: self.outgoing.clone(),
             pending: self.pending.clone(),
             events: self.events.clone(),
+            stderr: self.stderr.clone(),
         };
         thread::Builder::new()
             .name("lsp-reader".into())
@@ -900,7 +962,7 @@ impl Session {
         send(&writer, request(0, "initialize", self.initialize_params()))?;
         let result = init
             .recv_blocking()
-            .context("the server stopped while starting")?
+            .map_err(|_| anyhow!(self.stderr.exit_reason()))?
             .map_err(anyhow::Error::msg)?;
         if result.is_null() {
             bail!("{} refused to start", self.kind.program());
@@ -1055,6 +1117,7 @@ struct Reader {
     outgoing: async_channel::Receiver<Outgoing>,
     pending: Pending,
     events: async_channel::Sender<Event>,
+    stderr: Arc<Stderr>,
 }
 
 impl Reader {
@@ -1063,13 +1126,12 @@ impl Reader {
         while let Ok(Some(message)) = read_message(&mut input) {
             self.handle(message);
         }
+        let reason = self.stderr.exit_reason();
         // Waiters see a closed channel instead of hanging; closing the queue first means a
         // request that misses this clear is refused by the queue instead.
         self.outgoing.close();
         self.pending.lock().expect("pending lock").clear();
-        let _ = self
-            .events
-            .send_blocking(Event::Stopped("the language server exited".into()));
+        let _ = self.events.send_blocking(Event::Stopped(reason));
     }
 
     fn handle(&self, message: Value) {
@@ -1281,6 +1343,35 @@ mod tests {
     }
 
     #[test]
+    fn a_server_that_exits_reports_its_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("daedalus-lsp-stderr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'boom: no toolchain' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_client, events) = Client::start_local(
+            ServerKind::Go,
+            script,
+            dir.clone(),
+            Arc::new(RwLock::new(json!({}))),
+        );
+        let why = loop {
+            match events.recv_blocking().unwrap() {
+                Event::Stopped(why) => break why,
+                _ => continue,
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(why.contains("boom"), "{why}");
+    }
+
+    #[test]
     fn dropping_a_server_kills_the_processes_it_started() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("daedalus-lsp-group-{}", std::process::id()));
@@ -1337,6 +1428,7 @@ mod tests {
             events: events_tx,
             pending: Arc::default(),
             child: Arc::default(),
+            stderr: Arc::default(),
             triggers: Arc::default(),
             signature_triggers: Arc::default(),
             capabilities: Arc::default(),
@@ -1417,6 +1509,7 @@ mod tests {
             events: events_tx,
             pending: pending.clone(),
             child: Arc::default(),
+            stderr: Arc::default(),
             triggers: Arc::default(),
             signature_triggers: Arc::default(),
             capabilities: capabilities_slot.clone(),
