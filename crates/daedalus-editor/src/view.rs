@@ -1808,6 +1808,10 @@ impl Render for EditorView {
                     .on_modifiers_changed(cx.listener(
                         |this, e: &ModifiersChangedEvent, window, cx| {
                             this.hover_link(window.mouse_position(), e.modifiers.platform, cx);
+                            if !e.modifiers.platform {
+                                // gpui does not repaint on modifier changes, so unfocused editors keep a stale underline
+                                window.refresh();
+                            }
                         },
                     ))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
