@@ -91,8 +91,8 @@ use crate::actions::{
 };
 use crate::actions::{
     FindInProject, FontZoomIn, FontZoomOut, FontZoomReset, GoToSymbol, GoToWorkspaceSymbol,
-    NavigateBack, NavigateForward, NextProblem, PrevProblem, RevealInTree, SendToClaude,
-    ShowChanges, ShowProblems, SwitchBranch, ToggleBlame, ToggleIdeIntegration,
+    NavigateBack, NavigateForward, NextProblem, PrevProblem, RevealInTree, SearchEverything,
+    SendToClaude, ShowChanges, ShowProblems, SwitchBranch, ToggleBlame, ToggleIdeIntegration,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -740,6 +740,9 @@ impl Render for Shell {
             .text_color(t.color.content)
             .on_action(cx.listener(|this, _: &QuickOpen, w, cx| {
                 this.open_palette(palette::Mode::Files, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SearchEverything, w, cx| {
+                this.open_palette(palette::Mode::Everything, w, cx)
             }))
             .on_action(cx.listener(|this, _: &QuickOpenBeside, w, cx| {
                 this.open_palette(palette::Mode::FilesBeside, w, cx)

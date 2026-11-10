@@ -57,6 +57,9 @@ actions!(
         ToggleFormatOnSave,
         ToggleWordWrapDefault,
         FindInProject,
+        SearchEverything,
+        NextGroup,
+        PrevGroup,
         ShowChanges,
         ToggleBlame,
         SwitchBranch,
@@ -215,7 +218,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-shift-t", ContinueClaudeSession, None),
         KeyBinding::new("cmd-shift-v", TogglePreview, None),
         KeyBinding::new("cmd-shift-s", SaveAs, None),
-        KeyBinding::new("cmd-shift-f", FindInProject, None),
+        KeyBinding::new("cmd-shift-f", SearchEverything, None),
+        KeyBinding::new("tab", NextGroup, Some("Spotlight")),
+        KeyBinding::new("shift-tab", PrevGroup, Some("Spotlight")),
         KeyBinding::new("cmd-alt-shift-g", ToggleBlame, None),
         KeyBinding::new("ctrl--", NavigateBack, None),
         // macOS reports ⌃⇧- as ⌃_, so that is the binding that matches; the other is for the menu.
@@ -375,6 +380,7 @@ fn menus(recent: &[PathBuf]) -> Vec<Menu> {
                 MenuItem::action("Go to Symbol in Workspace…", GoToWorkspaceSymbol),
                 MenuItem::action("Back", NavigateBack),
                 MenuItem::action("Forward", NavigateForward),
+                MenuItem::action("Search Everything…", SearchEverything),
                 MenuItem::action("Find in Project…", FindInProject),
                 MenuItem::action("Toggle File Tree", ToggleFileTree),
                 MenuItem::submenu(Menu {
@@ -503,6 +509,7 @@ mod tests {
         for (source, key) in [
             ("f8", "f8"),
             ("shift-f8", "f8"),
+            ("shift-tab", "tab"),
             ("f2", "f2"),
             ("cmd-f12", "f12"),
             ("cmd-.", "."),
