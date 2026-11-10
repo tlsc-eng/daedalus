@@ -840,7 +840,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &crate::actions::ShowGit, w, cx| {
                 this.show_side_mode(SideMode::Git, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &FindInProject, w, cx| this.find_in_project(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &FindInProject, w, cx| this.find_in_project(None, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ShowChanges, _, cx| this.toggle_changes(cx)))
             .on_action(cx.listener(|this, _: &ToggleBlame, _, cx| this.toggle_blame(cx)))
             .on_action(cx.listener(|this, _: &FontZoomIn, _, cx| this.zoom_font(Some(1), cx)))

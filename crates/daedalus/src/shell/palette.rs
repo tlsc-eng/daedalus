@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use daedalus_editor::EditorView;
@@ -15,6 +17,7 @@ use gpui::{
 use super::Shell;
 use super::fuzzy;
 use super::lsp::document_key;
+use super::search::{self, Matcher, Query};
 use super::send_selection::{Mention, SendTo};
 use crate::actions;
 use daedalus_term::ClaudeState;
@@ -23,6 +26,8 @@ mod spotlight;
 
 const MAX_FILES: usize = 20_000;
 const MAX_ROWS: usize = 50;
+/// The text search stops at this many matches; the list shows fewer.
+const TEXT_CAP: usize = 20;
 /// A file's whole outline is listed, as VS Code does, up to this many symbols.
 const MAX_SYMBOL_ROWS: usize = 1000;
 /// Typing pauses this long before the servers are asked for workspace symbols.
@@ -47,6 +52,8 @@ pub(super) enum Target {
     SidebarFolder(super::sidebar::FolderPick),
     /// Sending a selection to a Claude session, or to a new one.
     Send(SendTo, Mention),
+    /// Hands the query to the Search drawer tab.
+    ProjectSearch(String),
 }
 
 impl Clone for Target {
@@ -63,6 +70,7 @@ impl Clone for Target {
             Self::Link(url) => Self::Link(url.clone()),
             Self::SidebarFolder(pick) => Self::SidebarFolder(pick.clone()),
             Self::Send(to, mention) => Self::Send(to.clone(), mention.clone()),
+            Self::ProjectSearch(query) => Self::ProjectSearch(query.clone()),
         }
     }
 }
@@ -784,9 +792,10 @@ impl Shell {
             origin: None,
             asked: 0,
             symbols_task: None,
-            spotlight: commands.map(|commands| spotlight::State {
-                commands,
-                ..Default::default()
+            spotlight: commands.map(|commands| {
+                let mut state = spotlight::State::default();
+                state.commands = commands;
+                state
             }),
             _subscription: subscription,
         });
@@ -1102,7 +1111,10 @@ impl Shell {
         }
         match self.palette.as_ref().map(|p| p.mode) {
             Some(Mode::WorkspaceSymbols) => self.request_workspace_symbols(cx),
-            Some(Mode::Everything) => self.request_everything_symbols(cx),
+            Some(Mode::Everything) => {
+                self.request_everything_symbols(cx);
+                self.request_everything_text(cx);
+            }
             _ => {}
         }
         self.filter_palette(cx);
@@ -1267,6 +1279,61 @@ impl Shell {
         }));
     }
 
+    fn request_everything_text(&mut self, cx: &mut Context<Self>) {
+        let root = self.workspace.active_project().map(|p| p.root.clone());
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        let query = Self::palette_needle(palette, cx);
+        let Some(spotlight) = palette.spotlight.as_mut() else {
+            return;
+        };
+        spotlight.text_cancel.store(true, Ordering::Relaxed);
+        spotlight.text_cancel = Arc::default();
+        spotlight.text_task = None;
+        let matcher = Matcher::new(&Query::literal(&query));
+        let (true, Ok(Some(m)), Some(root)) = (query.chars().count() >= 3, matcher, root) else {
+            spotlight.text.clear();
+            return;
+        };
+        let cancel = spotlight.text_cancel.clone();
+        spotlight.text_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(search::DEBOUNCE).await;
+            let found = cx
+                .background_executor()
+                .spawn({
+                    let (root, cancel) = (root.clone(), cancel.clone());
+                    async move {
+                        let mut found = Vec::new();
+                        search::search(&root, &m, &cancel, TEXT_CAP, |batch| {
+                            found.extend(batch);
+                            true
+                        });
+                        found
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(spotlight) = this.palette.as_mut().and_then(|p| p.spotlight.as_mut())
+                else {
+                    return;
+                };
+                spotlight.text = found
+                    .iter()
+                    .flat_map(|f| {
+                        f.hits
+                            .iter()
+                            .map(|h| spotlight::text_entry(&root, &f.path, h))
+                    })
+                    .collect();
+                this.refresh_spotlight(cx);
+            });
+        }));
+    }
+
     /// Re-ranks Search Everything; rows that arrive late keep the selection where it was.
     fn refresh_spotlight(&mut self, cx: &mut Context<Self>) {
         let selected = self.palette.as_ref().map_or(0, |p| p.selected);
@@ -1275,6 +1342,15 @@ impl Shell {
             palette.selected = selected.min(palette.hits.len().saturating_sub(1));
             palette.reveal_selected();
         }
+    }
+
+    fn open_in_search_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = self.palette.as_ref() else {
+            return;
+        };
+        let query = Some(Self::palette_needle(palette, cx)).filter(|q| !q.is_empty());
+        self.close_palette(window, cx);
+        self.find_in_project(query, window, cx);
     }
 
     /// Tab and Shift-Tab in Search Everything: the first row of the next or previous group.
@@ -1539,6 +1615,7 @@ impl Shell {
             Some(Target::Link(_)) => {}
             Some(Target::SidebarFolder(pick)) => self.run_folder_pick(pick, cx),
             Some(Target::Send(to, mention)) => self.send_selection(to, mention, window, cx),
+            Some(Target::ProjectSearch(query)) => self.find_in_project(Some(query), window, cx),
             None => {}
         }
         cx.notify();
@@ -1677,6 +1754,11 @@ impl Shell {
                     .on_action(cx.listener(|this, _: &actions::PrevGroup, _, cx| {
                         this.jump_spotlight_group(-1, cx)
                     }))
+                    .on_action(
+                        cx.listener(|this, _: &actions::OpenInSearchPanel, window, cx| {
+                            this.open_in_search_panel(window, cx)
+                        }),
+                    )
             })
             .w(t.ui(if everything { 640. } else { 560. }))
             .max_h(t.ui(if everything {

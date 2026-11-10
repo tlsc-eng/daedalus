@@ -60,6 +60,7 @@ actions!(
         SearchEverything,
         NextGroup,
         PrevGroup,
+        OpenInSearchPanel,
         ShowChanges,
         ToggleBlame,
         SwitchBranch,
@@ -221,6 +222,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", SearchEverything, None),
         KeyBinding::new("tab", NextGroup, Some("Spotlight")),
         KeyBinding::new("shift-tab", PrevGroup, Some("Spotlight")),
+        KeyBinding::new("cmd-shift-f", OpenInSearchPanel, Some("Spotlight")),
         KeyBinding::new("cmd-alt-shift-g", ToggleBlame, None),
         KeyBinding::new("ctrl--", NavigateBack, None),
         // macOS reports ⌃⇧- as ⌃_, so that is the binding that matches; the other is for the menu.

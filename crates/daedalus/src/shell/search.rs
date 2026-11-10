@@ -24,7 +24,7 @@ use super::drawer::DrawerTab;
 use super::item::ItemView;
 
 /// Typing pauses this long before a new search starts.
-const DEBOUNCE: Duration = Duration::from_millis(150);
+pub(super) const DEBOUNCE: Duration = Duration::from_millis(150);
 const MAX_FILE: u64 = 1024 * 1024;
 /// A NUL byte this early marks a file as binary, as git and ripgrep decide.
 const BINARY_PROBE: usize = 8 * 1024;
@@ -38,17 +38,17 @@ const ROW_HEIGHT: f32 = 24.;
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Hit {
     /// Zero-based line and UTF-16 column of the first match, as editors are positioned.
-    line: u32,
-    column: u32,
-    text: String,
+    pub(super) line: u32,
+    pub(super) column: u32,
+    pub(super) text: String,
     /// Byte ranges of the matches within `text`.
-    ranges: Vec<Range<usize>>,
+    pub(super) ranges: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FileHits {
-    path: PathBuf,
-    hits: Vec<Hit>,
+    pub(super) path: PathBuf,
+    pub(super) hits: Vec<Hit>,
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +123,15 @@ pub(super) struct Matcher {
     options: FindOptions,
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
+}
+
+impl Query {
+    pub(super) fn literal(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
 }
 
 impl Matcher {
@@ -290,11 +299,12 @@ fn excerpt(line: &str, ranges: &[Range<usize>]) -> (String, Vec<Range<usize>>) {
     (format!("{prefix}{}", &line[start..end]), shown)
 }
 
-/// Searches every file under `root`, handing results to `send` in batches; true when the cap cut it short.
-fn search(
+/// Searches every file under `root`, handing results to `send` in batches; true when `cap` cut it short.
+pub(super) fn search(
     root: &Path,
     m: &Matcher,
     cancel: &AtomicBool,
+    cap: usize,
     mut send: impl FnMut(Vec<FileHits>) -> bool,
 ) -> bool {
     let mut batch = Vec::new();
@@ -322,7 +332,7 @@ fn search(
                 text,
                 ranges,
             });
-            if total >= MAX_HITS {
+            if total >= cap {
                 break;
             }
         }
@@ -330,7 +340,7 @@ fn search(
             pending += hits.len();
             batch.push(FileHits { path, hits });
         }
-        if total >= MAX_HITS {
+        if total >= cap {
             send(batch);
             return true;
         }
@@ -498,13 +508,19 @@ impl Shell {
     }
 
     /// Cmd+Shift+F: shows the Search tab, seeded with the editor's one-line selection.
-    pub(super) fn find_in_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn find_in_project(
+        &mut self,
+        seed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let find = self.ensure_search_inputs(cx);
-        let seed = self
-            .focused_editor()
-            .and_then(|e| e.read(cx).cursor())
-            .and_then(|(_, _, selection)| selection)
-            .filter(|s| !s.contains('\n'));
+        let seed = seed.or_else(|| {
+            self.focused_editor()
+                .and_then(|e| e.read(cx).cursor())
+                .and_then(|(_, _, selection)| selection)
+                .filter(|s| !s.contains('\n'))
+        });
         // Selected, as VS Code leaves it, so typing replaces the seed or the last query.
         find.update(cx, |i, cx| {
             if let Some(seed) = seed {
@@ -596,7 +612,7 @@ impl Shell {
             let (tx, rx) = async_channel::unbounded();
             cx.background_executor()
                 .spawn(async move {
-                    let truncated = search(&root, &m, &cancel, |batch| {
+                    let truncated = search(&root, &m, &cancel, MAX_HITS, |batch| {
                         tx.send_blocking(Found::Batch(batch)).is_ok()
                     });
                     let _ = tx.send_blocking(Found::Done { truncated });
@@ -1331,7 +1347,7 @@ mod tests {
     fn run_query(root: &Path, q: &Query) -> (Vec<FileHits>, bool) {
         let mut out = Vec::new();
         let m = Matcher::new(q).unwrap().unwrap();
-        let truncated = search(root, &m, &AtomicBool::new(false), |b| {
+        let truncated = search(root, &m, &AtomicBool::new(false), MAX_HITS, |b| {
             out.extend(b);
             true
         });
@@ -1538,6 +1554,22 @@ mod tests {
         assert!(truncated);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].hits.len(), MAX_HITS / 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_stops_at_a_smaller_cap() {
+        let root = project("small-cap");
+        let lines: String = (0..10).map(|_| "hit\n").collect();
+        std::fs::write(root.join("src/a.txt"), lines).unwrap();
+        let m = matcher("hit");
+        let mut found = Vec::new();
+        let truncated = search(&root, &m, &AtomicBool::new(false), 3, |b| {
+            found.extend(b);
+            true
+        });
+        assert!(truncated);
+        assert_eq!(found[0].hits.len(), 3);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
