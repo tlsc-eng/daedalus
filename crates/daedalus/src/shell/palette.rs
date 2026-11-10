@@ -1367,7 +1367,7 @@ impl Shell {
     /// Tab and Shift-Tab in Search Everything: the first row of the next or previous group.
     fn jump_spotlight_group(&mut self, step: isize, cx: &mut Context<Self>) {
         if let Some(p) = self.palette.as_mut()
-            && let Some(spotlight) = &p.spotlight
+            && let Some(spotlight) = p.spotlight.as_ref().filter(|s| s.scope.is_none())
         {
             p.selected = spotlight::jump(&spotlight.sections, p.selected, step);
             p.reveal_selected();
@@ -1513,10 +1513,8 @@ impl Shell {
                 spotlight.scope = None;
             }
             let (entries, hits, sections) = spotlight::arrange(spotlight, &query, spotlight.scope);
-            spotlight.chips = match spotlight.scope {
-                None => spotlight::chips(&sections),
-                Some(_) => spotlight::chips(&spotlight::arrange(spotlight, &query, None).2),
-            };
+            let all = spotlight::arrange(spotlight, &query, None).2;
+            spotlight.chips = spotlight::chips(&all, spotlight.scope);
             palette.entries = entries;
             palette.hits = hits;
             spotlight.sections = sections;

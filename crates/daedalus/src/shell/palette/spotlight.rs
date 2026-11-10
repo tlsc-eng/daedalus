@@ -164,9 +164,12 @@ pub(super) fn arrange(
     (entries, hits, sections)
 }
 
-/// The groups to offer as chips: those with rows, in group order.
-pub(super) fn chips(sections: &[(Group, Range<usize>)]) -> Vec<Group> {
-    sections.iter().map(|(group, _)| *group).collect()
+/// The groups to offer as chips: those with rows plus the scoped one, in group order.
+pub(super) fn chips(sections: &[(Group, Range<usize>)], scope: Option<Group>) -> Vec<Group> {
+    [Group::Files, Group::Symbols, Group::Commands, Group::Text]
+        .into_iter()
+        .filter(|group| Some(*group) == scope || sections.iter().any(|(g, _)| g == group))
+        .collect()
 }
 
 /// What Enter does on a row, shown beside the selected one.
@@ -720,10 +723,10 @@ mod tests {
     fn chips_follow_groups_with_results_in_order() {
         let (_, _, sections) = arrange(&state(2, 0, 1), "item", None);
         assert_eq!(
-            chips(&sections),
+            chips(&sections, None),
             vec![Group::Files, Group::Commands, Group::Text]
         );
-        assert!(chips(&[]).is_empty());
+        assert!(chips(&[], None).is_empty());
     }
 
     #[test]
@@ -736,5 +739,14 @@ mod tests {
         assert_eq!(row_hint(&Target::Symbol(PathBuf::from("a"), at)), "Go to");
         assert_eq!(row_hint(&Target::Claude("x".into())), "Run");
         assert_eq!(row_hint(&Target::ProjectSearch("q".into())), "Search");
+    }
+
+    #[test]
+    fn scoped_chip_stays_when_its_group_empties() {
+        let (_, _, sections) = arrange(&state(0, 0, 1), "item", None);
+        assert_eq!(
+            chips(&sections, Some(Group::Symbols)),
+            vec![Group::Symbols, Group::Commands, Group::Text]
+        );
     }
 }
