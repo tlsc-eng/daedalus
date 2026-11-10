@@ -191,6 +191,22 @@ pub(super) fn keep_selection(selected: usize, on_search_row: bool, rows: usize) 
     }
 }
 
+/// Top and height in px of the overlay scrollbar thumb, or `None` when the rows fit.
+pub(super) fn scroll_thumb(
+    view: f32,
+    max_offset: f32,
+    offset: f32,
+    min_h: f32,
+) -> Option<(f32, f32)> {
+    if view <= 0. || max_offset <= 0.5 {
+        return None;
+    }
+    let content = view + max_offset;
+    let height = (view * view / content).max(min_h).min(view);
+    let top = (offset / max_offset).clamp(0., 1.) * (view - height);
+    Some((top, height))
+}
+
 /// The first row of the section after (or, with a negative step, before) the one holding
 /// `selected`, wrapping around.
 pub(super) fn jump(sections: &[(Group, Range<usize>)], selected: usize, step: isize) -> usize {
@@ -302,6 +318,22 @@ impl Shell {
                     .map(|group| chip(group.chip_id(), group.title(), Some(*group))),
             );
 
+        let thumb = scroll_thumb(
+            f32::from(state.scroll.bounds().size.height),
+            f32::from(state.scroll.max_offset().height),
+            -f32::from(state.scroll.offset().y),
+            24.,
+        )
+        .map(|(top, height)| {
+            div()
+                .absolute()
+                .top(px(top))
+                .right(t.ui(4.))
+                .w(t.ui(4.))
+                .h(px(height))
+                .rounded_full()
+                .bg(t.color.border_strong)
+        });
         let nothing = !query_empty && palette.hits.is_empty();
         let panel =
             div()
@@ -366,22 +398,31 @@ impl Shell {
                     .child(chips)
                     .child(
                         div()
-                            .id("palette-rows")
+                            .relative()
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&state.scroll)
-                            .pb(t.ui(8.))
-                            .children(rows)
-                            .children(nothing.then(|| {
+                            .flex()
+                            .flex_col()
+                            .child(
                                 div()
-                                    .h(t.ui(52.))
-                                    .px(t.ui(18.))
-                                    .flex()
-                                    .items_center()
-                                    .text_color(t.color.content_muted)
-                                    .child("Nothing matches")
-                            })),
+                                    .id("palette-rows")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&state.scroll)
+                                    .pb(t.ui(8.))
+                                    .children(rows)
+                                    .children(nothing.then(|| {
+                                        div()
+                                            .h(t.ui(52.))
+                                            .px(t.ui(18.))
+                                            .flex()
+                                            .items_center()
+                                            .text_color(t.color.content_muted)
+                                            .child("Nothing matches")
+                                    })),
+                            )
+                            .children(thumb),
                     )
                 });
         self.palette_layer(panel, closing, viewport.height * 0.18, &t, cx)
@@ -527,6 +568,30 @@ mod tests {
 
     use super::*;
     use crate::shell::palette::Target;
+
+    #[test]
+    fn scroll_thumb_hides_when_rows_fit() {
+        assert_eq!(scroll_thumb(300., 0., 0., 24.), None);
+        assert_eq!(scroll_thumb(0., 300., 0., 24.), None);
+    }
+
+    #[test]
+    fn scroll_thumb_spans_proportionally_at_top_and_bottom() {
+        assert_eq!(scroll_thumb(300., 300., 0., 24.), Some((0., 150.)));
+        assert_eq!(scroll_thumb(300., 300., 300., 24.), Some((150., 150.)));
+    }
+
+    #[test]
+    fn scroll_thumb_keeps_min_height_on_long_lists() {
+        assert_eq!(scroll_thumb(300., 30000., 0., 24.), Some((0., 24.)));
+        assert_eq!(scroll_thumb(300., 30000., 30000., 24.), Some((276., 24.)));
+    }
+
+    #[test]
+    fn scroll_thumb_clamps_overscroll() {
+        assert_eq!(scroll_thumb(300., 300., -50., 24.), Some((0., 150.)));
+        assert_eq!(scroll_thumb(300., 300., 400., 24.), Some((150., 150.)));
+    }
 
     fn rows(prefix: &str, n: usize) -> Vec<Entry> {
         (0..n)
