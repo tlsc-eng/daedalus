@@ -180,7 +180,10 @@ impl Shell {
         let Some(root) = self.active_root() else {
             return;
         };
-        self.close_panel_terminal_in(root, id, window, cx);
+        let programs = self.running_programs(&root, [id], cx);
+        self.confirm_end_programs(programs, window, cx, move |this, window, cx| {
+            this.close_panel_terminal_in(root, id, window, cx)
+        });
     }
 
     /// Hangs up a terminal of the panel of the project at `root`, which need not be the active one.

@@ -401,6 +401,14 @@ impl TerminalView {
         self.foreground.as_ref().map(|p| p.pid)
     }
 
+    /// The program in the foreground when it is not a shell prompt and the shell is still alive.
+    pub fn running_program(&self) -> Option<String> {
+        if self.terminal.as_ref().is_some_and(|t| t.exit.is_some()) {
+            return None;
+        }
+        self.foreground.as_ref().and_then(running_name)
+    }
+
     /// An older session daemon still runs this terminal's shell, so it cannot attach.
     pub fn is_stale(&self) -> bool {
         self.stale.is_some()
@@ -545,11 +553,7 @@ impl TerminalView {
     }
 
     pub fn is_claude(&self) -> bool {
-        self.foreground.as_ref().is_some_and(|p| {
-            p.name == "claude"
-                || p.path.ends_with("claude")
-                || p.path.to_string_lossy().contains("/claude/versions/")
-        })
+        self.foreground.as_ref().is_some_and(is_claude_process)
     }
 
     fn current_claude_state(&self) -> Option<ClaudeState> {
@@ -1957,6 +1961,22 @@ pub fn is_shell(name: &str) -> bool {
     )
 }
 
+fn is_claude_process(p: &Process) -> bool {
+    p.name == "claude"
+        || p.path.ends_with("claude")
+        || p.path.to_string_lossy().contains("/claude/versions/")
+}
+
+fn running_name(p: &Process) -> Option<String> {
+    if is_shell(&p.name) {
+        None
+    } else if is_claude_process(p) {
+        Some("Claude".into())
+    } else {
+        Some(p.name.clone())
+    }
+}
+
 impl gpui::EntityInputHandler for TerminalView {
     fn text_for_range(
         &mut self,
@@ -2179,6 +2199,34 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(name: &str, path: &str) -> Process {
+        Process {
+            pid: 1,
+            name: name.into(),
+            path: path.into(),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn running_name_skips_shells() {
+        for name in ["-zsh", "bash", "login"] {
+            assert_eq!(running_name(&process(name, "/bin/x")), None);
+        }
+    }
+
+    #[test]
+    fn running_name_names_claude() {
+        let p = process("2.1.294", "/home/u/.local/share/claude/versions/2.1.294");
+        assert_eq!(running_name(&p).as_deref(), Some("Claude"));
+    }
+
+    #[test]
+    fn running_name_names_other_programs() {
+        let p = process("vim", "/usr/bin/vim");
+        assert_eq!(running_name(&p).as_deref(), Some("vim"));
+    }
 
     #[test]
     fn only_text_that_reaches_a_live_terminal_ends_a_lease() {

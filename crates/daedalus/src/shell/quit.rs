@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use daedalus_editor::EditorView;
-use gpui::{Context, Entity, PromptLevel, Window};
+use daedalus_workspace::ItemId;
+use gpui::{App, Context, Entity, PromptLevel, Window};
 
 use super::Shell;
 use super::item::ItemView;
@@ -80,6 +81,63 @@ impl Shell {
         let Some(root) = self.active_root() else {
             return;
         };
+        let ids: Vec<ItemId> = self
+            .workspace
+            .active
+            .and_then(|i| self.workspace.projects.get(i))
+            .map(|p| p.items().map(|i| i.id).collect())
+            .unwrap_or_default();
+        let programs = self.running_programs(&root, ids, cx);
+        self.confirm_end_programs(programs, window, cx, move |this, window, cx| {
+            this.close_project_at(root, window, cx)
+        });
+    }
+
+    /// Terminals of the project at `root` whose shell runs a program, by display name.
+    pub(super) fn running_programs(
+        &self,
+        root: &Path,
+        items: impl IntoIterator<Item = ItemId>,
+        cx: &App,
+    ) -> Vec<String> {
+        items
+            .into_iter()
+            .filter_map(|id| match self.items.get(&(root.to_path_buf(), id)) {
+                Some(ItemView::Terminal(t)) => t.read(cx).running_program(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs `then` at once when no program runs, else after the user confirms ending them.
+    pub(super) fn confirm_end_programs(
+        &mut self,
+        programs: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if programs.is_empty() {
+            return then(self, window, cx);
+        }
+        let (message, detail) = end_programs_text(&programs);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some(&detail),
+            &super::lsp::confirm_buttons("Cancel", "Close"),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() != Some(super::lsp::CONFIRMED) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
+        })
+        .detach();
+    }
+
+    fn close_project_at(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let mut dirty = self.dirty_editors(Some(&root), cx);
         if self.autosave_delay().is_some() {
             dirty.retain(|e| !e.update(cx, |e, cx| e.save(cx)));
@@ -159,5 +217,37 @@ impl Shell {
         }
         self.schedule_save(cx);
         cx.notify();
+    }
+}
+
+fn end_programs_text(programs: &[String]) -> (String, String) {
+    match programs {
+        [one] => (
+            format!("Close the terminal running {one}?"),
+            format!("Closing it ends {one}."),
+        ),
+        _ => (
+            format!("Close {} terminals with programs running?", programs.len()),
+            format!("Closing them ends {}.", programs.join(", ")),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_program_names_it() {
+        let (message, detail) = end_programs_text(&["vim".into()]);
+        assert_eq!(message, "Close the terminal running vim?");
+        assert_eq!(detail, "Closing it ends vim.");
+    }
+
+    #[test]
+    fn several_programs_count_and_list_them() {
+        let (message, detail) = end_programs_text(&["vim".into(), "Claude".into()]);
+        assert_eq!(message, "Close 2 terminals with programs running?");
+        assert_eq!(detail, "Closing them ends vim, Claude.");
     }
 }

@@ -857,6 +857,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(root) = self.active_root() {
+            let programs = self.running_programs(&root, [item], cx);
+            if !programs.is_empty() {
+                return self.confirm_end_programs(programs, window, cx, move |this, window, cx| {
+                    // The project may have changed while the prompt was up; ids repeat across projects.
+                    if this.active_root().as_deref() == Some(root.as_path()) {
+                        this.close_pane_item(pane, item, window, cx);
+                    } else {
+                        this.remove_item_from(&root, item, window, cx);
+                    }
+                });
+            }
+        }
         let dirty = self
             .active_root()
             .and_then(|root| self.items.get(&(root, item)).cloned())
@@ -924,7 +937,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(root) = self.active_root() {
-            self.close_items_in(root, items, window, cx);
+            let programs = self.running_programs(&root, items.iter().copied(), cx);
+            self.confirm_end_programs(programs, window, cx, move |this, window, cx| {
+                this.close_items_in(root, items, window, cx)
+            });
         }
     }
 
