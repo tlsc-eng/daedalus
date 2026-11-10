@@ -213,8 +213,8 @@ impl EditorView {
             let caption = self
                 .blame
                 .as_ref()
-                .filter(|(l, _)| focused && *l == line && line == head_line)
-                .map_or(0, |(_, c)| c.chars().count() + 3);
+                .filter(|b| focused && b.line == line && line == head_line)
+                .map_or(0, |b| b.caption.chars().count() + 3);
             let x = origin.x + layout.cell * (3 + caption) as f32;
             let right = self.viewport.width - crate::minimap::width(self, self.viewport.width);
             let room = layout.origin.x + right - x;

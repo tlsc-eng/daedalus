@@ -365,6 +365,7 @@ pub struct Frame {
     line_height: Pixels,
     gutter_bg: Hsla,
     minimap: Vec<PaintQuad>,
+    inline_blame: Option<Bounds<Pixels>>,
 }
 
 impl IntoElement for EditorElement {
@@ -491,6 +492,7 @@ impl Element for EditorElement {
             line_height: lh,
             gutter_bg: theme.color.surface_sunken,
             minimap: Vec::new(),
+            inline_blame: None,
         };
 
         let blame_w = blame_width(self.view.read(cx), cell);
@@ -999,19 +1001,24 @@ impl Element for EditorElement {
                 frame.gutter.push((point(x, y), shaped));
             }
 
-            if let Some((_, caption)) = view
+            if let Some(blame) = view
                 .blame
                 .as_ref()
-                .filter(|(l, _)| *l == *line && *line == head_line && self.focused)
+                .filter(|b| b.line == *line && *line == head_line && self.focused)
                 .filter(|_| folded.is_none() && r.last)
             {
+                let caption = &blame.caption;
                 let text = text_system.shape_line(
                     caption.clone().into(),
                     font_size,
                     &[run(caption.len(), syntax.comment)],
                     None,
                 );
-                frame.text.push((point(row_end + cell * 3., y), text));
+                let at = point(row_end + cell * 3., y);
+                frame.inline_blame = Some(Bounds::new(at, size(text.width, lh)))
+                    .map(|b| b.intersect(&frame.text_bounds))
+                    .filter(|b| !b.is_empty());
+                frame.text.push((at, text));
             }
 
             for caret in heads_on_row() {
@@ -1134,6 +1141,7 @@ impl Element for EditorElement {
             let end = |r: &LayoutRow| (r.row, r.chars.start);
             (rows.first().map(end), rows.last().map(end))
         };
+        let inline_blame = frame.inline_blame;
         self.view.update(cx, |view, _| {
             view.scroll.x = scroll_x;
             // Popups, lenses and inlay requests read this layout at render, which came first.
@@ -1157,6 +1165,7 @@ impl Element for EditorElement {
                 sticky,
                 fold_column,
                 review_column: (numbers_right, numbers_right + review_w),
+                inline_blame,
             });
         });
         frame

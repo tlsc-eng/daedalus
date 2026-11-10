@@ -372,7 +372,9 @@ information rather than triggering the install dialog).
   instead, as hunk staging does.
 - Inline blame (on by default; `cmd-alt-shift-g` or `"git.inline_blame": false` in
   [settings.json](#settings) turns it off): "author · 3 days ago · summary" after the cursor's
-  line, "Not committed yet" for edited lines.
+  line, "Not committed yet" for edited lines. Resting the pointer on the caption opens a card
+  with the author and email, date, short id and full message, and buttons to open the commit's
+  changes, open its pull request (when `gh` is signed in and finds one) and copy the full SHA.
 - File blame (**Git: Toggle file blame** in the palette, or View > Toggle File Blame) adds a
   column to the focused editor, like GitLens: an age bar on every line, brighter for newer
   commits, and the author and age where each commit's lines start. Hovering shows the commit's

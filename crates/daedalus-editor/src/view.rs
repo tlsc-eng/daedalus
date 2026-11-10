@@ -321,6 +321,8 @@ pub(crate) struct EditorLayout {
     pub fold_column: (Pixels, Pixels),
     /// The gutter column holding review comment dots; empty when the file is not under review.
     pub review_column: (Pixels, Pixels),
+    /// Where the inline blame caption was drawn, when the cursor's line shows one.
+    pub inline_blame: Option<Bounds<Pixels>>,
 }
 
 impl EditorLayout {
@@ -486,7 +488,8 @@ pub struct EditorView {
     conflict: Option<DiskState>,
     pub(crate) gutter_marks: Vec<GutterMark>,
     /// A caption drawn after the cursor's line while the cursor stays on that zero-based line.
-    pub(crate) blame: Option<(usize, String)>,
+    pub(crate) blame: Option<crate::blame::LineBlame>,
+    pub(crate) blame_card: crate::blame::BlameCard,
     cursor_line: usize,
     context_menu: Option<(Entity<ContextMenu>, Subscription)>,
     pub(crate) rename: Option<crate::lsp_ui::RenameBox>,
@@ -605,6 +608,7 @@ impl EditorView {
             conflict: None,
             gutter_marks: Vec::new(),
             blame: None,
+            blame_card: Default::default(),
             cursor_line: 0,
             context_menu: None,
             rename: None,
@@ -778,8 +782,15 @@ impl EditorView {
         }
     }
 
-    pub fn set_blame(&mut self, blame: Option<(usize, String)>, cx: &mut Context<Self>) {
+    pub fn set_blame(&mut self, blame: Option<crate::blame::LineBlame>, cx: &mut Context<Self>) {
         if self.blame != blame {
+            let same_commit = |b: &Option<crate::blame::LineBlame>| {
+                b.as_ref()
+                    .map(|b| (b.line, b.commit.as_ref().map(|c| c.sha.clone())))
+            };
+            if same_commit(&self.blame) != same_commit(&blame) {
+                self.hide_blame_card(cx);
+            }
             self.blame = blame;
             cx.notify();
         }
@@ -1102,6 +1113,7 @@ impl EditorView {
         self.hover_breakpoint_margin(Some(event.position), cx);
         self.hover_review(Some(event.position), cx);
         if event.pressed_button.is_none() {
+            self.hover_inline_blame(event.position, cx);
             self.hover_pointer(event.position, cx);
             self.hover_link(event.position, event.modifiers.platform, cx);
         }
@@ -1824,6 +1836,7 @@ impl Render for EditorView {
                         }
                         if !hovered {
                             this.hover_left(cx);
+                            this.blame_card_left(cx);
                             this.hover_breakpoint_margin(None, cx);
                             this.hover_review(None, cx);
                         }
@@ -2044,6 +2057,7 @@ impl Render for EditorView {
             .children(self.render_breakpoint_box(cx))
             .children(self.render_hover(cx))
             .children(self.render_blame_hover(cx))
+            .children(self.render_blame_card(cx))
             .children(self.render_peek(cx))
             .children(self.render_review())
             .children(self.render_merge_actions(cx))

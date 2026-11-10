@@ -35,7 +35,7 @@ mod syntax;
 mod view;
 mod wrap;
 
-pub use blame::{BlameCommit, GitGutterEvent, GutterBlame};
+pub use blame::{BlameCommit, CommitInfo, GitGutterEvent, GutterBlame, LineBlame};
 pub use breakpoints::{
     Breakpoint, DebugTestAt, EnableBreakpointAt, SetBreakpointAt, ToggleBreakpoint,
     ToggleBreakpointAt,

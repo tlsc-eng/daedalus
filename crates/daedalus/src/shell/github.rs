@@ -130,6 +130,14 @@ impl Shell {
         self.git.github.gh.as_ref()?.explain()
     }
 
+    /// `gh`'s path when it is installed and signed in.
+    pub(super) fn gh_program(&self) -> Option<PathBuf> {
+        match self.git.github.gh.as_ref()? {
+            Gh::Ready(program) => Some(program.clone()),
+            _ => None,
+        }
+    }
+
     /// The latest run on the project's current branch, for the status bar.
     pub(super) fn ci_run(&self, root: &Path) -> Option<&CiRun> {
         let branch = self.cached_branch(root)?;
