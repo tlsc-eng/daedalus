@@ -265,12 +265,7 @@ impl Palette {
 
     /// Like `glide_to` for the highlight, but forgets it while no row exists so it lands on the first row.
     fn highlight_to(&self, target: f32, has_rows: bool, duration: Duration) -> Glide {
-        if has_rows {
-            Self::glide_to(&self.selection, target, duration)
-        } else {
-            self.selection.set(None);
-            Glide::settled(target, duration)
-        }
+        highlight_glide(&self.selection, target, has_rows, duration)
     }
 
     /// Time since the rows appeared while the stagger is still running, `None` once it is over.
@@ -282,6 +277,20 @@ impl Palette {
         let elapsed = self.revealed.get()?.elapsed();
         (!reduced && rows_now && elapsed < STAGGER_STEP * STAGGER_ROWS as u32 + STAGGER_FADE)
             .then_some(elapsed)
+    }
+}
+
+fn highlight_glide(
+    cell: &Cell<Option<Glide>>,
+    target: f32,
+    has_rows: bool,
+    duration: Duration,
+) -> Glide {
+    if has_rows {
+        Palette::glide_to(cell, target, duration)
+    } else {
+        cell.set(None);
+        Glide::settled(target, duration)
     }
 }
 
@@ -2043,6 +2052,17 @@ fn claude_entries(query: &str) -> Vec<Entry> {
 mod tests {
     use super::*;
     use daedalus_lsp::Range;
+
+    #[test]
+    fn highlight_lands_on_the_first_row_after_having_none() {
+        let cell = Cell::new(None);
+        let d = Duration::from_millis(200);
+        highlight_glide(&cell, 0., true, d);
+        highlight_glide(&cell, 0., false, d);
+        let glide = highlight_glide(&cell, 28., true, d);
+        assert_eq!(glide.value(), 28.);
+        assert!(!glide.running());
+    }
 
     #[test]
     fn classic_list_height_counts_rows_and_message() {
