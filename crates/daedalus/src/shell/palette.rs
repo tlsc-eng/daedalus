@@ -1,12 +1,13 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daedalus_editor::EditorView;
 use daedalus_lsp::{Position, Symbol, symbol_kind_label};
-use daedalus_ui::motion::{self, Closing};
+use daedalus_ui::motion::{self, Closing, Glide};
 use daedalus_ui::{ActiveTheme, InputEvent, TextInput};
 use gpui::{
     Action, Animation, AnyElement, ClickEvent, Context, Entity, Focusable, FontWeight,
@@ -236,16 +237,77 @@ pub(super) struct Palette {
     asked: u64,
     symbols_task: Option<Task<()>>,
     spotlight: Option<spotlight::State>,
+    opened: u64,
+    selection: Cell<Option<Glide>>,
+    list_height: Cell<Option<Glide>>,
+    revealed: Cell<Option<Instant>>,
+    had_rows: Cell<bool>,
     _subscription: Subscription,
 }
 
 impl Palette {
-    /// Child index in the rows list equals the hit index, so the selection is the item to reveal.
+    /// Child 0 of the rows list is the selection highlight, so the hit's child index is one more.
     fn reveal_selected(&self) {
         if let Some(spotlight) = &self.spotlight {
-            spotlight.scroll.scroll_to_item(self.selected);
+            spotlight.scroll.scroll_to_item(self.selected + 1);
         }
     }
+
+    /// Eases `cell` toward `target`; the first call starts settled so nothing animates on open.
+    fn glide_to(cell: &Cell<Option<Glide>>, target: f32, duration: Duration) -> Glide {
+        let mut glide = cell
+            .get()
+            .unwrap_or_else(|| Glide::settled(target, duration));
+        glide.retarget(target);
+        cell.set(Some(glide));
+        glide
+    }
+
+    /// Like `glide_to` for the highlight, but forgets it while no row exists so it lands on the first row.
+    fn highlight_to(&self, target: f32, has_rows: bool, duration: Duration) -> Glide {
+        highlight_glide(&self.selection, target, has_rows, duration)
+    }
+
+    /// Time since the rows appeared while the stagger is still running, `None` once it is over.
+    fn stagger_elapsed(&self, rows_now: bool, reduced: bool) -> Option<Duration> {
+        if rows_now && !self.had_rows.get() {
+            self.revealed.set(Some(Instant::now()));
+        }
+        self.had_rows.set(rows_now);
+        let elapsed = self.revealed.get()?.elapsed();
+        (!reduced && rows_now && elapsed < STAGGER_STEP * STAGGER_ROWS as u32 + STAGGER_FADE)
+            .then_some(elapsed)
+    }
+}
+
+fn highlight_glide(
+    cell: &Cell<Option<Glide>>,
+    target: f32,
+    has_rows: bool,
+    duration: Duration,
+) -> Glide {
+    if has_rows {
+        Palette::glide_to(cell, target, duration)
+    } else {
+        cell.set(None);
+        Glide::settled(target, duration)
+    }
+}
+
+const STAGGER_STEP: Duration = Duration::from_millis(18);
+const STAGGER_FADE: Duration = Duration::from_millis(160);
+const STAGGER_ROWS: usize = 8;
+
+/// How far in (0 to 1) row `row` is while the stagger has been running for `elapsed`.
+fn stagger_progress(elapsed: Duration, row: usize) -> f32 {
+    let delay = STAGGER_STEP * row.min(STAGGER_ROWS) as u32;
+    let p = elapsed.saturating_sub(delay).as_secs_f32() / STAGGER_FADE.as_secs_f32();
+    motion::ease_enter()(p.min(1.))
+}
+
+/// Height in unscaled px of the classic list below the input for `rows` rows and a message line.
+fn classic_list_height(rows: usize, message: bool) -> f32 {
+    8. + 32. * rows as f32 + if message { 32. } else { 0. }
 }
 
 /// Only a linked worktree has changes to bring back, so the palette hides it elsewhere.
@@ -801,6 +863,11 @@ impl Shell {
                 state.commands = commands;
                 state
             }),
+            opened: self.next_generation(),
+            selection: Cell::new(None),
+            list_height: Cell::new(None),
+            revealed: Cell::new(None),
+            had_rows: Cell::new(false),
             _subscription: subscription,
         });
         if files {
@@ -1651,6 +1718,13 @@ impl Shell {
             return Some(self.render_spotlight(palette, closing, window, cx));
         }
         let t = cx.theme().clone();
+        let s = t.ui_scale;
+        let rows_shown = if palette.status.is_none() {
+            palette.hits.len()
+        } else {
+            0
+        };
+        let stagger = palette.stagger_elapsed(rows_shown > 0, t.motion.reduced);
         let rows: Vec<AnyElement> = palette
             .hits
             .iter()
@@ -1689,6 +1763,10 @@ impl Shell {
                         t.color.content
                     })
                     .when(!selected, |el| el.hover(|s| s.bg(t.color.surface_hover)))
+                    .when_some(stagger, |el, elapsed| {
+                        let e = stagger_progress(elapsed, row);
+                        el.relative().top(px(s * 4. * (1. - e))).opacity(e)
+                    })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.run_palette(Some(row), event.modifiers().platform, window, cx)
                     }))
@@ -1746,10 +1824,22 @@ impl Shell {
 
         let empty = palette.hits.is_empty() && !palette.input.read(cx).text().is_empty();
         let message = palette.status.or(empty.then_some(palette.placeholder_hint));
+        let target = classic_list_height(rows_shown, message.is_some()).min(32. * 8.5);
+        let glide_for = if t.motion.reduced {
+            Duration::ZERO
+        } else {
+            t.motion.base
+        };
+        let height = Palette::glide_to(&palette.list_height, target, glide_for);
+        let highlight_y = 4. + 32. * palette.selected as f32;
+        let highlight = palette.highlight_to(highlight_y, rows_shown > 0, glide_for);
+        if height.running() || highlight.running() || stagger.is_some() {
+            window.request_animation_frame();
+        }
+        let highlight_opacity = stagger.map_or(1., |elapsed| stagger_progress(elapsed, 0));
         let panel = div()
             .id("palette")
             .w(t.ui(560.))
-            .max_h(t.ui(44. + 32. * 8.5))
             .flex()
             .flex_col()
             .bg(t.color.surface)
@@ -1776,10 +1866,24 @@ impl Shell {
             .child(
                 div()
                     .id("palette-rows")
-                    .flex_1()
-                    .min_h_0()
+                    .relative()
+                    .flex_none()
+                    .h(px(s * height.value()))
                     .overflow_y_scroll()
                     .py(t.ui(4.))
+                    .when(rows_shown > 0, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(t.ui(4.))
+                                .right(t.ui(4.))
+                                .top(px(s * highlight.value()))
+                                .h(t.ui(32.))
+                                .opacity(highlight_opacity)
+                                .bg(t.color.surface_active)
+                                .rounded(t.shape.radius_control),
+                        )
+                    })
                     .when(palette.status.is_none(), |el| el.children(rows))
                     .children(message.map(|message| {
                         div()
@@ -1791,13 +1895,14 @@ impl Shell {
                             .child(message)
                     })),
             );
-        Some(self.palette_layer(panel, closing, px(96.), &t, cx))
+        Some(self.palette_layer(panel, closing, palette.opened, px(96.), &t, cx))
     }
 
     fn palette_layer(
         &self,
         panel: gpui::Stateful<gpui::Div>,
         closing: Option<Closing>,
+        opened: u64,
         top: gpui::Pixels,
         t: &daedalus_ui::Theme,
         cx: &mut Context<Self>,
@@ -1808,15 +1913,22 @@ impl Shell {
                 panel,
                 ("palette-exit", closing.generation),
                 t.motion.fast,
-                |el, d| el.opacity(1. - d).top(px(2. * d)),
+                |el, d| el.opacity(1. - d).top(px(-4. * d)),
             ),
-            None => motion::animate_if(
-                t.motion.reduced,
-                panel,
-                "palette-enter",
-                Animation::new(t.motion.fast).with_easing(motion::ease_enter()),
-                |el, d| el.opacity(d).top(px(2. * (1. - d))),
-            ),
+            None => {
+                let spring = motion::ease_spring();
+                let fade = motion::ease_enter();
+                motion::animate_if(
+                    t.motion.reduced,
+                    panel,
+                    ("palette-enter", opened),
+                    Animation::new(t.motion.slow),
+                    move |el, d| {
+                        el.opacity(fade((d * 2.5).min(1.)))
+                            .top(px(-8. * (1. - spring(d))))
+                    },
+                )
+            }
         };
         div()
             .id("palette-layer")
@@ -1940,6 +2052,24 @@ fn claude_entries(query: &str) -> Vec<Entry> {
 mod tests {
     use super::*;
     use daedalus_lsp::Range;
+
+    #[test]
+    fn highlight_lands_on_the_first_row_after_having_none() {
+        let cell = Cell::new(None);
+        let d = Duration::from_millis(200);
+        highlight_glide(&cell, 0., true, d);
+        highlight_glide(&cell, 0., false, d);
+        let glide = highlight_glide(&cell, 28., true, d);
+        assert_eq!(glide.value(), 28.);
+        assert!(!glide.running());
+    }
+
+    #[test]
+    fn classic_list_height_counts_rows_and_message() {
+        assert_eq!(classic_list_height(0, false), 8.);
+        assert_eq!(classic_list_height(3, false), 104.);
+        assert_eq!(classic_list_height(0, true), 40.);
+    }
 
     #[test]
     fn text_budget_survives_a_line_with_many_matches() {

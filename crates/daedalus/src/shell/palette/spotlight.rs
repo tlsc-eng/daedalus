@@ -2,16 +2,19 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use daedalus_lsp::Position;
 use daedalus_ui::motion::Closing;
 use daedalus_ui::{ActiveTheme, Theme, icon_for};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, FontWeight, HighlightStyle, MouseButton, SharedString,
-    StyledText, Task, Window, canvas, div, fill, point, prelude::*, px, size, svg,
+    AnyElement, Bounds, ClickEvent, Context, Div, FontWeight, HighlightStyle, MouseButton,
+    SharedString, StyledText, Task, Window, canvas, div, fill, point, prelude::*, px, size, svg,
 };
 
-use super::{Entry, MAX_ROWS, Mode, Palette, Target, label_highlights, rank_entries};
+use super::{
+    Entry, MAX_ROWS, Mode, Palette, Target, label_highlights, rank_entries, stagger_progress,
+};
 use crate::actions;
 use crate::shell::Shell;
 use crate::shell::search::Hit;
@@ -218,6 +221,33 @@ pub(super) fn jump(sections: &[(Group, Range<usize>)], selected: usize, step: is
     sections.get(next).map_or(0, |(_, rows)| rows.start)
 }
 
+/// Top in unscaled px of `row` inside the rows list, counting each section header before it.
+pub(super) fn row_top(sections: &[(Group, Range<usize>)], scoped: bool, row: usize) -> f32 {
+    let header = |r: usize| {
+        if !scoped && sections.iter().any(|(_, rows)| rows.start == r) {
+            28.
+        } else {
+            0.
+        }
+    };
+    (0..row).map(|r| 52. + header(r)).sum::<f32>() + header(row)
+}
+
+/// Height in unscaled px of the rows list for `hits` rows, or its single "Nothing matches" row.
+pub(super) fn list_height(
+    sections: &[(Group, Range<usize>)],
+    scoped: bool,
+    hits: usize,
+    nothing: bool,
+) -> f32 {
+    let rows = if nothing {
+        52.
+    } else {
+        row_top(sections, scoped, hits)
+    };
+    rows + 8.
+}
+
 impl Shell {
     /// Picks a chip: the group to list alone, or `None` for every group.
     fn set_spotlight_scope(&mut self, scope: Option<Group>, cx: &mut Context<Self>) {
@@ -241,6 +271,8 @@ impl Shell {
         let viewport = window.viewport_size();
         let query_empty = palette.input.read(cx).text().is_empty();
         let scoped = state.scope.is_some();
+        let s = t.ui_scale;
+        let stagger = palette.stagger_elapsed(!palette.hits.is_empty(), t.motion.reduced);
 
         let rows: Vec<AnyElement> = palette
             .hits
@@ -258,8 +290,15 @@ impl Shell {
                     .flatten()
                     .map(|(group, _)| group.title());
                 let row_el = self.spotlight_row(palette, row, entry, positions, group, &t, cx);
+                let entrance = move |el: Div| match stagger {
+                    Some(elapsed) => {
+                        let e = stagger_progress(elapsed, row);
+                        el.relative().top(px(s * 4. * (1. - e))).opacity(e)
+                    }
+                    None => el,
+                };
                 match header {
-                    Some(title) => div()
+                    Some(title) => entrance(div())
                         .child(
                             div()
                                 .h(t.ui(28.))
@@ -272,7 +311,7 @@ impl Shell {
                         )
                         .child(row_el)
                         .into_any_element(),
-                    None => row_el,
+                    None => entrance(div()).child(row_el).into_any_element(),
                 }
             })
             .collect();
@@ -348,6 +387,25 @@ impl Shell {
         .absolute()
         .inset_0();
         let nothing = !query_empty && palette.hits.is_empty();
+        let glide_for = if t.motion.reduced {
+            Duration::ZERO
+        } else {
+            t.motion.base
+        };
+        let max = (f32::from(viewport.height) * 0.6 - 2.) / s - 60.;
+        let target = if query_empty {
+            0.
+        } else {
+            (1. / s + 40. + list_height(&state.sections, scoped, palette.hits.len(), nothing))
+                .min(max)
+        };
+        let height = Palette::glide_to(&palette.list_height, target, glide_for);
+        let highlight_y = row_top(&state.sections, scoped, palette.selected);
+        let highlight = palette.highlight_to(highlight_y, !palette.hits.is_empty(), glide_for);
+        if height.running() || highlight.running() || stagger.is_some() {
+            window.request_animation_frame();
+        }
+        let highlight_opacity = stagger.map_or(1., |elapsed| stagger_progress(elapsed, 0));
         let panel =
             div()
                 .id("palette")
@@ -400,45 +458,74 @@ impl Shell {
                                 .child(palette.input.clone()),
                         ),
                 )
-                .when(!query_empty, |el| {
-                    el.child(
-                        div()
-                            .mx(t.ui(16.))
-                            .flex_none()
-                            .border_b_1()
-                            .border_color(t.color.border),
-                    )
-                    .child(chips)
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(s * height.value()))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .when(!query_empty, |el| {
+                            el.child(
+                                div()
+                                    .mx(t.ui(16.))
+                                    .flex_none()
+                                    .border_b_1()
+                                    .border_color(t.color.border),
+                            )
+                            .child(chips)
                             .child(
                                 div()
-                                    .id("palette-rows")
+                                    .relative()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&state.scroll)
-                                    .pb(t.ui(8.))
-                                    .children(rows)
-                                    .children(nothing.then(|| {
+                                    .flex()
+                                    .flex_col()
+                                    .child(
                                         div()
-                                            .h(t.ui(52.))
-                                            .px(t.ui(18.))
-                                            .flex()
-                                            .items_center()
-                                            .text_color(t.color.content_muted)
-                                            .child("Nothing matches")
-                                    })),
+                                            .id("palette-rows")
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .track_scroll(&state.scroll)
+                                            .pb(t.ui(8.))
+                                            .when(!palette.hits.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(t.ui(8.))
+                                                        .right(t.ui(8.))
+                                                        .top(px(s * highlight.value()))
+                                                        .h(t.ui(52.))
+                                                        .opacity(highlight_opacity)
+                                                        .bg(t.color.surface_active)
+                                                        .rounded(t.ui(12.)),
+                                                )
+                                            })
+                                            .children(rows)
+                                            .children(nothing.then(|| {
+                                                div()
+                                                    .h(t.ui(52.))
+                                                    .px(t.ui(18.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_color(t.color.content_muted)
+                                                    .child("Nothing matches")
+                                            })),
+                                    )
+                                    .child(thumb),
                             )
-                            .child(thumb),
-                    )
-                });
-        self.palette_layer(panel, closing, viewport.height * 0.18, &t, cx)
+                        }),
+                );
+        self.palette_layer(
+            panel,
+            closing,
+            palette.opened,
+            viewport.height * 0.18,
+            &t,
+            cx,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -511,7 +598,6 @@ impl Shell {
             .rounded(t.ui(12.))
             .cursor_pointer()
             .text_color(t.color.content)
-            .when(selected, |el| el.bg(t.color.surface_active))
             .when(!selected, |el| el.hover(|s| s.bg(t.color.surface_hover)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.run_palette(Some(row), event.modifiers().platform, window, cx)
@@ -794,6 +880,22 @@ mod tests {
         let last = &entries[hits.last().unwrap().0];
         assert!(matches!(&last.target, Target::ProjectSearch(q) if q == "line"));
         assert_eq!(entries[hits[19].0].label, "line19");
+    }
+
+    #[test]
+    fn row_top_counts_headers_unless_scoped() {
+        let sections = vec![(Group::Files, 0..2), (Group::Symbols, 2..5)];
+        assert_eq!(row_top(&sections, false, 0), 28.);
+        assert_eq!(row_top(&sections, false, 2), 28. + 104. + 28.);
+        assert_eq!(row_top(&sections, false, 5), 28. + 104. + 28. + 156.);
+        assert_eq!(row_top(&sections, true, 3), 156.);
+    }
+
+    #[test]
+    fn list_height_adds_padding_and_nothing_row() {
+        let sections = vec![(Group::Files, 0..2)];
+        assert_eq!(list_height(&sections, false, 2, false), 28. + 104. + 8.);
+        assert_eq!(list_height(&[], false, 0, true), 60.);
     }
 
     #[test]

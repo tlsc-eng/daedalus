@@ -66,6 +66,78 @@ pub fn ease_exit() -> impl Fn(f32) -> f32 + Clone {
     cubic_bezier(x1, y1, x2, y2)
 }
 
+/// Underdamped spring step response over [0, 1] that overshoots a few percent before settling.
+pub fn ease_spring() -> impl Fn(f32) -> f32 + Clone {
+    const ZETA: f32 = 0.72;
+    const A: f32 = 5.0;
+    let root = (1. - ZETA * ZETA).sqrt();
+    let b = A / ZETA * root;
+    let k = ZETA / root;
+    move |t| {
+        if t <= 0. {
+            0.
+        } else if t >= 1. {
+            1.
+        } else {
+            1. - (-A * t).exp() * ((b * t).cos() + k * (b * t).sin())
+        }
+    }
+}
+
+/// A value easing toward a target; retargeting mid-flight continues from the value shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glide {
+    from: f32,
+    to: f32,
+    since: Instant,
+    duration: Duration,
+}
+
+impl Glide {
+    pub fn settled(at: f32, duration: Duration) -> Self {
+        Self {
+            from: at,
+            to: at,
+            since: Instant::now(),
+            duration,
+        }
+    }
+
+    pub fn retarget(&mut self, to: f32) {
+        self.retarget_at(to, Instant::now());
+    }
+
+    fn retarget_at(&mut self, to: f32, now: Instant) {
+        if to == self.to {
+            return;
+        }
+        self.from = self.value_at(now);
+        self.to = to;
+        self.since = now;
+    }
+
+    pub fn value(&self) -> f32 {
+        self.value_at(Instant::now())
+    }
+
+    fn value_at(&self, now: Instant) -> f32 {
+        if self.duration.is_zero() {
+            return self.to;
+        }
+        let elapsed = now.saturating_duration_since(self.since);
+        let p = (elapsed.as_secs_f32() / self.duration.as_secs_f32()).min(1.);
+        self.from + (self.to - self.from) * ease_standard()(p)
+    }
+
+    pub fn running(&self) -> bool {
+        self.running_at(Instant::now())
+    }
+
+    fn running_at(&self, now: Instant) -> bool {
+        self.from != self.to && now.saturating_duration_since(self.since) < self.duration
+    }
+}
+
 /// Runs `animator` as an animation, or renders its final frame directly when motion is reduced.
 pub fn animate_if<E: IntoElement + AnimationExt + 'static>(
     reduced: bool,
@@ -202,6 +274,65 @@ mod tests {
     fn exit_is_back_loaded() {
         let ease = ease_exit();
         assert!(ease(0.5) < 0.5);
+    }
+
+    #[test]
+    fn spring_hits_endpoints() {
+        let f = ease_spring();
+        assert_eq!(f(0.), 0.);
+        assert_eq!(f(1.), 1.);
+    }
+
+    #[test]
+    fn spring_overshoots_a_little() {
+        let f = ease_spring();
+        let max = (0..=1000).map(|i| f(i as f32 / 1000.)).fold(0., f32::max);
+        assert!(max > 1.0 && max < 1.06, "{max}");
+    }
+
+    #[test]
+    fn spring_settles_near_the_end() {
+        let f = ease_spring();
+        for i in 900..=1000 {
+            let t = i as f32 / 1000.;
+            assert!((f(t) - 1.).abs() < 0.02, "{t}");
+        }
+    }
+
+    #[test]
+    fn glide_settled_holds_its_value() {
+        let g = Glide::settled(3., Duration::from_millis(200));
+        assert_eq!(g.value(), 3.);
+        assert!(!g.running());
+    }
+
+    #[test]
+    fn glide_retarget_starts_from_the_shown_value() {
+        let t0 = Instant::now();
+        let mut g = Glide::settled(0., Duration::from_millis(200));
+        g.retarget_at(10., t0);
+        let now = t0 + Duration::from_millis(50);
+        let shown = g.value_at(now);
+        assert!(shown > 0. && shown < 10.);
+        g.retarget_at(20., now);
+        assert_eq!(g.from, shown);
+        assert!(g.running_at(now + Duration::from_millis(100)));
+        assert!(!g.running_at(now + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn glide_same_target_is_a_noop() {
+        let mut g = Glide::settled(5., Duration::from_millis(200));
+        let before = g;
+        g.retarget(5.);
+        assert_eq!(g, before);
+    }
+
+    #[test]
+    fn glide_zero_duration_jumps() {
+        let mut g = Glide::settled(0., Duration::ZERO);
+        g.retarget(7.);
+        assert_eq!(g.value(), 7.);
     }
 
     type Ease = Box<dyn Fn(f32) -> f32>;
