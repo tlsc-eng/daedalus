@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
@@ -886,7 +886,7 @@ impl Stderr {
         let read_error = state.read_error.clone();
         drop(state);
         let how = match exit_status(child, read_error.is_none()) {
-            Some(status) => describe_status(status),
+            Some(status) => status,
             None => match read_error {
                 Some(error) => format!("sent a message Daedalus couldn't read: {error}"),
                 None => "closed its output".into(),
@@ -896,14 +896,14 @@ impl Stderr {
     }
 }
 
-fn exit_status(child: &Mutex<Option<Child>>, poll: bool) -> Option<ExitStatus> {
+fn exit_status(child: &Mutex<Option<Child>>, poll: bool) -> Option<String> {
     let deadline = Instant::now() + if poll { EXIT_WAIT } else { Duration::ZERO };
     loop {
         let status = child
             .lock()
             .expect("child lock")
-            .as_mut()
-            .and_then(|c| c.try_wait().ok().flatten());
+            .as_ref()
+            .and_then(|c| peek_exit(c.id()));
         if status.is_some() || Instant::now() >= deadline {
             return status;
         }
@@ -911,12 +911,23 @@ fn exit_status(child: &Mutex<Option<Child>>, poll: bool) -> Option<ExitStatus> {
     }
 }
 
-fn describe_status(status: ExitStatus) -> String {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("exited with status {code}"),
-        (None, Some(signal)) => format!("killed by signal {signal}"),
+/// Reads a dead child's status without reaping it, so the reaper's killpg still targets a pid nobody else can reuse.
+fn peek_exit(pid: u32) -> Option<String> {
+    // SAFETY: waitid only writes into the zeroed siginfo_t it is given.
+    let (code, status) = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() == 0
+        {
+            return None;
+        }
+        (info.si_code, info.si_status())
+    };
+    Some(match code {
+        libc::CLD_EXITED => format!("exited with status {status}"),
+        libc::CLD_KILLED | libc::CLD_DUMPED => format!("killed by signal {status}"),
         _ => "exited".into(),
-    }
+    })
 }
 
 fn cap(text: &str, max: usize) -> String {
@@ -1405,6 +1416,18 @@ mod tests {
         out.write_all(&body).unwrap();
     }
 
+    fn stopped_within(events: &async_channel::Receiver<Event>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.try_recv() {
+                Ok(Event::Stopped(why)) => return why,
+                Ok(_) => {}
+                Err(_) if Instant::now() >= deadline => panic!("no Stopped event within 5s"),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
     #[test]
     fn a_server_that_exits_reports_its_stderr() {
         use std::os::unix::fs::PermissionsExt;
@@ -1424,12 +1447,7 @@ mod tests {
             dir.clone(),
             Arc::new(RwLock::new(json!({}))),
         );
-        let why = loop {
-            match events.recv_blocking().unwrap() {
-                Event::Stopped(why) => break why,
-                _ => continue,
-            }
-        };
+        let why = stopped_within(&events);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(why.contains("boom"), "{why}");
     }
@@ -1442,20 +1460,20 @@ mod tests {
         let script = dir.join("server");
         std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (_client, events) = Client::start_local(
+        let (client, events) = Client::start_local(
             ServerKind::Go,
             script,
             dir.clone(),
             Arc::new(RwLock::new(json!({}))),
         );
         let started = Instant::now();
-        let why = loop {
-            match events.recv_blocking().unwrap() {
-                Event::Stopped(why) => break why,
-                _ => continue,
-            }
-        };
+        let why = stopped_within(&events);
         let _ = std::fs::remove_dir_all(&dir);
+        let pid = client.child.lock().unwrap().as_ref().map(Child::id);
+        if let Some(pid) = pid {
+            // SAFETY: the child is still held by the client, so its group id is not reused.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
         assert!(started.elapsed() < Duration::from_secs(2), "stopped late");
         why
     }
@@ -1467,6 +1485,21 @@ mod tests {
             "printf 'Content-Length: abc\\r\\n\\r\\n'\nsleep 30",
         );
         assert!(why.contains("couldn't read"), "{why}");
+    }
+
+    #[test]
+    fn peeking_at_an_exit_leaves_the_child_unreaped() {
+        let mut child = Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let said = loop {
+            if let Some(said) = peek_exit(child.id()) {
+                break said;
+            }
+            assert!(Instant::now() < deadline, "child never exited");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(said.contains("status 3"), "{said}");
+        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
     }
 
     #[test]
