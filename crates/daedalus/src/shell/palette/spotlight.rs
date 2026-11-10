@@ -132,6 +132,15 @@ pub(super) fn arrange(state: &State, query: &str) -> (Vec<Entry>, Hits, Sections
     (entries, hits, sections)
 }
 
+/// The row to select after the list is rebuilt: the search-in-project row stays last, others keep their index.
+pub(super) fn keep_selection(selected: usize, on_search_row: bool, rows: usize) -> usize {
+    if on_search_row {
+        rows.saturating_sub(1)
+    } else {
+        selected.min(rows.saturating_sub(1))
+    }
+}
+
 /// The first row of the section after (or, with a negative step, before) the one holding
 /// `selected`, wrapping around.
 pub(super) fn jump(sections: &[(Group, Range<usize>)], selected: usize, step: isize) -> usize {
@@ -278,6 +287,14 @@ mod tests {
         let last = entries[hits.last().unwrap().0].clone();
         assert!(matches!(last.target, Target::ProjectSearch(q) if q == "item"));
         assert_eq!(sections.last(), Some(&(Group::Text, 1..2)));
+    }
+
+    #[test]
+    fn keep_selection_follows_the_search_row_and_clamps_the_rest() {
+        assert_eq!(keep_selection(1, true, 6), 5);
+        assert_eq!(keep_selection(1, false, 6), 1);
+        assert_eq!(keep_selection(9, false, 6), 5);
+        assert_eq!(keep_selection(0, false, 0), 0);
     }
 
     #[test]

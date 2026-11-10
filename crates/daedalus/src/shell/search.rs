@@ -507,7 +507,7 @@ impl Shell {
         find
     }
 
-    /// Cmd+Shift+F: shows the Search tab, seeded with the editor's one-line selection.
+    /// Opens the drawer search, seeded with `seed` or else the editor's one-line selection.
     pub(super) fn find_in_project(
         &mut self,
         seed: Option<String>,

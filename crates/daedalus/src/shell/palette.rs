@@ -26,8 +26,8 @@ mod spotlight;
 
 const MAX_FILES: usize = 20_000;
 const MAX_ROWS: usize = 50;
-/// The text search stops at this many matches; the list shows fewer.
-const TEXT_CAP: usize = 20;
+/// The search counts matches, not lines, so a line with many matches must not use up the budget.
+const TEXT_CAP: usize = 200;
 /// A file's whole outline is listed, as VS Code does, up to this many symbols.
 const MAX_SYMBOL_ROWS: usize = 1000;
 /// Typing pauses this long before the servers are asked for workspace symbols.
@@ -1337,9 +1337,16 @@ impl Shell {
     /// Re-ranks Search Everything; rows that arrive late keep the selection where it was.
     fn refresh_spotlight(&mut self, cx: &mut Context<Self>) {
         let selected = self.palette.as_ref().map_or(0, |p| p.selected);
+        let on_search_row = self.palette.as_ref().is_some_and(|p| {
+            p.hits
+                .get(p.selected)
+                .and_then(|(i, _)| p.entries.get(*i))
+                .is_some_and(|e| matches!(e.target, Target::ProjectSearch(_)))
+        });
         self.filter_palette(cx);
         if let Some(palette) = self.palette.as_mut() {
-            palette.selected = selected.min(palette.hits.len().saturating_sub(1));
+            palette.selected =
+                spotlight::keep_selection(selected, on_search_row, palette.hits.len());
             palette.reveal_selected();
         }
     }
@@ -1950,6 +1957,30 @@ fn claude_entries(query: &str) -> Vec<Entry> {
 mod tests {
     use super::*;
     use daedalus_lsp::Range;
+
+    #[test]
+    fn text_budget_survives_a_line_with_many_matches() {
+        let root =
+            std::env::temp_dir().join(format!("daedalus-palette-text-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let mut body = format!(
+            "{}\n",
+            std::iter::repeat_n("needle ", 60).collect::<String>()
+        );
+        for i in 0..5 {
+            body.push_str(&format!("other needle {i}\n"));
+        }
+        std::fs::write(root.join("a.txt"), body).unwrap();
+        let m = Matcher::new(&Query::literal("needle")).unwrap().unwrap();
+        let mut lines = 0;
+        search::search(&root, &m, &Default::default(), TEXT_CAP, |batch| {
+            lines += batch.iter().map(|f| f.hits.len()).sum::<usize>();
+            true
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(lines, 6);
+    }
 
     #[test]
     fn highlights_land_on_the_label_characters_the_key_matched() {
