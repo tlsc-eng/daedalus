@@ -1364,7 +1364,7 @@ impl Shell {
             return self.lsp_failed("No definition found", NO_SERVER.into(), cx);
         };
         tracing::debug!(path = %doc.display(), line = at.line, character = at.character, "definition");
-        let editor = editor.clone();
+        let editor = editor.downgrade();
         cx.spawn(async move |this, cx| {
             let found = client.definition(&doc, at).await;
             match &found {
@@ -1373,7 +1373,9 @@ impl Shell {
             }
             let _ = this.update(cx, |this, cx| match found {
                 Ok(list) if is_own_definition(&doc, at, &list) => {
-                    this.lsp_references(&editor, at, cx)
+                    if let Some(editor) = editor.upgrade() {
+                        this.lsp_references(&editor, at, cx)
+                    }
                 }
                 Ok(list) if list.len() > 1 => this.show_locations(list, "definition", cx),
                 Ok(list) => match list.into_iter().next() {
