@@ -11,10 +11,11 @@ use daedalus_ui::{
     empty_state,
 };
 use gpui::{
-    Animation, App, Bounds, ClipboardItem, Context, DismissEvent, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, Size, Subscription, Task,
-    UTF16Selection, Window, actions, div, prelude::*, px,
+    Animation, App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render,
+    ScrollWheelEvent, ShapedLine, Size, Subscription, Task, UTF16Selection, Window, actions, div,
+    prelude::*, px,
 };
 
 use crate::buffer::{
@@ -475,6 +476,8 @@ pub struct EditorView {
     /// Foldable regions by header line, valid for one buffer version.
     fold_cache: RefCell<(u64, HashMap<usize, Option<Fold>>)>,
     pub(crate) gutter_hover: bool,
+    pub(crate) link: Option<std::ops::Range<usize>>,
+    pub(crate) definitions: bool,
     autosave: Option<Duration>,
     autosave_task: Option<Task<()>>,
     reloading: Option<Task<()>>,
@@ -540,6 +543,12 @@ impl Focusable for EditorView {
 }
 
 impl EditorView {
+    /// Turns the cmd-hover underline on for editors whose server can go to definition.
+    pub fn set_definitions(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.definitions = on;
+        self.hover_link(Point::default(), false, cx);
+    }
+
     /// Shows `path`, sharing the buffer of any other tab already showing it.
     pub fn open(path: PathBuf, cx: &mut Context<Self>) -> Self {
         let (buffer, error) = match shared::open(&path, cx) {
@@ -588,6 +597,8 @@ impl EditorView {
             minimap: Default::default(),
             fold_cache: RefCell::default(),
             gutter_hover: false,
+            link: None,
+            definitions: false,
             autosave: None,
             autosave_task: None,
             reloading: None,
@@ -928,6 +939,7 @@ impl EditorView {
         if dirty != self.was_dirty {
             self.was_dirty = dirty;
         }
+        self.link = None;
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -1061,7 +1073,10 @@ impl EditorView {
         }
         drop(b);
         self.note_cursor_line(false, cx);
-        if event.modifiers.platform && event.click_count == 1 {
+        if event.modifiers.platform
+            && event.click_count == 1
+            && self.word_at_position(event.position).is_some()
+        {
             self.definition_at(at, cx);
             cx.notify();
             return;
@@ -1088,6 +1103,7 @@ impl EditorView {
         self.hover_review(Some(event.position), cx);
         if event.pressed_button.is_none() {
             self.hover_pointer(event.position, cx);
+            self.hover_link(event.position, event.modifiers.platform, cx);
         }
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             self.selecting = false;
@@ -1119,6 +1135,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_review_on_scroll(window, cx);
+        self.clear_link(cx);
         let lh = self.layout.as_ref().map_or(px(20.), |l| l.line_height);
         let delta = event.delta.pixel_delta(lh);
         let lines = self
@@ -1770,7 +1787,11 @@ impl Render for EditorView {
                     .min_h_0()
                     .track_focus(&self.focus)
                     .key_context("Editor")
-                    .cursor_text()
+                    .cursor(if self.link.is_some() && window.modifiers().platform {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::IBeam
+                    })
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::open_context_menu))
                     .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| {
@@ -1784,7 +1805,19 @@ impl Render for EditorView {
                         }
                     }))
                     .on_mouse_move(cx.listener(Self::mouse_move))
+                    .on_modifiers_changed(cx.listener(
+                        |this, e: &ModifiersChangedEvent, window, cx| {
+                            this.hover_link(window.mouse_position(), e.modifiers.platform, cx);
+                            if !e.modifiers.platform {
+                                // gpui does not repaint on modifier changes, so unfocused editors keep a stale underline
+                                window.refresh();
+                            }
+                        },
+                    ))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !hovered {
+                            this.hover_link(Point::default(), false, cx);
+                        }
                         if !hovered && this.gutter_hover {
                             this.gutter_hover = false;
                             cx.notify();
