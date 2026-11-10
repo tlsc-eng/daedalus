@@ -186,6 +186,11 @@ impl EditorView {
     }
 
     pub(crate) fn hide_hover(&mut self, cx: &mut Context<Self>) -> bool {
+        let lsp = self.hide_lsp_hover(cx);
+        self.hide_blame_card(cx) || lsp
+    }
+
+    fn hide_lsp_hover(&mut self, cx: &mut Context<Self>) -> bool {
         self.hovering.pending = None;
         self.hovering.hide_timer = None;
         self.hovering.over_popover = false;
@@ -193,7 +198,7 @@ impl EditorView {
         if was_shown {
             cx.notify();
         }
-        self.hide_blame_card(cx) || was_shown
+        was_shown
     }
 
     fn schedule_hover_hide(&mut self, cx: &mut Context<Self>) {
@@ -201,7 +206,7 @@ impl EditorView {
             cx.background_executor().timer(HIDE_DELAY).await;
             let _ = this.update(cx, |this, cx| {
                 if !this.hovering.over_popover {
-                    this.hide_hover(cx);
+                    this.hide_lsp_hover(cx);
                 }
             });
         }));

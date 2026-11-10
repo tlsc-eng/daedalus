@@ -1110,10 +1110,10 @@ impl EditorView {
             cx.notify();
         }
         self.hover_blame(event.position, cx);
-        self.hover_inline_blame(event.position, cx);
         self.hover_breakpoint_margin(Some(event.position), cx);
         self.hover_review(Some(event.position), cx);
         if event.pressed_button.is_none() {
+            self.hover_inline_blame(event.position, cx);
             self.hover_pointer(event.position, cx);
             self.hover_link(event.position, event.modifiers.platform, cx);
         }

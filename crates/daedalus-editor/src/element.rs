@@ -1015,7 +1015,9 @@ impl Element for EditorElement {
                     None,
                 );
                 let at = point(row_end + cell * 3., y);
-                frame.inline_blame = Some(Bounds::new(at, size(text.width, lh)));
+                frame.inline_blame = Some(Bounds::new(at, size(text.width, lh)))
+                    .map(|b| b.intersect(&frame.text_bounds))
+                    .filter(|b| !b.is_empty());
                 frame.text.push((at, text));
             }
 

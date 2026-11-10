@@ -25,11 +25,11 @@ pub(super) struct GutterState {
     /// The committed commit the inline blame caption names, for its hover card to open.
     inline_commit: Option<(EntityId, git::BlameCommit)>,
     /// Hover card details by full SHA; only successful reads are kept.
-    details: HashMap<String, CommitInfo>,
+    details: HashMap<(PathBuf, String), CommitInfo>,
     /// The pull request (number, url) each SHA came in through, `None` when it has none.
-    pulls: HashMap<String, Option<(u64, String)>>,
-    asking_details: HashSet<String>,
-    asking_pulls: HashSet<String>,
+    pulls: HashMap<(PathBuf, String), Option<(u64, String)>>,
+    asking_details: HashSet<(PathBuf, String)>,
+    asking_pulls: HashSet<(PathBuf, String)>,
 }
 
 struct Blamed {
@@ -317,7 +317,10 @@ impl Shell {
             }
             GitGutterEvent::CommitDetails { sha } => self.commit_card(editor, sha, cx),
             GitGutterEvent::OpenPullRequest { sha } => {
-                if let Some(Some((_, url))) = self.git.gutters.pulls.get(&sha)
+                let Some(root) = self.editor_root(editor) else {
+                    return;
+                };
+                if let Some(Some((_, url))) = self.git.gutters.pulls.get(&(root, sha))
                     && url.starts_with("https://")
                 {
                     cx.open_url(url);
@@ -335,11 +338,22 @@ impl Shell {
         let Some(root) = self.editor_root(editor) else {
             return;
         };
-        if let Some(info) = self.git.gutters.details.get(&sha).cloned() {
+        if let Some(info) = self
+            .git
+            .gutters
+            .details
+            .get(&(root.clone(), sha.clone()))
+            .cloned()
+        {
             editor.update(cx, |e, cx| e.show_commit_details(&sha, info, cx));
             return self.commit_pull(editor, root, sha, cx);
         }
-        if !self.git.gutters.asking_details.insert(sha.clone()) {
+        if !self
+            .git
+            .gutters
+            .asking_details
+            .insert((root.clone(), sha.clone()))
+        {
             return;
         }
         let weak = editor.downgrade();
@@ -352,7 +366,10 @@ impl Shell {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.git.gutters.asking_details.remove(&sha);
+                this.git
+                    .gutters
+                    .asking_details
+                    .remove(&(root.clone(), sha.clone()));
                 let details = match found {
                     Ok(details) => details,
                     Err(err) => return tracing::debug!("git log: {err:#}"),
@@ -362,7 +379,10 @@ impl Shell {
                     date: details.date,
                     message: details.message,
                 };
-                this.git.gutters.details.insert(sha.clone(), info.clone());
+                this.git
+                    .gutters
+                    .details
+                    .insert((root.clone(), sha.clone()), info.clone());
                 let Some(editor) = weak.upgrade() else {
                     return;
                 };
@@ -381,7 +401,7 @@ impl Shell {
         sha: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pull) = self.git.gutters.pulls.get(&sha) {
+        if let Some(pull) = self.git.gutters.pulls.get(&(root.clone(), sha.clone())) {
             if let Some((number, _)) = pull {
                 editor.update(cx, |e, cx| e.show_commit_pr(&sha, *number, cx));
             }
@@ -390,18 +410,26 @@ impl Shell {
         let Some(program) = self.gh_program() else {
             return;
         };
-        if !self.git.gutters.asking_pulls.insert(sha.clone()) {
+        if !self
+            .git
+            .gutters
+            .asking_pulls
+            .insert((root.clone(), sha.clone()))
+        {
             return;
         }
         let weak = editor.downgrade();
         cx.spawn(async move |this, cx| {
-            let task_sha = sha.clone();
+            let (task_root, task_sha) = (root.clone(), sha.clone());
             let found = cx
                 .background_executor()
-                .spawn(async move { gh::pull_for_commit(&program, &root, &task_sha) })
+                .spawn(async move { gh::pull_for_commit(&program, &task_root, &task_sha) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.git.gutters.asking_pulls.remove(&sha);
+                this.git
+                    .gutters
+                    .asking_pulls
+                    .remove(&(root.clone(), sha.clone()));
                 let pull = match found {
                     Ok(pull) => pull,
                     Err(err) => return tracing::debug!("gh api commit pulls: {err:#}"),
@@ -410,7 +438,7 @@ impl Shell {
                 this.git
                     .gutters
                     .pulls
-                    .insert(sha.clone(), pull.map(|p| (p.number, p.url)));
+                    .insert((root.clone(), sha.clone()), pull.map(|p| (p.number, p.url)));
                 if let (Some(number), Some(editor)) = (number, weak.upgrade()) {
                     editor.update(cx, |e, cx| e.show_commit_pr(&sha, number, cx));
                 }

@@ -335,6 +335,7 @@ impl EditorView {
         card.rest_timer = None;
         card.hide_timer = None;
         card.over_card = false;
+        card.over_caption = false;
         let was_shown = card.shown.take().is_some();
         if was_shown {
             cx.notify();
