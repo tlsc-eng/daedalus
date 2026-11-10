@@ -173,6 +173,45 @@ pub fn latest_run(program: &Path, root: &Path, branch: &str) -> Result<Option<Ci
     parse_runs(&run(program, root, &args, QUERY_LIMIT, &[])?.0)
 }
 
+/// A pull request that brought a commit in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct PullRecord {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    html_url: String,
+    #[serde(default)]
+    merged_at: Option<String>,
+}
+
+/// Reads `gh api repos/{owner}/{repo}/commits/<sha>/pulls`: the merged pull request if there is
+/// one, else the first.
+pub fn parse_pulls(json: &[u8]) -> Result<Option<PullRequest>> {
+    let pulls: Vec<PullRecord> = serde_json::from_slice(json)?;
+    let pick = pulls
+        .iter()
+        .position(|p| p.merged_at.is_some())
+        .unwrap_or(0);
+    Ok(pulls.into_iter().nth(pick).map(|p| PullRequest {
+        number: p.number,
+        title: p.title,
+        url: p.html_url,
+    }))
+}
+
+/// The pull request `sha` came in through; `None` for a commit pushed straight to a branch.
+pub fn pull_for_commit(program: &Path, root: &Path, sha: &str) -> Result<Option<PullRequest>> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls");
+    parse_pulls(&run(program, root, &["api", &endpoint], QUERY_LIMIT, &[])?.0)
+}
+
 /// `gh pr create --web`: opens GitHub's new pull request page for the current branch, which
 /// must already be pushed, since gh cannot ask where to push it.
 pub fn create_pr_web(program: &Path, root: &Path) -> Result<()> {
@@ -297,6 +336,7 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "run list") echo '[{"status":"completed","conclusion":"failure","url":"https://github.com/o/r/actions/runs/1","workflowName":"CI","displayTitle":"Fix it"}]' ;;
   "pr create") exit 0 ;;
+  "api repos/{owner}/{repo}/commits/abc123/pulls") echo '[{"number":3,"title":"Open","html_url":"https://github.com/o/r/pull/3","merged_at":null},{"number":4,"title":"Done","html_url":"https://github.com/o/r/pull/4","merged_at":"2024-01-01T00:00:00Z"}]' ;;
   "pr checks") echo '[{"name":"lint","workflow":"CI","bucket":"pass","link":"https://x/1"},{"name":"test","workflow":"CI","bucket":"pending","link":"https://x/2"}]'; exit 8 ;;
 esac"#,
         );
@@ -312,6 +352,11 @@ esac"#,
             ("CI", "Fix it")
         );
         create_pr_web(&program, &root).unwrap();
+        let pull = pull_for_commit(&program, &root, "abc123").unwrap().unwrap();
+        assert_eq!(
+            (pull.number, pull.url.as_str()),
+            (4, "https://github.com/o/r/pull/4")
+        );
         let checks = pr_checks(&program, &root).unwrap();
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["test", "lint"]);
@@ -328,6 +373,8 @@ esac"#,
                 "false".to_string(),
                 format!("1 pr create --web in {root}"),
                 "false".to_string(),
+                format!("1 api repos/{{owner}}/{{repo}}/commits/abc123/pulls in {root}"),
+                "false".to_string(),
                 format!("1 pr checks --json=name,workflow,bucket,link in {root}"),
                 "false".to_string(),
             ]
@@ -336,6 +383,16 @@ esac"#,
             .collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pulls_prefer_the_merged_one_and_an_empty_list_has_none() {
+        let json = br#"[{"number":1,"html_url":"u1"},{"number":2,"title":"t","html_url":"u2","merged_at":"2024-01-01T00:00:00Z"}]"#;
+        assert_eq!(parse_pulls(json).unwrap().unwrap().number, 2);
+        let open =
+            br#"[{"number":5,"html_url":"u5","merged_at":null},{"number":6,"html_url":"u6"}]"#;
+        assert_eq!(parse_pulls(open).unwrap().unwrap().number, 5);
+        assert_eq!(parse_pulls(b"[]").unwrap(), None);
     }
 
     #[test]

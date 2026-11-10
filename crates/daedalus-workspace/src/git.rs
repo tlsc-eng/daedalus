@@ -241,59 +241,6 @@ pub fn parse_hunks(diff: &str) -> Vec<Hunk> {
         .collect()
 }
 
-/// Who last changed a line.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Blame {
-    pub author: String,
-    /// Seconds since the epoch.
-    pub time: i64,
-    pub summary: String,
-    pub uncommitted: bool,
-}
-
-/// Parses the first entry of `git blame --porcelain`.
-pub fn parse_blame(out: &str) -> Option<Blame> {
-    let mut lines = out.lines();
-    let sha = lines.next()?.split(' ').next()?;
-    if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut blame = Blame {
-        author: String::new(),
-        time: 0,
-        summary: String::new(),
-        uncommitted: sha.bytes().all(|b| b == b'0'),
-    };
-    for line in lines {
-        if line.starts_with('\t') {
-            break;
-        }
-        if let Some(author) = line.strip_prefix("author ") {
-            blame.author = author.to_string();
-        } else if let Some(time) = line.strip_prefix("author-time ") {
-            blame.time = time.parse().unwrap_or(0);
-        } else if let Some(summary) = line.strip_prefix("summary ") {
-            blame.summary = summary.to_string();
-        }
-    }
-    Some(blame)
-}
-
-impl Blame {
-    /// "Ann · 3 days ago · Fix the parser", or the VS Code wording for unsaved and uncommitted lines.
-    pub fn caption(&self, now: i64) -> String {
-        if self.uncommitted {
-            return "You · Not committed yet".into();
-        }
-        format!(
-            "{} · {} · {}",
-            self.author,
-            relative_time(now - self.time),
-            self.summary
-        )
-    }
-}
-
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago".
 pub fn relative_time(seconds: i64) -> String {
     let s = seconds.max(0);
@@ -697,7 +644,7 @@ pub fn blame_line(
     line: usize,
     contents: Option<&[u8]>,
     cancel: &Cancel,
-) -> Result<Option<Blame>> {
+) -> Result<Option<BlameCommit>> {
     let rel = path
         .strip_prefix(root)
         .context("file is outside the project")?;
@@ -715,7 +662,10 @@ pub fn blame_line(
     }
     cmd.arg("--").arg(rel);
     let out = run_until(cmd, contents, TIMEOUT, cancel)?;
-    Ok(parse_blame(&String::from_utf8_lossy(&out)))
+    Ok(parse_file_blame(&String::from_utf8_lossy(&out))
+        .commits
+        .into_iter()
+        .next())
 }
 
 /// A commit that last changed some lines of a blamed file.
@@ -733,6 +683,55 @@ pub struct BlameCommit {
     pub previous: Option<String>,
     /// The parent commit the lines came from, with `previous`.
     pub parent: Option<String>,
+}
+
+impl BlameCommit {
+    /// "Ann · 3 days ago · Fix the parser", or the VS Code wording for uncommitted lines.
+    pub fn caption(&self, now: i64) -> String {
+        if self.uncommitted {
+            return "You · Not committed yet".into();
+        }
+        format!(
+            "{} · {} · {}",
+            self.author,
+            relative_time(now - self.time),
+            self.summary
+        )
+    }
+}
+
+/// The parts of a commit the blame hover card adds to what blame already knows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitDetails {
+    pub email: String,
+    /// Local time, "2024-05-01 14:30".
+    pub date: String,
+    pub message: String,
+}
+
+/// Parses `git log -1 --format=%aE%x00%ad%x00%B`.
+pub fn parse_commit_details(out: &str) -> CommitDetails {
+    let mut parts = out.splitn(3, '\0');
+    CommitDetails {
+        email: parts.next().unwrap_or_default().trim().to_string(),
+        date: parts.next().unwrap_or_default().trim().to_string(),
+        message: parts.next().unwrap_or_default().trim().to_string(),
+    }
+}
+
+/// Author email, date and full message of a commit.
+pub fn commit_details(root: &Path, sha: &str, cancel: &Cancel) -> Result<CommitDetails> {
+    let mut cmd = git(root);
+    cmd.args([
+        "log",
+        "-1",
+        "--format=%aE%x00%ad%x00%B",
+        "--date=format-local:%Y-%m-%d %H:%M",
+        sha,
+        "--",
+    ]);
+    let out = run_until(cmd, None, TIMEOUT, cancel)?;
+    Ok(parse_commit_details(&String::from_utf8_lossy(&out)))
 }
 
 /// Whole-file blame: the commits, and which of them each zero-based line came from.
@@ -2074,7 +2073,7 @@ mod tests {
         let out = "0930e963f1c8991bb9873ea31854b682b2ec228a 1 1 1\n\
                    author Ann Lee\nauthor-mail <ann@x>\nauthor-time 1700000000\n\
                    author-tz +0000\nsummary Fix the parser\nfilename f.txt\n\ta\n";
-        let blame = parse_blame(out).unwrap();
+        let blame = parse_file_blame(out).commits.remove(0);
         assert_eq!(blame.author, "Ann Lee");
         assert_eq!(blame.time, 1_700_000_000);
         assert!(!blame.uncommitted);
@@ -2082,12 +2081,22 @@ mod tests {
             blame.caption(1_700_000_000 + 3 * 86_400),
             "Ann Lee · 3 days ago · Fix the parser"
         );
-        let mine = parse_blame(
+        let mine = parse_file_blame(
             "0000000000000000000000000000000000000000 2 2 1\nauthor Not Committed Yet\n\tB\n",
         )
-        .unwrap();
+        .commits
+        .remove(0);
         assert!(mine.uncommitted);
         assert_eq!(mine.caption(0), "You · Not committed yet");
+    }
+
+    #[test]
+    fn commit_details_split_on_nul_and_keep_a_multiline_message() {
+        let d = parse_commit_details("ann@x.io\x002024-05-01 14:30\x00Fix it\n\nLonger why.\n\n");
+        assert_eq!(d.email, "ann@x.io");
+        assert_eq!(d.date, "2024-05-01 14:30");
+        assert_eq!(d.message, "Fix it\n\nLonger why.");
+        assert_eq!(parse_commit_details(""), CommitDetails::default());
     }
 
     #[test]
@@ -2381,6 +2390,10 @@ mod tests {
             (first.author.as_str(), first.summary.as_str()),
             ("Test", "init")
         );
+        let details = commit_details(&sub, &first.sha, &none).unwrap();
+        assert_eq!(details.message, "init");
+        assert!(details.email.contains('@'), "{details:?}");
+        assert_eq!(details.date.len(), "2024-05-01 14:30".len(), "{details:?}");
         let changed = blame_line(&sub, &sub.join("f.txt"), 1, None, &none)
             .unwrap()
             .unwrap();

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
-use daedalus_editor::{EditorView, GutterMark, diff};
+use daedalus_editor::{BlameCommit, EditorView, GutterMark, LineBlame, diff};
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, Ellipsis, InputEvent, TextInput, Theme, Tooltip,
 };
@@ -1169,7 +1169,7 @@ impl Shell {
         let weak = editor.downgrade();
         let line = line as usize;
         let cancel = git::Cancel::default();
-        self.git.blame = Some(cx.spawn(async move |_, cx| {
+        self.git.blame = Some(cx.spawn(async move |this, cx| {
             let _stop = cancel.on_drop();
             cx.background_executor().timer(BLAME_DELAY).await;
             // Read after the pause, so typing does not copy the whole buffer per keystroke.
@@ -1187,16 +1187,31 @@ impl Shell {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64);
-            let caption = match found {
-                Ok(Some(blame)) => Some((line, blame.caption(now))),
-                Ok(None) => None,
+            let (line_blame, commit) = match found {
+                Ok(Some(blame)) => (
+                    Some(LineBlame {
+                        line,
+                        caption: blame.caption(now),
+                        commit: (!blame.uncommitted).then(|| BlameCommit {
+                            sha: blame.sha.clone(),
+                            author: blame.author.clone(),
+                            age: git::relative_time(now - blame.time),
+                            summary: blame.summary.clone(),
+                            heat: 0.,
+                        }),
+                    }),
+                    (!blame.uncommitted).then_some(blame),
+                ),
+                Ok(None) => (None, None),
                 Err(err) => {
                     tracing::debug!("git blame: {err:#}");
-                    None
+                    (None, None)
                 }
             };
             if let Some(editor) = weak.upgrade() {
-                let _ = editor.update(cx, |e, cx| e.set_blame(caption, cx));
+                let id = editor.entity_id();
+                let _ = this.update(cx, |this, _| this.set_inline_commit(id, commit));
+                let _ = editor.update(cx, |e, cx| e.set_blame(line_blame, cx));
             }
         }));
     }

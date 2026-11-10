@@ -193,7 +193,7 @@ impl EditorView {
         if was_shown {
             cx.notify();
         }
-        was_shown
+        self.hide_blame_card(cx) || was_shown
     }
 
     fn schedule_hover_hide(&mut self, cx: &mut Context<Self>) {

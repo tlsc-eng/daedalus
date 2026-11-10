@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use daedalus_editor::{
-    BlameCommit, EditorEvent, EditorView, FileEncoding, GitGutterEvent, GutterBlame,
+    BlameCommit, CommitInfo, EditorEvent, EditorView, FileEncoding, GitGutterEvent, GutterBlame,
 };
 use daedalus_workspace::DiffBase;
+use daedalus_workspace::gh;
 use daedalus_workspace::git::{self, FileBlame, Rev};
 use gpui::{Context, Entity, EntityId, Subscription, Task};
 
@@ -21,6 +22,14 @@ const REBLAME_DELAY: Duration = Duration::from_millis(500);
 pub(super) struct GutterState {
     blames: HashMap<EntityId, Blamed>,
     watch: HashMap<EntityId, [Subscription; 2]>,
+    /// The committed commit the inline blame caption names, for its hover card to open.
+    inline_commit: Option<(EntityId, git::BlameCommit)>,
+    /// Hover card details by full SHA; only successful reads are kept.
+    details: HashMap<String, CommitInfo>,
+    /// The pull request (number, url) each SHA came in through, `None` when it has none.
+    pulls: HashMap<String, Option<(u64, String)>>,
+    asking_details: HashSet<String>,
+    asking_pulls: HashSet<String>,
 }
 
 struct Blamed {
@@ -100,16 +109,19 @@ fn gutter_blame(blame: &FileBlame, now: i64) -> GutterBlame {
 
 /// The diff a blamed commit opens for `path`: what it did to the file, or the uncommitted changes.
 fn commit_diff(blame: &FileBlame, sha: &str) -> Option<DiffBase> {
-    let commit = blame.commits.iter().find(|c| c.sha == sha)?;
+    blame.commits.iter().find(|c| c.sha == sha).map(commit_base)
+}
+
+fn commit_base(commit: &git::BlameCommit) -> DiffBase {
     if commit.uncommitted {
-        return Some(DiffBase::Index);
+        return DiffBase::Index;
     }
-    Some(DiffBase::Commit {
+    DiffBase::Commit {
         rev: commit.sha.clone(),
         old: commit.previous.clone(),
         new: commit.path.clone(),
         parent: commit.parent.clone(),
-    })
+    }
 }
 
 /// The encoding the editor reads and writes its file in, which the index's copy shares.
@@ -289,14 +301,26 @@ impl Shell {
         let path = editor.read(cx).path().to_path_buf();
         match event {
             GitGutterEvent::OpenCommit { sha } => {
-                let base = self
-                    .git
-                    .gutters
+                let gutters = &self.git.gutters;
+                let id = editor.entity_id();
+                let base = gutters
                     .blames
-                    .get(&editor.entity_id())
-                    .and_then(|b| commit_diff(b.blame.as_ref()?, &sha));
+                    .get(&id)
+                    .and_then(|b| commit_diff(b.blame.as_ref()?, &sha))
+                    .or_else(|| {
+                        let (at, commit) = gutters.inline_commit.as_ref()?;
+                        (*at == id && commit.sha == sha).then(|| commit_base(commit))
+                    });
                 if let Some(base) = base {
                     self.open_diff_soon(path, base, cx);
+                }
+            }
+            GitGutterEvent::CommitDetails { sha } => self.commit_card(editor, sha, cx),
+            GitGutterEvent::OpenPullRequest { sha } => {
+                if let Some(Some((_, url))) = self.git.gutters.pulls.get(&sha)
+                    && url.starts_with("https://")
+                {
+                    cx.open_url(url);
                 }
             }
             GitGutterEvent::StageChange { contents, expected } => {
@@ -304,6 +328,100 @@ impl Shell {
             }
             GitGutterEvent::PeekChange { line } => self.peek_change(editor, &path, line, cx),
         }
+    }
+
+    /// Fills the inline blame hover card for `sha`: its details, then the pull request if `gh` has one.
+    fn commit_card(&mut self, editor: &Entity<EditorView>, sha: String, cx: &mut Context<Self>) {
+        let Some(root) = self.editor_root(editor) else {
+            return;
+        };
+        if let Some(info) = self.git.gutters.details.get(&sha).cloned() {
+            editor.update(cx, |e, cx| e.show_commit_details(&sha, info, cx));
+            return self.commit_pull(editor, root, sha, cx);
+        }
+        if !self.git.gutters.asking_details.insert(sha.clone()) {
+            return;
+        }
+        let weak = editor.downgrade();
+        cx.spawn(async move |this, cx| {
+            let (task_root, task_sha) = (root.clone(), sha.clone());
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    git::commit_details(&task_root, &task_sha, &git::Cancel::default())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git.gutters.asking_details.remove(&sha);
+                let details = match found {
+                    Ok(details) => details,
+                    Err(err) => return tracing::debug!("git log: {err:#}"),
+                };
+                let info = CommitInfo {
+                    email: details.email,
+                    date: details.date,
+                    message: details.message,
+                };
+                this.git.gutters.details.insert(sha.clone(), info.clone());
+                let Some(editor) = weak.upgrade() else {
+                    return;
+                };
+                editor.update(cx, |e, cx| e.show_commit_details(&sha, info, cx));
+                this.commit_pull(&editor, root, sha, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Adds the "Open pull request" button when `gh` is signed in and finds one for `sha`.
+    fn commit_pull(
+        &mut self,
+        editor: &Entity<EditorView>,
+        root: PathBuf,
+        sha: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pull) = self.git.gutters.pulls.get(&sha) {
+            if let Some((number, _)) = pull {
+                editor.update(cx, |e, cx| e.show_commit_pr(&sha, *number, cx));
+            }
+            return;
+        }
+        let Some(program) = self.gh_program() else {
+            return;
+        };
+        if !self.git.gutters.asking_pulls.insert(sha.clone()) {
+            return;
+        }
+        let weak = editor.downgrade();
+        cx.spawn(async move |this, cx| {
+            let task_sha = sha.clone();
+            let found = cx
+                .background_executor()
+                .spawn(async move { gh::pull_for_commit(&program, &root, &task_sha) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git.gutters.asking_pulls.remove(&sha);
+                let pull = match found {
+                    Ok(pull) => pull,
+                    Err(err) => return tracing::debug!("gh api commit pulls: {err:#}"),
+                };
+                let number = pull.as_ref().map(|p| p.number);
+                this.git
+                    .gutters
+                    .pulls
+                    .insert(sha.clone(), pull.map(|p| (p.number, p.url)));
+                if let (Some(number), Some(editor)) = (number, weak.upgrade()) {
+                    editor.update(cx, |e, cx| e.show_commit_pr(&sha, number, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Remembers the commit the cursor line's caption names, for its hover card.
+    pub(super) fn set_inline_commit(&mut self, editor: EntityId, commit: Option<git::BlameCommit>) {
+        self.git.gutters.inline_commit = commit.map(|c| (editor, c));
     }
 
     /// Reads the file's index version for the quick diff peek the editor asked for.
@@ -455,6 +573,20 @@ mod tests {
         );
         assert_eq!(commit_diff(&blame, "0000000"), Some(DiffBase::Index));
         assert_eq!(commit_diff(&blame, "fffffff"), None);
+    }
+
+    #[test]
+    fn an_inline_commit_opens_its_change_through_a_rename() {
+        let c = commit("aaaaaaa", 1, false);
+        assert_eq!(
+            commit_base(&c),
+            DiffBase::Commit {
+                rev: "aaaaaaa".into(),
+                old: Some("src/a.rs".into()),
+                new: "src/b.rs".into(),
+                parent: Some("ddddddd".into()),
+            }
+        );
     }
 
     #[test]
