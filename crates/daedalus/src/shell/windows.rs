@@ -642,6 +642,8 @@ pub(super) fn set_companion(
     windows.companion = Some(server);
     windows._companion_events = Some(task);
     windows._companion_ticker = Some(ticker);
+    // A returning phone gets the last snapshot first, so its open chat does not see every session vanish.
+    super::companion::push_snapshot(cx);
 }
 
 pub(super) fn companion_needs(cx: &App) -> &HashMap<PaneId, String> {
@@ -718,10 +720,6 @@ fn set_companion_clients(count: usize, cx: &mut App) {
     }
     if before == 0 {
         super::companion::push_snapshot(cx);
-    } else if count == 0
-        && let Some(server) = companion(cx)
-    {
-        server.set_snapshot(Arc::default());
     }
     for handle in handles(cx) {
         let _ = handle.update(cx, |_, _, cx| cx.notify());
