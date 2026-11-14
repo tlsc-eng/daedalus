@@ -3013,6 +3013,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_returning_phone_gets_the_last_snapshot_first() {
+        let fx = Fixture::new();
+        show_sessions(&fx, &["s1"]);
+        let (_, token) = fx.pair_device();
+        let mut ws = fx.welcomed(&token).await;
+        let ServerMsg::Snapshot { sessions, .. } = next_msg(&mut ws).await else {
+            panic!("expected the first snapshot");
+        };
+        assert_eq!(sessions.len(), 1);
+        drop(ws);
+
+        let mut ws = fx.welcomed(&token).await;
+        let ServerMsg::Snapshot { sessions, .. } = next_msg(&mut ws).await else {
+            panic!("expected the first snapshot");
+        };
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_returning_phone_can_open_a_transcript_at_once() {
+        let fx = Fixture::new();
+        show_sessions(&fx, &["s1"]);
+        write_replies(&fx, "s1", 1);
+        let (_, token) = fx.pair_device();
+        let ws = fx.welcomed(&token).await;
+        drop(ws);
+
+        let mut ws = fx.welcomed(&token).await;
+        assert!(matches!(
+            open_transcript(&mut ws, "s1", 10).await,
+            ServerMsg::Transcript { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn attach_needs_a_pane_in_the_snapshot() {
         let fx = Fixture::new();
         let (_, token) = fx.pair_device();
