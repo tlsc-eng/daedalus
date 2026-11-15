@@ -265,6 +265,9 @@ impl Mysql {
                 .collect();
             if let Err(e) = conn.exec_drop(stmt.sql, Params::Positional(values)).await {
                 let _ = conn.query_drop("ROLLBACK").await;
+                if stop.load(Ordering::SeqCst) {
+                    return Err(ApplyError::timed_out());
+                }
                 return Err(ApplyError {
                     index: Some(i),
                     message: describe(&e),

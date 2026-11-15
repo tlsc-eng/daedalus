@@ -172,14 +172,12 @@ fn apply_blocking(
             }
             Err(e) => {
                 rollback();
-                let message = if stop.load(Ordering::SeqCst) {
-                    ApplyError::timed_out().message
-                } else {
-                    failure(&e, &stmt.sql).message
-                };
+                if stop.load(Ordering::SeqCst) {
+                    return Err(ApplyError::timed_out());
+                }
                 return Err(ApplyError {
                     index: Some(i),
-                    message,
+                    message: failure(&e, &stmt.sql).message,
                 });
             }
         }

@@ -28,7 +28,8 @@ pub fn init(path: &Path, env: &str) -> io::Result<()> {
     } else {
         BoxMakeWriter::new(file)
     };
-    let filter = EnvFilter::try_from_env(env).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        quiet_drivers(EnvFilter::try_from_env(env).unwrap_or_else(|_| EnvFilter::new("info")));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)
@@ -37,9 +38,27 @@ pub fn init(path: &Path, env: &str) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+/// Added last so no DAEDALUS_LOG value can make a driver log SQL text or bound cell values.
+fn quiet_drivers(filter: EnvFilter) -> EnvFilter {
+    ["tokio_postgres=warn", "mysql_async=warn", "rusqlite=warn"]
+        .into_iter()
+        .fold(filter, |f, d| {
+            f.add_directive(d.parse().expect("static directive"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_cannot_unmute_the_db_drivers() {
+        let filter = quiet_drivers(EnvFilter::new("debug"));
+        let text = filter.to_string();
+        assert!(text.contains("tokio_postgres=warn"), "{text}");
+        assert!(text.contains("mysql_async=warn"), "{text}");
+        assert!(text.contains("rusqlite=warn"), "{text}");
+    }
 
     #[test]
     fn oversized_log_is_rotated_and_reopened_owner_only() {

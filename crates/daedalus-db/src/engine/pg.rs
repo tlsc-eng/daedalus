@@ -212,8 +212,13 @@ fn failure(e: &tokio_postgres::Error) -> Failure {
 }
 
 /// Sends a cell as text so the server parses it for the column's own type.
-#[derive(Debug)]
 struct TextParam<'a>(Option<&'a str>);
+
+impl std::fmt::Debug for TextParam<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TextParam(..)")
+    }
+}
 
 impl ToSql for TextParam<'_> {
     fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
@@ -320,6 +325,9 @@ impl Pg {
                 }
                 Err(e) => {
                     rollback().await;
+                    if stop.load(Ordering::SeqCst) {
+                        return Err(ApplyError::timed_out());
+                    }
                     return Err(ApplyError {
                         index: Some(i),
                         message: failure(&e).message,
@@ -435,6 +443,11 @@ mod tests {
             projects: Vec::new(),
             save_password: false,
         }
+    }
+
+    #[test]
+    fn text_param_debug_redacts_the_value() {
+        assert!(!format!("{:?}", TextParam(Some("secret"))).contains("secret"));
     }
 
     #[test]

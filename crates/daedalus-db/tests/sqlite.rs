@@ -885,3 +885,54 @@ fn apply_queued_behind_a_run_runs_after_it() {
         }
     }
 }
+
+#[test]
+fn apply_rolls_back_on_a_constraint_violation() {
+    let rig = rig(false);
+    table_with_rows(
+        &rig,
+        "create table t(id integer primary key, u text unique); insert into t values (1,'a')",
+    );
+    let err = apply(
+        &rig,
+        vec![
+            stmt("insert into t values (?, ?)", &[Some("2"), Some("b")]),
+            stmt("insert into t values (?, ?)", &[Some("3"), Some("a")]),
+        ],
+    )
+    .expect_err("unique");
+    assert_eq!(err.index, Some(1));
+    assert_eq!(
+        scalar(&rig, 2, "select count(*) from t"),
+        vec![Some("1".into())]
+    );
+}
+
+#[test]
+fn disconnect_during_apply_changes_nothing() {
+    let path = make_db("disc");
+    let path_str = path.to_str().expect("utf8").to_owned();
+    let mut first = connect(conn(&path_str, false), None);
+    first.files.push(path);
+    assert!(matches!(first.next(), Update::Connected { .. }));
+    table_with_rows(
+        &first,
+        "create table t(id integer primary key, x integer); insert into t values (1, 0)",
+    );
+    first.handle.send(Command::Apply {
+        session: S,
+        statements: vec![stmt(
+            "update t set x = (with recursive c(n) as (select 1 union all select n+1 from c where n < 500000000) select max(n) from c) where id = ?",
+            &[Some("1")],
+        )],
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    first.handle.send(Command::Disconnect { session: S });
+    std::thread::sleep(Duration::from_millis(500));
+    let second = connect(conn(&path_str, false), None);
+    assert!(matches!(second.next(), Update::Connected { .. }));
+    assert_eq!(
+        scalar(&second, 1, "select x from t"),
+        vec![Some("0".into())]
+    );
+}
