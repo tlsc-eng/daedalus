@@ -312,8 +312,6 @@ async fn introspect(
     let mut stream = driver.catalog();
     let deadline = Instant::now() + INTROSPECT_TIMEOUT;
     let mut timed_out = false;
-    let mut resend = tokio::time::interval(CANCEL_RESEND);
-    resend.reset();
     let mut rows = Vec::new();
     let mut failed: Option<String> = None;
     loop {
@@ -322,13 +320,6 @@ async fn introspect(
                 std::future::pending().await
             } else {
                 tokio::time::sleep_until(deadline).await
-            }
-        };
-        let resend_tick = async {
-            if timed_out {
-                resend.tick().await;
-            } else {
-                std::future::pending::<()>().await;
             }
         };
         tokio::select! {
@@ -347,9 +338,7 @@ async fn introspect(
             () = sleep => {
                 cancel().await;
                 timed_out = true;
-                resend.reset();
             }
-            () = resend_tick => cancel().await,
             item = stream.next() => match item {
                 Some(Ok(Item::Row(row))) => rows.push(row),
                 Some(Ok(_)) => {}
