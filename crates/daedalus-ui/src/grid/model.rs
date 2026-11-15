@@ -317,6 +317,62 @@ pub(crate) fn drag_width(start_w: f32, start_x: f32, x: f32, min: f32) -> f32 {
     (start_w + x - start_x).clamp(min, MAX_COL_W.max(min))
 }
 
+/// Rows moved by one page key: a screen minus one row of overlap, never fewer than one.
+pub(crate) fn page_rows(body_h: f32, row_h: f32) -> usize {
+    if row_h <= 0. || !body_h.is_finite() || !row_h.is_finite() {
+        return 1;
+    }
+    ((body_h / row_h).floor() as usize).saturating_sub(1).max(1)
+}
+
+/// Cell under a point in content coordinates (gutter and scroll already removed), clamped to the grid.
+pub(crate) fn cell_at(
+    x: f32,
+    y: f32,
+    lefts: &[f32],
+    row_h: f32,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    let cols = lefts.len().checked_sub(1).filter(|&c| c > 0)?;
+    let last = rows.checked_sub(1)?;
+    if row_h <= 0. || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let row = ((y.max(0.) / row_h).floor() as usize).min(last);
+    let col = lefts[1..].partition_point(|&r| r <= x).min(cols - 1);
+    Some((row, col))
+}
+
+/// Whether an axis has enough overflow to show a scrollbar; render and paint must agree on it.
+pub(crate) fn scrollable(max_offset: f32) -> bool {
+    max_offset > 0.5
+}
+
+/// Top and length in px of a scrollbar thumb inside a track, or `None` when the content fits.
+// Mirrors the palette's scroll_thumb; daedalus-ui cannot import the app crate.
+pub(crate) fn thumb(
+    view: f32,
+    max_offset: f32,
+    offset: f32,
+    track: f32,
+    min_len: f32,
+) -> Option<(f32, f32)> {
+    if view <= 0. || !scrollable(max_offset) || track <= 0. {
+        return None;
+    }
+    let len = (track * view / (view + max_offset)).max(min_len).min(track);
+    let top = (offset / max_offset).clamp(0., 1.) * (track - len);
+    Some((top, len))
+}
+
+/// Scroll offset that centres the thumb on a pointer position along the track.
+pub(crate) fn bar_offset(pos: f32, track: f32, thumb_len: f32, max_offset: f32) -> f32 {
+    if track <= thumb_len || max_offset <= 0. {
+        return 0.;
+    }
+    ((pos - thumb_len / 2.) / (track - thumb_len)).clamp(0., 1.) * max_offset
+}
+
 pub(crate) fn gutter_chars(rows: usize) -> usize {
     rows.max(1).to_string().len().max(3)
 }
@@ -786,5 +842,78 @@ mod tests {
         assert_eq!(gutter_chars(999), 3);
         assert_eq!(gutter_chars(1000), 4);
         assert_eq!(gutter_chars(100_000), 6);
+    }
+
+    #[test]
+    fn page_rows_cases() {
+        assert_eq!(page_rows(220., 22.), 9);
+        assert_eq!(page_rows(30., 22.), 1);
+        assert_eq!(page_rows(0., 22.), 1);
+        assert_eq!(page_rows(100., 0.), 1);
+        assert_eq!(page_rows(f32::NAN, 22.), 1);
+    }
+
+    #[test]
+    fn cell_at_maps_content_coords() {
+        let lefts = [0., 100., 200., 300.];
+        assert_eq!(cell_at(150., 45., &lefts, 22., 10), Some((2, 1)));
+        assert_eq!(cell_at(-5., -5., &lefts, 22., 10), Some((0, 0)));
+        assert_eq!(cell_at(999., 9999., &lefts, 22., 10), Some((9, 2)));
+        assert_eq!(cell_at(100., 22., &lefts, 22., 10), Some((1, 1)));
+    }
+
+    #[test]
+    fn cell_at_follows_resized_columns() {
+        let lefts = [0., 40., 300.];
+        assert_eq!(cell_at(39., 0., &lefts, 22., 3), Some((0, 0)));
+        assert_eq!(cell_at(41., 0., &lefts, 22., 3), Some((0, 1)));
+    }
+
+    #[test]
+    fn cell_at_empty() {
+        assert_eq!(cell_at(10., 10., &[0.], 22., 10), None);
+        assert_eq!(cell_at(10., 10., &[], 22., 10), None);
+        assert_eq!(cell_at(10., 10., &[0., 100.], 22., 0), None);
+        assert_eq!(cell_at(f32::NAN, 10., &[0., 100.], 22., 5), None);
+    }
+
+    #[test]
+    fn bar_offset_centres_thumb() {
+        assert_eq!(bar_offset(0., 100., 20., 500.), 0.);
+        assert_eq!(bar_offset(50., 100., 20., 500.), 250.);
+        assert_eq!(bar_offset(100., 100., 20., 500.), 500.);
+        assert_eq!(bar_offset(30., 100., 20., 500.), 125.);
+        assert_eq!(bar_offset(30., 20., 20., 500.), 0.);
+    }
+
+    #[test]
+    fn thumb_matches_palette() {
+        assert_eq!(thumb(100., 300., 150., 100., 24.), Some((37.5, 25.)));
+        assert_eq!(thumb(100., 0., 0., 100., 24.), None);
+    }
+
+    #[test]
+    fn step_jump_saturates() {
+        let mut m = grid(4, 3, false);
+        m.select(pos(1, 1), false);
+        assert_eq!(m.step(isize::MAX, isize::MAX, false), Some(pos(3, 2)));
+        assert_eq!(m.step(-isize::MAX, 0, false), Some(pos(0, 2)));
+    }
+
+    #[test]
+    fn scrollable_ignores_view_and_track() {
+        assert!(scrollable(0.6));
+        assert!(!scrollable(0.5));
+        assert!(!scrollable(0.));
+        assert!(thumb(0., 100., 0., 50., 24.).is_none());
+        assert!(scrollable(100.));
+    }
+
+    #[test]
+    fn thumb_centre_round_trips_through_bar_offset() {
+        let (view, max, cur, track, min_len) = (100., 900., 300., 100., 30.);
+        let (top, len) = thumb(view, max, cur, track, min_len).unwrap();
+        let back = bar_offset(top + len / 2., track, len, max);
+        assert!((back - cur).abs() < 0.01);
     }
 }
