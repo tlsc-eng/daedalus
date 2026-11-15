@@ -1,6 +1,8 @@
 mod model;
+mod value;
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -21,6 +23,7 @@ use model::{
     gutter_chars, reveal_x, scroll_strategy, style_for, visible_columns, visible_rows,
 };
 pub use model::{GridColumn, GridMarks, RowMark};
+use value::Inspected;
 
 actions!(
     data_grid,
@@ -35,7 +38,9 @@ actions!(
         SelectRight,
         SelectAll,
         Copy,
-        Edit
+        Edit,
+        ToggleValue,
+        CloseValue
     ]
 );
 
@@ -53,6 +58,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("cmd-c", Copy, ctx),
         KeyBinding::new("enter", Edit, ctx),
+        KeyBinding::new("shift-enter", ToggleValue, ctx),
+        KeyBinding::new("escape", CloseValue, ctx),
     ]);
 }
 
@@ -111,6 +118,9 @@ pub struct DataGrid {
     editing: Option<Editing>,
     // show() has no window, so render restores grid focus if the dropped editor still held it.
     refocus_pending: Option<FocusHandle>,
+    value_open: bool,
+    value_opened: Option<Opening>,
+    value_cache: Option<(CellPos, SharedString, Rc<Inspected>)>,
 }
 
 impl EventEmitter<GridEvent> for DataGrid {}
@@ -147,6 +157,9 @@ impl DataGrid {
             marks: GridMarks::default(),
             editing: None,
             refocus_pending: None,
+            value_open: false,
+            value_opened: None,
+            value_cache: None,
         }
     }
 
@@ -300,7 +313,131 @@ impl DataGrid {
                 row: pos.row,
                 col: pos.col,
             });
+        } else if !self.editable && self.editing.is_none() {
+            self.show_value(cx);
         }
+    }
+
+    /// Opens the value panel for the active cell.
+    pub fn show_value(&mut self, cx: &mut Context<Self>) {
+        if !self.value_open {
+            self.value_open = true;
+            self.value_opened = Some(Opening::now());
+        }
+        cx.notify();
+    }
+
+    fn close_value(&mut self, cx: &mut Context<Self>) {
+        if self.value_open {
+            self.value_open = false;
+            cx.notify();
+        }
+    }
+
+    fn inspected(&mut self) -> Option<(CellPos, Rc<Inspected>)> {
+        let pos = self.model.active?;
+        let raw = self.model.rows.get(pos.row)?.get(pos.col)?;
+        let key = raw.clone().unwrap_or_default();
+        if let Some((p, k, i)) = &self.value_cache
+            && *p == pos
+            && *k == key
+            && (raw.is_some() == (i.kind != value::ValueKind::Null))
+        {
+            return Some((pos, i.clone()));
+        }
+        let inspected = Rc::new(value::inspect(raw.as_ref().map(|v| v.as_ref())));
+        self.value_cache = Some((pos, key, inspected.clone()));
+        Some((pos, inspected))
+    }
+
+    fn value_panel(
+        &self,
+        shown: Option<(CellPos, Rc<Inspected>)>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let t = cx.theme().clone();
+        let name = shown
+            .as_ref()
+            .and_then(|(p, _)| self.model.columns.get(p.col))
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let raw: Option<SharedString> = shown
+            .as_ref()
+            .and_then(|(p, _)| self.model.rows.get(p.row)?.get(p.col)?.clone());
+        let key = shown.as_ref().map_or(0, |(p, _)| p.row * 4096 + p.col);
+        let body = match &shown {
+            None => div()
+                .text_color(t.color.content_muted)
+                .child("Select a cell"),
+            Some((_, i)) if i.kind == value::ValueKind::Null => div()
+                .italic()
+                .text_color(t.color.content_muted)
+                .child("NULL"),
+            Some((_, i)) => div().child(i.body.clone()),
+        };
+        let summary = shown.as_ref().map(|(_, i)| i.summary.clone());
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .px(t.space(Space::Sm))
+                .cursor_pointer()
+                .text_color(t.color.content_secondary)
+                .hover(|s| s.bg(t.color.surface_hover))
+                .child(label)
+        };
+        div()
+            .flex_none()
+            .w(t.ui(320.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(t.color.border)
+            .bg(t.color.surface)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .h(t.size(Size::Control))
+                    .items_center()
+                    .px(t.space(Space::Sm))
+                    .gap(t.space(Space::Sm))
+                    .border_b_1()
+                    .border_color(t.color.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .ellipsis()
+                            .text_color(t.color.content_muted)
+                            .child(match summary {
+                                Some(s) => format!("{name} · {s}"),
+                                None => name.to_string(),
+                            }),
+                    )
+                    .child(button("grid-value-copy", "Copy").on_click(cx.listener(
+                        move |_, _: &gpui::ClickEvent, _, cx| {
+                            let text = raw.as_ref().map_or(String::new(), |v| v.to_string());
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        },
+                    )))
+                    .child(button("grid-value-close", "×").on_click(cx.listener(
+                        |this, _: &gpui::ClickEvent, window, cx| {
+                            this.close_value(cx);
+                            window.focus(&this.focus);
+                        },
+                    ))),
+            )
+            .child(
+                body.id(("grid-value-body", key))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .p(t.space(Space::Sm))
+                    .font_family(t.typography.mono.clone())
+                    .text_color(t.color.content),
+            )
     }
 
     fn right_click(
@@ -893,6 +1030,7 @@ impl Render for DataGrid {
         {
             window.focus(&self.focus);
         }
+        let shown = self.value_open.then(|| self.inspected()).flatten();
         let m = self.metrics(window, cx);
         let t = m.theme.clone();
         if self.dim.running() {
@@ -935,6 +1073,23 @@ impl Render for DataGrid {
                 if let Some(pos) = this.model.active {
                     this.request_edit(pos, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleValue, _, cx| {
+                if this.editing.is_some() {
+                    return cx.propagate();
+                }
+                if this.value_open {
+                    this.close_value(cx);
+                } else {
+                    this.show_value(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseValue, window, cx| {
+                if this.editing.is_some() || !this.value_open {
+                    return cx.propagate();
+                }
+                this.close_value(cx);
+                window.focus(&this.focus);
             }));
         if self.model.columns.is_empty() {
             return root;
@@ -942,19 +1097,40 @@ impl Render for DataGrid {
         let fresh = self.opened.is_some_and(|o| o.running(t.motion.fast));
         let header = self.header(&m, cx);
         let body = self.body(m, cx);
-        root.child(motion::animate_enter(
+        let grid = motion::animate_enter(
             t.motion.reduced,
             fresh,
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w_0()
                 .min_h_0()
                 .child(header)
                 .child(body),
             ("data-grid-in", self.generation),
             Animation::new(t.motion.fast).with_easing(motion::ease_enter()),
             |el, d| el.opacity(d),
-        ))
+        );
+        let panel = self.value_open.then(|| {
+            let fresh = self.value_opened.is_some_and(|o| o.running(t.motion.base));
+            motion::animate_enter(
+                t.motion.reduced,
+                fresh,
+                self.value_panel(shown, cx).relative(),
+                ("grid-value-in", self.generation),
+                Animation::new(t.motion.base).with_easing(motion::ease_enter()),
+                |el, d| el.opacity(d).left(px((1. - d) * 16.)),
+            )
+        });
+        root.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .child(grid)
+                .children(panel),
+        )
     }
 }
