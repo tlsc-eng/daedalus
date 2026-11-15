@@ -346,7 +346,7 @@ fn shown_span(text: &str, from: usize, to: usize, masked: bool) -> usize {
     shown(&text[from..to], masked).len()
 }
 
-/// Byte ranges of `text`'s lines without their breaks; a single-line box has one line.
+/// Byte offset of `b` into the line starting at `at`, or the shown-bullet offset for masked text.
 /// Layout starts are stale until the next paint, so a masked slice may not land on a char boundary.
 fn line_offset(text: &str, at: usize, b: usize, masked: bool) -> usize {
     let plain = b.saturating_sub(at);
@@ -357,6 +357,7 @@ fn line_offset(text: &str, at: usize, b: usize, masked: bool) -> usize {
     text.get(at..b).map_or(plain, |s| shown(s, true).len())
 }
 
+/// Byte ranges of `text`'s lines without their breaks; a single-line box has one line.
 fn line_ranges(text: &str, multiline: bool) -> Vec<Range<usize>> {
     if !multiline {
         return std::iter::once(0..text.len()).collect();
