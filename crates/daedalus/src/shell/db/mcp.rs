@@ -13,7 +13,7 @@ use gpui::Context;
 use super::{Meta, Phase, Shell, conn_key, path};
 
 const MAX_RUNS_PER_SESSION: usize = 4;
-/// Past the worker's own timeout, so only a run it can no longer end is cut here.
+/// Counts from the send, so a run still queued behind other work can expire before it starts.
 const DEADLINE: Duration = Duration::from_secs(QUERY_TIMEOUT.as_secs() + 5);
 const NO_CALLER: &str = "Database tools work only from Claude in a Daedalus terminal.";
 const UNFINISHED: &str = "The query did not finish.";
