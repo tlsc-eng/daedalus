@@ -178,8 +178,23 @@ async fn session_task(
     mut rx: mpsc::UnboundedReceiver<Command>,
     updates: async_channel::Sender<Update>,
 ) {
-    let connected =
-        tokio::time::timeout(CONNECT_TIMEOUT, Driver::connect(&conn, password.as_ref())).await;
+    let mut queued: VecDeque<Command> = VecDeque::new();
+    let connected = {
+        let connect =
+            tokio::time::timeout(CONNECT_TIMEOUT, Driver::connect(&conn, password.as_ref()));
+        tokio::pin!(connect);
+        loop {
+            tokio::select! {
+                biased;
+                command = rx.recv() => match command {
+                    None | Some(Command::Disconnect { .. }) => return,
+                    Some(c @ (Command::Run { .. } | Command::Cancel { .. })) => queued.push_back(c),
+                    Some(_) => {}
+                },
+                result = &mut connect => break result,
+            }
+        }
+    };
     drop(password);
     let driver = match connected {
         Ok(Ok((driver, server))) => {
@@ -202,7 +217,6 @@ async fn session_task(
             return;
         }
     };
-    let mut queued: VecDeque<Command> = VecDeque::new();
     loop {
         let command = match queued.pop_front() {
             Some(c) => c,
@@ -219,6 +233,16 @@ async fn session_task(
                 timeout,
                 ..
             } => {
+                let early = queued
+                    .iter()
+                    .position(|c| matches!(c, Command::Cancel { run: r, .. } if *r == run));
+                if let Some(i) = early {
+                    queued.remove(i);
+                    if updates.send(cancelled_done(session, run)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let job = Job {
                     session,
                     run,
@@ -253,6 +277,48 @@ fn timeout_message(timeout: Duration) -> String {
     }
 }
 
+fn cancelled_done(session: SessionId, run: RunId) -> Update {
+    Update::Done {
+        session,
+        run,
+        affected: None,
+        elapsed: Duration::ZERO,
+        truncated: true,
+    }
+}
+
+enum Route {
+    Cancel,
+    Disconnect,
+    Cancelled(RunId),
+    Nothing,
+}
+
+/// Sorts a command that arrived mid-run; a Cancel for a queued run removes it so it never starts.
+fn route(command: Command, run: RunId, queued: &mut VecDeque<Command>) -> Route {
+    match command {
+        Command::Cancel { run: r, .. } if r == run => Route::Cancel,
+        Command::Cancel { run: r, .. } => {
+            let at = queued
+                .iter()
+                .position(|c| matches!(c, Command::Run { run: q, .. } if *q == r));
+            match at {
+                Some(i) => {
+                    queued.remove(i);
+                    Route::Cancelled(r)
+                }
+                None => Route::Nothing,
+            }
+        }
+        Command::Disconnect { .. } => Route::Disconnect,
+        c @ Command::Run { .. } => {
+            queued.push_back(c);
+            Route::Nothing
+        }
+        _ => Route::Nothing,
+    }
+}
+
 #[derive(PartialEq)]
 enum Stop {
     User,
@@ -269,18 +335,29 @@ enum Resume {
 async fn wait_for_resume(
     rx: &mut mpsc::UnboundedReceiver<Command>,
     queued: &mut VecDeque<Command>,
+    updates: &async_channel::Sender<Update>,
+    session: SessionId,
     run: RunId,
 ) -> Resume {
     loop {
-        match rx.recv().await {
-            None => return Resume::Gone,
-            Some(Command::FetchMore { run: r, rows, .. }) if r == run => {
+        let Some(command) = rx.recv().await else {
+            return Resume::Gone;
+        };
+        if let Command::FetchMore { run: r, rows, .. } = command {
+            if r == run {
                 return Resume::More(rows.max(1));
             }
-            Some(Command::Cancel { run: r, .. }) if r == run => return Resume::Stop,
-            Some(Command::Disconnect { .. }) => return Resume::Gone,
-            Some(c @ Command::Run { .. }) => queued.push_back(c),
-            Some(_) => {}
+            continue;
+        }
+        match route(command, run, queued) {
+            Route::Cancel => return Resume::Stop,
+            Route::Disconnect => return Resume::Gone,
+            Route::Cancelled(r) => {
+                if updates.send(cancelled_done(session, r)).await.is_err() {
+                    return Resume::Gone;
+                }
+            }
+            Route::Nothing => {}
         }
     }
 }
@@ -302,12 +379,19 @@ async fn run_job(
     } = job;
     let started = Instant::now();
     let canceller = driver.canceller();
-    let cancel = || {
+    // Bounded so a dead network cannot wedge the session; an idle backend just ignores the signal.
+    let cancel = || async {
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
+    };
+    let cancel_detached = || {
         let canceller = canceller.clone();
-        tokio::spawn(async move { canceller.cancel().await });
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
+        });
     };
     let mut deadline = timeout.map(|t| started + t);
     let mut stop: Option<Stop> = None;
+    let mut first_item = true;
     let mut stream = driver.query(sql);
     let mut buffer: Vec<Vec<Cell>> = Vec::new();
     let mut limit = page;
@@ -326,6 +410,22 @@ async fn run_job(
     }
 
     loop {
+        match rx.try_recv() {
+            Ok(command) => match route(command, run, queued) {
+                Route::Cancel => {
+                    send!(cancelled_done(session, run));
+                    return true;
+                }
+                Route::Disconnect => return false,
+                Route::Cancelled(r) => send!(cancelled_done(session, r)),
+                Route::Nothing => {}
+            },
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => return false,
+        }
+    }
+
+    loop {
         let sleep = async {
             match deadline {
                 Some(d) if stop.is_none() => tokio::time::sleep_until(d).await,
@@ -335,28 +435,32 @@ async fn run_job(
         let item = tokio::select! {
             biased;
             command = rx.recv() => {
-                match command {
-                    None => return false,
-                    Some(Command::Cancel { run: r, .. }) if r == run => {
-                        cancel();
+                let Some(command) = command else { return false };
+                match route(command, run, queued) {
+                    Route::Cancel => {
+                        cancel().await;
                         stop.get_or_insert(Stop::User);
                     }
-                    Some(Command::Disconnect { .. }) => {
-                        cancel();
+                    Route::Disconnect => {
+                        cancel_detached();
                         return false;
                     }
-                    Some(c @ Command::Run { .. }) => queued.push_back(c),
-                    Some(_) => {}
+                    Route::Cancelled(r) => send!(cancelled_done(session, r)),
+                    Route::Nothing => {}
                 }
                 continue;
             }
             () = sleep => {
-                cancel();
+                cancel().await;
                 stop = Some(Stop::Timeout);
                 continue;
             }
             item = stream.next() => item,
         };
+        if std::mem::take(&mut first_item) && stop == Some(Stop::User) {
+            // The cancel may have raced the query send and been discarded by the backend.
+            cancel().await;
+        }
         match item {
             None => break,
             Some(Err(failure)) => {
@@ -405,10 +509,14 @@ async fn run_job(
             Some(Ok(Item::Row(row))) => {
                 if !budget.admit(&row) {
                     truncated = true;
-                    cancel();
+                    cancel().await;
                     break;
                 }
                 if buffer.len() >= limit {
+                    if stop.is_some() {
+                        truncated = true;
+                        break;
+                    }
                     send!(Update::Rows {
                         session,
                         run,
@@ -416,15 +524,15 @@ async fn run_job(
                         more: true
                     });
                     let paused = Instant::now();
-                    match wait_for_resume(rx, queued, run).await {
+                    match wait_for_resume(rx, queued, updates, session, run).await {
                         Resume::More(rows) => limit = rows,
                         Resume::Stop => {
-                            cancel();
+                            cancel().await;
                             truncated = true;
                             break;
                         }
                         Resume::Gone => {
-                            cancel();
+                            cancel_detached();
                             return false;
                         }
                     }

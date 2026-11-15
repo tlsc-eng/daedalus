@@ -27,7 +27,11 @@ pub struct Budget {
 impl Budget {
     /// Counts the row and returns false when it would pass a cap, in which case it is not counted.
     pub fn admit(&mut self, row: &[Cell]) -> bool {
-        let size: usize = row.iter().flatten().map(String::len).sum();
+        let size = std::mem::size_of::<Vec<Cell>>()
+            + row
+                .iter()
+                .map(|c| std::mem::size_of::<Cell>() + c.as_ref().map_or(0, String::len))
+                .sum::<usize>();
         if self.rows >= MAX_ROWS || self.bytes + size > MAX_BYTES {
             return false;
         }
@@ -44,10 +48,24 @@ mod tests {
     #[test]
     fn byte_cap_truncates() {
         let mut budget = Budget::default();
-        let big = vec![Some(String::from_utf8(vec![b'x'; MAX_BYTES / 2]).unwrap())];
+        let big = vec![Some(
+            String::from_utf8(vec![b'x'; MAX_BYTES / 2 - 48]).unwrap(),
+        )];
         assert!(budget.admit(&big));
         assert!(budget.admit(&big));
         assert!(!budget.admit(&[Some("y".into())]));
+    }
+
+    #[test]
+    fn null_only_rows_count_toward_the_byte_cap() {
+        let mut budget = Budget::default();
+        let row = vec![None; 64];
+        let mut admitted = 0;
+        while budget.admit(&row) {
+            admitted += 1;
+            assert!(admitted <= MAX_ROWS);
+        }
+        assert!(admitted < MAX_ROWS);
     }
 
     #[test]

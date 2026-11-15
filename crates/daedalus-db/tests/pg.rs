@@ -145,3 +145,156 @@ fn timeout_cancels() {
     let (message, _) = rig.next_error();
     assert_eq!(message, "timed out after 0.5s");
 }
+
+fn cancel(rig: &Rig, run: u64) {
+    rig.handle.send(Command::Cancel {
+        session: S,
+        run: RunId(run),
+    });
+}
+
+fn done_or_cancel_error(rig: &Rig, run: u64) {
+    loop {
+        match rig.next() {
+            Update::Columns { .. } | Update::Rows { .. } => {}
+            Update::Done {
+                run: r, truncated, ..
+            } if r == RunId(run) => {
+                assert!(truncated);
+                return;
+            }
+            Update::RunError {
+                run: r, message, ..
+            } if r == RunId(run) => {
+                assert!(message.contains("cancel"), "{message}");
+                return;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn cancel_right_after_run_stops_it() {
+    let rig = rig(false);
+    let started = Instant::now();
+    rig.run(1, "select pg_sleep(3)", 500, None);
+    cancel(&rig, 1);
+    done_or_cancel_error(&rig, 1);
+    assert!(started.elapsed() < Duration::from_millis(2500));
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn cancel_queued_run_never_runs() {
+    let rig = rig(false);
+    let started = Instant::now();
+    rig.run(1, "select pg_sleep(1)", 500, None);
+    rig.run(2, "select pg_sleep(2)", 500, None);
+    cancel(&rig, 2);
+    let (mut a_done, mut b_cancelled) = (false, false);
+    while !(a_done && b_cancelled) {
+        match rig.next() {
+            Update::Columns { .. } | Update::Rows { .. } => {}
+            Update::Done {
+                run: RunId(1),
+                truncated,
+                ..
+            } => {
+                assert!(!truncated);
+                a_done = true;
+            }
+            Update::Done {
+                run: RunId(2),
+                truncated,
+                ..
+            } => {
+                assert!(truncated);
+                b_cancelled = true;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(started.elapsed() < Duration::from_millis(1900));
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn cancel_while_paused_does_not_hit_next_run() {
+    let rig = rig(false);
+    for i in 0..10u64 {
+        let first = i * 2 + 1;
+        rig.run(first, "select g from generate_series(1, 600) g", 100, None);
+        loop {
+            if let Update::Rows { more: true, .. } = rig.next() {
+                break;
+            }
+        }
+        cancel(&rig, first);
+        loop {
+            match rig.next() {
+                Update::Done { run, .. } if run == RunId(first) => break,
+                Update::RunError { run, message, .. } if run == RunId(first) => {
+                    panic!("{message}")
+                }
+                _ => {}
+            }
+        }
+        rig.run(first + 1, "select pg_sleep(0.3)", 100, None);
+        loop {
+            match rig.next() {
+                Update::Done { run, .. } if run == RunId(first + 1) => break,
+                Update::RunError { message, .. } => panic!("next run hit: {message}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn scalar(rig: &Rig, run: u64) -> Option<String> {
+    let mut value = None;
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => {
+                if let Some(row) = rows.first() {
+                    value = row[0].clone();
+                }
+            }
+            Update::Done { run: r, .. } if r == RunId(run) => return value,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn multi_statement_script_keeps_transaction_usable() {
+    let rig = rig(false);
+    rig.run(1, "begin", 100, None);
+    scalar(&rig, 1);
+    rig.run(
+        2,
+        "create temp table zz(x int); insert into zz values (1)",
+        100,
+        None,
+    );
+    scalar(&rig, 2);
+    rig.run(3, "select count(*) from zz", 100, None);
+    assert_eq!(scalar(&rig, 3), Some("1".into()));
+    rig.run(4, "rollback", 100, None);
+    scalar(&rig, 4);
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn bad_statement_in_transaction_reports_real_error() {
+    let rig = rig(false);
+    rig.run(1, "begin", 100, None);
+    scalar(&rig, 1);
+    rig.run(2, "select * from nope_table", 100, None);
+    let (message, _) = rig.next_error();
+    assert!(message.contains("nope_table"), "{message}");
+    assert!(!message.contains("aborted"), "{message}");
+}

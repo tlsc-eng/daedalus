@@ -243,21 +243,25 @@ impl Pg {
         }
     }
 
-    /// Prepare only supplies type and table info; scripts fail it and then get names alone.
+    /// Prepare only supplies type and table info and is skipped for scripts, where it would abort a transaction.
     pub fn query(&self, sql: String) -> ItemStream {
         let client = self.client.clone();
         let start = async move {
-            let typed: Vec<Column> = match client.prepare(&sql).await {
-                Ok(stmt) => stmt
-                    .columns()
-                    .iter()
-                    .map(|c| Column {
-                        name: c.name().to_owned(),
-                        type_name: c.type_().name().to_owned(),
-                        table: c.table_oid().map(|oid| TableRef { oid }),
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
+            let typed: Vec<Column> = if may_be_script(&sql) {
+                Vec::new()
+            } else {
+                match client.prepare(&sql).await {
+                    Ok(stmt) => stmt
+                        .columns()
+                        .iter()
+                        .map(|c| Column {
+                            name: c.name().to_owned(),
+                            type_name: c.type_().name().to_owned(),
+                            table: c.table_oid().map(|oid| TableRef { oid }),
+                        })
+                        .collect(),
+                    Err(e) => return stream::once(ready(Err(failure(&e)))).boxed(),
+                }
             };
             match client.simple_query_raw(&sql).await {
                 Ok(rows) => rows
@@ -298,6 +302,12 @@ impl Pg {
         };
         stream::once(start).flatten().boxed()
     }
+}
+
+/// Conservative: any `;` besides trailing ones may mean several statements; a false positive only costs column types.
+fn may_be_script(sql: &str) -> bool {
+    sql.trim_end_matches(|c: char| c.is_whitespace() || c == ';')
+        .contains(';')
 }
 
 impl PgCanceller {
