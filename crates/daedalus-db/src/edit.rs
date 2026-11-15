@@ -46,6 +46,13 @@ pub fn select_page(
     if order.contains(';') {
         return Err("Remove the ; from the order.".to_string());
     }
+    let bad = |t: &str| t.chars().any(|c| c.is_control() && c != '\t');
+    if bad(filter) {
+        return Err("Remove the control characters from the filter.".to_string());
+    }
+    if bad(order) {
+        return Err("Remove the control characters from the order.".to_string());
+    }
     let mut sql = format!("SELECT * FROM {}\n", qualified(engine, schema, &table.name));
     if !filter.is_empty() {
         sql.push_str(&format!("WHERE (\n{filter}\n)\n"));
@@ -67,7 +74,7 @@ pub fn select_page(
     }
     sql.push_str(&format!("LIMIT {} OFFSET {offset}", PAGE_ROWS + 1));
     let stmts = classify::split(&sql, engine);
-    if stmts.len() != 1 || stmts[0].kind != Kind::Read {
+    if stmts.len() != 1 || stmts[0].kind != Kind::Read || stmts[0].range.end != sql.len() {
         return Err("The filter and order must be expressions, not statements.".to_string());
     }
     Ok(sql)
@@ -225,6 +232,10 @@ impl Builder {
     }
 
     fn where_pk(&mut self, table: &Table, shape: &Shape, pk: &[Cell]) {
+        assert!(
+            !pk.is_empty() && pk.len() == shape.pk.len(),
+            "primary key value count does not match the key columns"
+        );
         self.text(" WHERE ");
         for (n, (&col, val)) in shape.pk.iter().zip(pk).enumerate() {
             if n > 0 {
@@ -638,5 +649,36 @@ mod tests {
         let p = plan(Engine::Postgres, "s", &t, &sh, &ch);
         assert!(p.preview.contains("\"$1\" = 'v' WHERE \"id\" = '1';"));
         assert_eq!(p.statements[0].params, vec![s("v"), s("1")]);
+    }
+
+    #[test]
+    fn block_comment_cannot_drop_limit() {
+        for e in ALL {
+            assert!(select_page(e, "p", &users(), "", "id /*", 0).is_err());
+            assert!(select_page(e, "p", &users(), "1=1) /*", "", 0).is_err());
+        }
+    }
+
+    #[test]
+    fn control_characters_are_refused() {
+        for bad in ["id > 1 --\rx", "a\nb", "a\0b"] {
+            assert!(select_page(Engine::Postgres, "p", &users(), bad, "", 0).is_err());
+            assert!(select_page(Engine::Postgres, "p", &users(), "", bad, 0).is_err());
+        }
+        assert!(select_page(Engine::Postgres, "p", &users(), "a\t= 1", "", 0).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "primary key value count")]
+    fn short_pk_is_refused() {
+        let t = table(vec![col("a", "int", true), col("b", "int", true)]);
+        let sh = shape(Engine::Postgres, &t).unwrap();
+        plan(
+            Engine::Postgres,
+            "s",
+            &t,
+            &sh,
+            &[Change::Delete { pk: vec![s("1")] }],
+        );
     }
 }
