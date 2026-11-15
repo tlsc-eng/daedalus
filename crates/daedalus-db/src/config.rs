@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -138,7 +138,13 @@ pub fn load(path: &Path) -> Result<Store> {
 /// Writes via temp file and rename so a crash never leaves a half-written file.
 pub fn save(path: &Path, store: &Store) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
-    let mut out = fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("write {}", tmp.display()))?;
     out.write_all(&serde_json::to_vec_pretty(store)?)
         .with_context(|| format!("write {}", tmp.display()))?;
     // Without this, a power loss after the rename can leave an empty file under the real name.
@@ -172,18 +178,23 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
         Origin::Project => {
             let port = conn.port.map(|p| p.to_string()).unwrap_or_default();
             let root = root
-                .map(|r| r.to_string_lossy().into_owned())
+                .map(|r| r.as_os_str().as_encoded_bytes())
                 .unwrap_or_default();
-            let parts = [
-                root.as_str(),
-                conn.id.as_str(),
-                conn.engine.name(),
-                conn.host.as_str(),
-                port.as_str(),
-                conn.database.as_str(),
-                conn.user.as_str(),
+            let parts: [&[u8]; 7] = [
+                root,
+                conn.id.as_bytes(),
+                conn.engine.name().as_bytes(),
+                conn.host.as_bytes(),
+                port.as_bytes(),
+                conn.database.as_bytes(),
+                conn.user.as_bytes(),
             ];
-            let digest = Sha256::digest(parts.join("\0").as_bytes());
+            let mut hasher = Sha256::new();
+            for part in parts {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+            let digest = hasher.finalize();
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
             format!("p-{hex}")
         }
@@ -197,7 +208,7 @@ pub fn new_id() -> std::io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode(s: &str) -> Result<String, &'static str> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -214,7 +225,7 @@ fn percent_decode(s: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).map_err(|_| "credentials are not valid UTF-8")
 }
 
 fn tls_from_param(value: &str) -> Option<Tls> {
@@ -235,7 +246,9 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
         "postgres" | "postgresql" => Engine::Postgres,
         "mysql" | "mariadb" => Engine::Mysql,
         "sqlite" => Engine::Sqlite,
-        s => return Err(format!("unsupported scheme {s}")),
+        s @ ("jdbc" | "http" | "https" | "file" | "redis" | "mongodb" | "mongodb+srv"
+        | "sqlserver" | "oracle") => return Err(format!("unsupported scheme {s}")),
+        _ => return Err("unsupported scheme".to_string()),
     };
     let id = new_id().map_err(|_| "could not create an id".to_string())?;
     let blank = |name: String, host: String, database: String| Connection {
@@ -256,7 +269,10 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
     };
 
     if engine == Engine::Sqlite {
-        let path = percent_decode(url.path());
+        if url.host_str().is_some_and(|h| !h.is_empty()) {
+            return Err("use sqlite:relative/path.db or sqlite:///absolute/path.db".into());
+        }
+        let path = percent_decode(url.path())?.to_string();
         let name = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -269,10 +285,16 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
     if host.is_empty() {
         return Err("missing host".into());
     }
-    let database = percent_decode(url.path().trim_start_matches('/'));
+    let database = percent_decode(url.path().trim_start_matches('/'))?;
+    if database.contains('@')
+        || url.query().is_some_and(|q| q.contains('@'))
+        || url.fragment().is_some_and(|f| f.contains('@'))
+    {
+        return Err("special characters in the password must be percent-encoded".into());
+    }
     let mut conn = blank(format!("{database} on {host}"), host, database);
     conn.port = url.port();
-    conn.user = percent_decode(url.username());
+    conn.user = percent_decode(url.username())?;
     conn.tls = Tls::default_for(&conn.host);
     for (key, value) in url.query_pairs() {
         if matches!(key.as_ref(), "sslmode" | "ssl-mode")
@@ -284,6 +306,7 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
     let secret = url
         .password()
         .map(percent_decode)
+        .transpose()?
         .filter(|p| !p.is_empty())
         .map(Secret::new);
     Ok((conn, secret))
@@ -432,6 +455,21 @@ mod tests {
     }
 
     #[test]
+    fn keychain_account_fields_cannot_collide() {
+        let root = Path::new("/work/a");
+        let mut a = conn("a", "A");
+        a.database = "a\0b".into();
+        a.user = "c".into();
+        let mut b = a.clone();
+        b.database = "a".into();
+        b.user = "b\0c".into();
+        assert_ne!(
+            keychain_account(Origin::Project, Some(root), &a),
+            keychain_account(Origin::Project, Some(root), &b)
+        );
+    }
+
+    #[test]
     fn global_account_is_the_id() {
         assert_eq!(
             keychain_account(Origin::Global, None, &conn("abc", "A")),
@@ -533,5 +571,46 @@ mod tests {
             redacted_url(&from_url("sqlite:a.db").unwrap().0),
             "sqlite:a.db"
         );
+    }
+
+    #[test]
+    fn unencoded_slash_in_password_is_rejected_not_saved() {
+        let err = from_url("postgres://admin:1234/s3cret@h/db").unwrap_err();
+        assert_eq!(
+            err,
+            "special characters in the password must be percent-encoded"
+        );
+        assert!(!err.contains("s3cret"));
+    }
+
+    #[test]
+    fn unknown_scheme_error_does_not_echo_it() {
+        for input in ["bob:s3cret@db.example.com/app", "s3cret:foo"] {
+            let err = from_url(input).unwrap_err();
+            assert!(!err.contains("bob") && !err.contains("s3cret"), "{err}");
+        }
+        assert!(
+            from_url("jdbc:postgresql://h/db")
+                .unwrap_err()
+                .contains("jdbc")
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_password_is_an_error() {
+        assert_eq!(
+            from_url("postgres://u:%E2%82%AC%FF@h/db").unwrap_err(),
+            "credentials are not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn sqlite_url_with_host_is_rejected() {
+        for input in ["sqlite://data/app.db", "sqlite://data.db"] {
+            assert_eq!(
+                from_url(input).unwrap_err(),
+                "use sqlite:relative/path.db or sqlite:///absolute/path.db"
+            );
+        }
     }
 }
