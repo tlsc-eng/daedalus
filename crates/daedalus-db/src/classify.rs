@@ -554,11 +554,90 @@ fn classify_one(
     if root.has_error() {
         return unknown;
     }
-    let kind = kind_of(root);
+    let kind = kind_of(root, text, engine);
     (kind, kind == Kind::Write && has_unguarded(root))
 }
 
-fn kind_of(root: Node) -> Kind {
+// A SELECT calling these changes state or runs arbitrary SQL, so it must not pass as a plain read.
+const PG_SIDE_EFFECT_FNS: &[&str] = &[
+    "set_config",
+    "nextval",
+    "setval",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_switch_wal",
+    "pg_notify",
+    "pg_promote",
+    "pg_import_system_collations",
+    "pg_create_restore_point",
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+];
+
+// Locks and sleeps are not data changes but are not harmless reads for an automated caller.
+const MY_SIDE_EFFECT_FNS: &[&str] = &[
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "sleep",
+    "benchmark",
+];
+
+// These load native code or touch the filesystem.
+const LITE_SIDE_EFFECT_FNS: &[&str] =
+    &["load_extension", "readfile", "writefile", "fts3_tokenizer"];
+
+fn is_side_effect_fn(name: &str, engine: Engine) -> bool {
+    let n = name.to_ascii_lowercase();
+    match engine {
+        Engine::Postgres => {
+            PG_SIDE_EFFECT_FNS.contains(&n.as_str())
+                || n.starts_with("dblink")
+                || n.starts_with("lo_")
+                || n.starts_with("pg_advisory")
+                || n.starts_with("pg_stat_reset")
+                || n.starts_with("pg_log_")
+                || n.starts_with("pg_replication_origin_")
+                || (n.starts_with("pg_") && n.contains("replication_slot"))
+        }
+        Engine::Mysql => MY_SIDE_EFFECT_FNS.contains(&n.as_str()),
+        Engine::Sqlite => LITE_SIDE_EFFECT_FNS.contains(&n.as_str()),
+    }
+}
+
+fn calls_side_effect_fn(root: Node, src: &str, engine: Engine) -> bool {
+    any_node(root, |n| {
+        if n.kind() != "invocation" {
+            return false;
+        }
+        let name = n
+            .named_child(0)
+            .and_then(|r| r.child_by_field_name("name"))
+            .and_then(|id| src.get(id.byte_range()));
+        // An unreadable name cannot be vouched for.
+        name.is_none_or(|nm| {
+            is_side_effect_fn(
+                nm.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')),
+                engine,
+            )
+        })
+    })
+}
+
+fn kind_of(root: Node, src: &str, engine: Engine) -> Kind {
+    match statement_kind(root) {
+        // INTO may sit anywhere in a set operation, and a call can hide in any subtree.
+        Kind::Read if any_node(root, |n| n.kind() == "keyword_into") => Kind::Write,
+        Kind::Read if calls_side_effect_fn(root, src, engine) => Kind::Unknown,
+        k => k,
+    }
+}
+
+fn statement_kind(root: Node) -> Kind {
     let mut cur = root.walk();
     if root
         .named_children(&mut cur)
@@ -863,6 +942,72 @@ mod tests {
     #[test]
     fn select_into_is_write() {
         assert_eq!(kind("select a into new_table from t"), Kind::Write);
+    }
+
+    #[test]
+    fn into_inside_set_operations_is_write() {
+        for sql in [
+            "select 1 as a into t2 union select 2",
+            "select 1 into t2 union all select 2",
+            "(select 1 into t2) union select 2",
+            "select 1 into t2 intersect select 1",
+        ] {
+            assert_eq!(kind_with(sql, PG), Kind::Write, "{sql}");
+        }
+        for sql in [
+            "select 1 union select 2 into @a",
+            "select 1 into @a union select 2",
+        ] {
+            assert_eq!(kind_with(sql, MY), Kind::Write, "{sql}");
+        }
+    }
+
+    #[test]
+    fn side_effect_functions_are_not_read() {
+        let pg = [
+            "select pg_catalog.set_config('a','b',false)",
+            "select NEXTVAL('s')",
+            "select 1 from t where x = setval('s', 1)",
+            "with c as (select pg_terminate_backend(1)) select * from c",
+            "select * from t where id in (select pg_advisory_lock(1))",
+            "select lo_import('/etc/passwd')",
+            "select dblink_exec('x','y')",
+            "select pg_drop_replication_slot('s')",
+            "select pg_stat_reset()",
+            "select pg_log_backend_memory_contexts(1)",
+            "select query_to_xml('delete from t', true, true, '')",
+            "select coalesce(1, \"pg_notify\"('a','b'))",
+        ];
+        for sql in pg {
+            assert_eq!(kind_with(sql, PG), Kind::Unknown, "{sql}");
+        }
+        for sql in [
+            "select get_lock('a',1)",
+            "select 1 where sleep(1)",
+            "select BENCHMARK(1,1)",
+        ] {
+            assert_eq!(kind_with(sql, MY), Kind::Unknown, "{sql}");
+        }
+        for sql in ["select load_extension('x')", "select writefile('a','b')"] {
+            assert_eq!(kind_with(sql, LITE), Kind::Unknown, "{sql}");
+        }
+    }
+
+    #[test]
+    fn plain_functions_and_lookalike_columns_stay_read() {
+        for sql in [
+            "select count(*) from t",
+            "select lower(name) from t",
+            "select now()",
+            "select nextval_count from t",
+        ] {
+            assert_eq!(kind_with(sql, PG), Kind::Read, "{sql}");
+        }
+    }
+
+    #[test]
+    fn dollar_in_identifier_does_not_open_a_dollar_quote() {
+        assert_eq!(kinds("select x$e'\\' ; delete from t; -- '", PG).len(), 2);
     }
 
     #[test]
