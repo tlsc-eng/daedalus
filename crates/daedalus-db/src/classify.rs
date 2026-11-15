@@ -114,6 +114,16 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 }
                 Engine::Sqlite => false,
             };
+            // U&"..\XXXX" decodes to a name the lexer never sees, and its quotes can hide.
+            if engine == Engine::Postgres
+                && (c == b'"' || c == b'\'')
+                && i >= 2
+                && b[i - 1] == b'&'
+                && b[i - 2] | 0x20 == b'u'
+                && (i == 2 || !(is_word_byte(b[i - 3]) || b[i - 3] == b'$'))
+            {
+                out.push((Tok::Hazard, start..start + 1));
+            }
             i += 1;
             while i < b.len() {
                 if escapes && b[i] == b'\\' {
@@ -576,6 +586,13 @@ const PG_SIDE_EFFECT_FNS: &[&str] = &[
     "query_to_xmlschema",
     "query_to_xml_and_xmlschema",
     "cursor_to_xml",
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
 ];
 
 // Locks and sleeps are not data changes but are not harmless reads for an automated caller.
@@ -592,6 +609,13 @@ const LITE_SIDE_EFFECT_FNS: &[&str] =
     &["load_extension", "readfile", "writefile", "fts3_tokenizer"];
 
 fn is_side_effect_fn(name: &str, engine: Engine) -> bool {
+    // Anything beyond plain identifier bytes may be an escape the name check cannot decode.
+    if name
+        .bytes()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$'))
+    {
+        return true;
+    }
     let n = name.to_ascii_lowercase();
     match engine {
         Engine::Postgres => {
@@ -599,6 +623,12 @@ fn is_side_effect_fn(name: &str, engine: Engine) -> bool {
                 || n.starts_with("dblink")
                 || n.starts_with("lo_")
                 || n.starts_with("pg_advisory")
+                || n.starts_with("pg_try_advisory")
+                || n.starts_with("pg_logical_emit")
+                || n.starts_with("pg_file_")
+                || n.starts_with("pg_wal_replay_")
+                || n.starts_with("pg_backup_")
+                || n.starts_with("pg_ls_")
                 || n.starts_with("pg_stat_reset")
                 || n.starts_with("pg_log_")
                 || n.starts_with("pg_replication_origin_")
@@ -977,6 +1007,24 @@ mod tests {
             "select pg_log_backend_memory_contexts(1)",
             "select query_to_xml('delete from t', true, true, '')",
             "select coalesce(1, \"pg_notify\"('a','b'))",
+            "select U&\"set\\005fconfig\"('a','b',false)",
+            "select pg_catalog.U&\"set\\005fconfig\"(1)",
+            "select u&'x' from t",
+            "select pg_try_advisory_lock(1)",
+            "select pg_try_advisory_lock_shared(1)",
+            "select pg_try_advisory_xact_lock(1)",
+            "select pg_logical_emit_message(true,'a','b')",
+            "select pg_file_write('a','b',false)",
+            "select pg_wal_replay_pause()",
+            "select pg_backup_start('l')",
+            "select pg_sleep(1)",
+            "select pg_sleep_for('1s')",
+            "select pg_sleep_until(now())",
+            "select pg_read_file('x')",
+            "select pg_read_binary_file('x')",
+            "select pg_ls_dir('x')",
+            "select pg_stat_file('x')",
+            "select pg_ls_logdir()",
         ];
         for sql in pg {
             assert_eq!(kind_with(sql, PG), Kind::Unknown, "{sql}");
@@ -1000,6 +1048,7 @@ mod tests {
             "select lower(name) from t",
             "select now()",
             "select nextval_count from t",
+            "select nextval_count(1)",
         ] {
             assert_eq!(kind_with(sql, PG), Kind::Read, "{sql}");
         }
