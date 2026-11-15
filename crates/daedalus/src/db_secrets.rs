@@ -1,7 +1,7 @@
 // Used from DB-7.
 #![allow(dead_code)]
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use daedalus_db::Secret;
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
@@ -34,10 +34,16 @@ pub fn save(account: &str, pw: &Secret) -> Result<()> {
     set_generic_password(SERVICE, account, pw.expose().as_bytes()).map_err(|e| map(e).into())
 }
 
+fn secret_from_bytes(bytes: Vec<u8>) -> Result<Secret> {
+    String::from_utf8(bytes)
+        .map(Secret::new)
+        .map_err(|_| anyhow!("keychain item is not valid UTF-8"))
+}
+
 /// Blocks on a Keychain prompt, so call it from the background executor.
 pub fn load(account: &str) -> Result<Option<Secret>> {
     match get_generic_password(SERVICE, account) {
-        Ok(bytes) => Ok(Some(Secret::new(String::from_utf8(bytes)?))),
+        Ok(bytes) => secret_from_bytes(bytes).map(Some),
         Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
         Err(e) => Err(map(e).into()),
     }
@@ -54,6 +60,13 @@ pub fn delete(account: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_utf8_error_does_not_hold_the_bytes() {
+        let err = secret_from_bytes(b"hunter2\xff".to_vec()).unwrap_err();
+        let dump = format!("{err:#?} {err:#}");
+        assert!(!dump.contains("hunter2") && !dump.contains("104, 117"));
+    }
 
     struct Cleanup(String);
 
