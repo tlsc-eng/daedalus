@@ -138,7 +138,7 @@ fn reads_rows_in_pages() {
     let rig = rig(false);
     rig.run(
         1,
-        "select row_number() over () as g, null as n, '' as e \
+        "select 1 as g, null as n, '' as e \
          from information_schema.columns a, information_schema.columns b limit 1200",
         500,
         None,
@@ -191,6 +191,22 @@ fn binary_is_hex() {
     assert_eq!(scalar(&rig, 1), Some("\\xff00".into()));
     rig.run(2, "select 'héllo'", 100, None);
     assert_eq!(scalar(&rig, 2), Some("héllo".into()));
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn bit_is_hex() {
+    let rig = rig(false);
+    // A bit literal is typed as a string by the server; only a real BIT column carries the type.
+    rig.run(
+        1,
+        "create temporary table bt (b bit(7), c bit(1)); insert into bt values (b'1000001', b'1'); select b from bt",
+        100,
+        None,
+    );
+    assert_eq!(scalar(&rig, 1), Some("\\x41".into()));
+    rig.run(2, "select c from bt", 100, None);
+    assert_eq!(scalar(&rig, 2), Some("\\x01".into()));
 }
 
 #[test]
@@ -253,7 +269,34 @@ fn cancel_queued_run_never_runs() {
     assert!(started.elapsed() < Duration::from_millis(1900));
 }
 
-const SERIES: &str = "select row_number() over () as g \
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn cancel_before_start_does_not_execute() {
+    let rig = rig(false);
+    rig.run(1, "create temporary table cbs (x int)", 100, None);
+    scalar(&rig, 1);
+    for i in 0..5u64 {
+        let ins = i * 2 + 2;
+        rig.run(ins, "insert into cbs select sleep(1)", 100, None);
+        cancel(&rig, ins);
+        loop {
+            match rig.next() {
+                Update::Done { run, .. } if run == RunId(ins) => break,
+                Update::RunError { run, message, .. } if run == RunId(ins) => {
+                    assert!(message.contains("cancel"), "{message}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let started = Instant::now();
+        rig.run(ins + 1, "select count(*) from cbs", 100, None);
+        assert_eq!(scalar(&rig, ins + 1), Some("0".into()));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+}
+
+const SERIES: &str = "select 1 as g \
     from information_schema.columns a, information_schema.columns b limit 1200";
 
 #[test]
@@ -279,13 +322,8 @@ fn cancel_does_not_hit_next_run() {
             }
         }
         rig.run(first + 1, "select sleep(0.3)", 100, None);
-        loop {
-            match rig.next() {
-                Update::Done { run, .. } if run == RunId(first + 1) => break,
-                Update::RunError { message, .. } => panic!("next run hit: {message}"),
-                _ => {}
-            }
-        }
+        // A stray KILL makes sleep return 1 without an error.
+        assert_eq!(scalar(&rig, first + 1), Some("0".into()));
     }
 }
 

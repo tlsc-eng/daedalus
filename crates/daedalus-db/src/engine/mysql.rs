@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use futures::{StreamExt, stream};
+use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, DriverError, Opts, OptsBuilder, SslOpts, Value};
 use tokio::sync::{Mutex, mpsc};
@@ -62,6 +63,15 @@ fn build_opts(conn: &Connection, password: Option<&Secret>, tls: Option<SslOpts>
         .into()
 }
 
+fn check_ca_file(conn: &Connection) -> Result<(), String> {
+    match (conn.tls, conn.ca_file.as_deref()) {
+        (Tls::Require, Some(path)) => std::fs::File::open(path)
+            .map(drop)
+            .map_err(|e| format!("cannot read CA file: {e}")),
+        _ => Ok(()),
+    }
+}
+
 fn describe(e: &mysql_async::Error) -> String {
     e.to_string()
 }
@@ -89,9 +99,11 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn to_cell(value: &Value) -> Cell {
+/// BIT values arrive as raw big-endian bytes, which can happen to be valid UTF-8 and would print as text.
+fn to_cell(value: &Value, is_bit: bool) -> Cell {
     match value {
         Value::NULL => None,
+        Value::Bytes(b) if is_bit => Some(hex(b)),
         Value::Bytes(b) => Some(match std::str::from_utf8(b) {
             Ok(s) => s.to_owned(),
             Err(_) => hex(b),
@@ -156,6 +168,7 @@ impl Mysql {
         conn: &Connection,
         password: Option<&Secret>,
     ) -> Result<(Mysql, String), String> {
+        check_ca_file(conn)?;
         let (mut live, opts) = open_with_fallback(conn, password)
             .await
             .map_err(|e| describe(&e))?;
@@ -189,16 +202,35 @@ impl Mysql {
     }
 
     pub fn query(&self, sql: String) -> ItemStream {
-        let (tx, rx) = mpsc::channel(1);
-        let conn = self.conn.clone();
-        tokio::spawn(async move {
-            let mut guard = conn.lock_owned().await;
-            if let Err(e) = run(&mut guard, &sql, &tx).await {
-                let _ = tx.send(Err(failure(&e))).await;
-            }
-        });
-        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) }).boxed()
+        let state = Lazy::NotStarted(self.conn.clone(), sql);
+        stream::unfold(state, |state| async move {
+            let mut rx = match state {
+                Lazy::NotStarted(conn, sql) => {
+                    let (tx, rx) = mpsc::channel(1);
+                    tokio::spawn(async move {
+                        let mut guard = conn.lock_owned().await;
+                        // The stream may have been dropped while this task waited for the lock.
+                        if tx.is_closed() {
+                            return;
+                        }
+                        if let Err(e) = run(&mut guard, &sql, &tx).await {
+                            let _ = tx.send(Err(failure(&e))).await;
+                        }
+                    });
+                    rx
+                }
+                Lazy::Running(rx) => rx,
+            };
+            rx.recv().await.map(|i| (i, Lazy::Running(rx)))
+        })
+        .boxed()
     }
+}
+
+/// The task starts on first poll so a stream dropped unpolled (a cancel before start) never runs its SQL.
+enum Lazy {
+    NotStarted(Arc<Mutex<Conn>>, String),
+    Running(mpsc::Receiver<Result<Item, Failure>>),
 }
 
 /// Returns early once the receiver is gone, after draining the rest so the connection stays usable.
@@ -211,8 +243,13 @@ async fn run(
     while let Some(columns) = result.columns() {
         let affected = result.affected_rows();
         let has_rows = !columns.is_empty();
+        let mut bits: Vec<bool> = Vec::new();
         if has_rows {
             let cols = columns.iter().map(column).collect();
+            bits = columns
+                .iter()
+                .map(|c| c.column_type() == ColumnType::MYSQL_TYPE_BIT)
+                .collect();
             if tx.send(Ok(Item::Columns(cols))).await.is_err() {
                 return result.drop_result().await;
             }
@@ -220,7 +257,7 @@ async fn run(
         let mut count = 0u64;
         while let Some(row) = result.next().await? {
             let cells = (0..row.len())
-                .map(|i| row.as_ref(i).and_then(to_cell))
+                .map(|i| row.as_ref(i).and_then(|v| to_cell(v, bits[i])))
                 .collect();
             count += 1;
             if tx.send(Ok(Item::Row(cells))).await.is_err() {
@@ -252,31 +289,52 @@ mod tests {
 
     #[test]
     fn cells_keep_null_distinct_from_empty() {
-        assert_eq!(to_cell(&Value::NULL), None);
-        assert_eq!(to_cell(&Value::Bytes(Vec::new())), Some(String::new()));
+        assert_eq!(to_cell(&Value::NULL, false), None);
+        assert_eq!(
+            to_cell(&Value::Bytes(Vec::new()), false),
+            Some(String::new())
+        );
     }
 
     #[test]
     fn invalid_utf8_becomes_hex() {
         assert_eq!(
-            to_cell(&Value::Bytes(vec![0xff, 0x00])),
+            to_cell(&Value::Bytes(vec![0xff, 0x00]), false),
             Some("\\xff00".into())
         );
-        assert_eq!(to_cell(&Value::Bytes("é".into())), Some("é".into()));
+        assert_eq!(to_cell(&Value::Bytes("é".into()), false), Some("é".into()));
+    }
+
+    #[test]
+    fn bit_columns_are_always_hex() {
+        assert_eq!(
+            to_cell(&Value::Bytes(vec![0x41]), true),
+            Some("\\x41".into())
+        );
+        assert_eq!(to_cell(&Value::Bytes(vec![0x41]), false), Some("A".into()));
+    }
+
+    #[test]
+    fn missing_ca_file_is_an_error() {
+        let (mut conn, _) = crate::from_url("mysql://u@localhost/db").expect("url");
+        conn.tls = Tls::Require;
+        conn.ca_file = Some("/nonexistent/daedalus-ca.pem".into());
+        let err = check_ca_file(&conn).expect_err("missing file");
+        assert!(err.starts_with("cannot read CA file: "), "{err}");
     }
 
     #[test]
     fn dates_and_times_print_plainly() {
         assert_eq!(
-            to_cell(&Value::Date(2024, 1, 2, 3, 4, 5, 0)),
+            to_cell(&Value::Date(2024, 1, 2, 3, 4, 5, 0), false),
             Some("2024-01-02 03:04:05".into())
         );
         assert_eq!(
-            to_cell(&Value::Date(2024, 1, 2, 0, 0, 0, 0)),
+            to_cell(&Value::Date(2024, 1, 2, 0, 0, 0, 0), false),
             Some("2024-01-02".into())
         );
         assert_eq!(
-            to_cell(&Value::Time(true, 1, 2, 3, 4, 500)),
+            to_cell(&Value::Time(true, 1, 2, 3, 4, 500), false),
             Some("-26:03:04.000500".into())
         );
     }
