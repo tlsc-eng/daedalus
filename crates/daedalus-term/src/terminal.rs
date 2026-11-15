@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,8 @@ pub struct Terminal {
     dropped: usize,
     /// A [`marks::PROBE`] is still in the main screen's scrollback.
     probe_out: bool,
+    /// The shell drew a prompt (OSC 133 `A`) and has not started a command (`C`) since.
+    at_prompt: bool,
 }
 
 /// Why the last command's output cannot be copied.
@@ -153,6 +155,7 @@ impl Terminal {
             prompt: None,
             dropped: 0,
             probe_out: false,
+            at_prompt: false,
         }
     }
 
@@ -222,9 +225,11 @@ impl Terminal {
                     self.commands.forget(id);
                 }
                 self.prompt_start = Some(self.cursor_abs());
+                self.at_prompt = true;
             }
             Mark::Command => self.tag_prompt(true),
             Mark::Output => {
+                self.at_prompt = false;
                 self.tag_prompt(true);
                 let cursor = self.term.grid().cursor.point.line;
                 if let Some((id, line)) = self.find_prompt(true)
@@ -520,6 +525,147 @@ impl Terminal {
         };
         let line = Line(r as i32 - self.term.grid().display_offset() as i32);
         (Point::new(line, Column(c)), side)
+    }
+
+    /// Whether the shell is reading a command line, as its OSC 133 marks tell.
+    pub fn at_prompt(&self) -> bool {
+        self.at_prompt && self.exit.is_none()
+    }
+
+    /// The rows of the soft-wrapped line the cursor is on, or `None` where clicks must not become keys.
+    fn input_line(&self) -> Option<RangeInclusive<Line>> {
+        let mode = self.mode();
+        if self.exit.is_some()
+            || mode.contains(TermMode::ALT_SCREEN)
+            || mode.intersects(TermMode::MOUSE_MODE)
+        {
+            return None;
+        }
+        let grid = self.term.grid();
+        let last = Column(grid.columns() - 1);
+        let wraps = |line: Line| grid[line][last].flags.contains(Flags::WRAPLINE);
+        let mut first = grid.cursor.point.line;
+        while first > grid.topmost_line() && wraps(first - 1) {
+            first -= 1;
+        }
+        let mut end = grid.cursor.point.line;
+        while end < grid.bottommost_line() && wraps(end) {
+            end += 1;
+        }
+        Some(first..=end)
+    }
+
+    fn is_spacer(flags: Flags) -> bool {
+        flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    }
+
+    /// A wide character is one stop: its own cell is the left half and its spacer the right.
+    fn wide_aware(flags: Flags, point: Point, side: Side) -> (Point, Side) {
+        if flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
+            (Point::new(point.line, point.column - 1), Side::Right)
+        } else if flags.contains(Flags::WIDE_CHAR) {
+            (point, Side::Left)
+        } else {
+            (point, side)
+        }
+    }
+
+    /// Characters between the start of row `first` and `to`, counting a wide one once.
+    fn chars_before(&self, first: Line, to: Point) -> usize {
+        let grid = self.term.grid();
+        let mut count = 0;
+        let mut line = first;
+        while line <= to.line {
+            let cols = if line == to.line {
+                to.column.0
+            } else {
+                grid.columns()
+            };
+            count += (0..cols)
+                .filter(|&c| !Self::is_spacer(grid[line][Column(c)].flags))
+                .count();
+            line += 1;
+        }
+        count
+    }
+
+    fn caret(&self, first: Line) -> usize {
+        let cursor = &self.term.grid().cursor;
+        self.chars_before(first, cursor.point) + cursor.input_needs_wrap as usize
+    }
+
+    /// Where the typed text ends: text after a double blank is a right-hand prompt.
+    fn input_end(&self, lines: &RangeInclusive<Line>, caret: usize) -> usize {
+        let grid = self.term.grid();
+        let mut cells = Vec::new();
+        let mut line = *lines.start();
+        while line <= *lines.end() {
+            for c in 0..grid.columns() {
+                let cell = &grid[line][Column(c)];
+                if !Self::is_spacer(cell.flags) {
+                    cells.push(cell.c);
+                }
+            }
+            line += 1;
+        }
+        let end = (caret..cells.len())
+            .find(|&i| cells[i] == ' ' && cells.get(i + 1).is_none_or(|&next| next == ' '))
+            .unwrap_or(cells.len());
+        end.max(caret)
+    }
+
+    fn arrows(&self, from: usize, to: usize) -> Vec<u8> {
+        let app = self.mode().contains(TermMode::APP_CURSOR);
+        let key: &[u8] = match (to < from, app) {
+            (true, true) => b"\x1bOD",
+            (true, false) => b"\x1b[D",
+            (false, true) => b"\x1bOC",
+            (false, false) => b"\x1b[C",
+        };
+        key.repeat(from.abs_diff(to))
+    }
+
+    /// Arrow keys that move the shell's cursor to `point` on its soft-wrapped line, or `None` when `point` is off that line or no move is needed.
+    pub fn move_keys(&self, point: Point, side: Side) -> Option<Vec<u8>> {
+        let lines = self.input_line()?;
+        if !lines.contains(&point.line) {
+            return None;
+        }
+        let first = *lines.start();
+        let grid = self.term.grid();
+        let (point, side) = Self::wide_aware(grid[point].flags, point, side);
+        let right_of_cell = side == Side::Right;
+        let caret = self.caret(first);
+        let target = (self.chars_before(first, point) + right_of_cell as usize)
+            .min(self.input_end(&lines, caret));
+        (target != caret).then(|| self.arrows(caret, target))
+    }
+
+    /// Keys that delete the selected part of the shell's input line: arrows to the selection's end, then one backspace per character.
+    pub fn delete_selection_keys(&self) -> Option<Vec<u8>> {
+        let lines = self.input_line()?;
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        if range.is_block || !lines.contains(&range.start.line) || !lines.contains(&range.end.line)
+        {
+            return None;
+        }
+        let first = *lines.start();
+        let caret = self.caret(first);
+        let grid = self.term.grid();
+        let start_cell = grid[range.start].flags;
+        let start = self.chars_before(
+            first,
+            Self::wide_aware(start_cell, range.start, Side::Left).0,
+        );
+        let last_is_spacer = Self::is_spacer(self.term.grid()[range.end].flags);
+        let end = (self.chars_before(first, range.end) + !last_is_spacer as usize)
+            .min(self.input_end(&lines, caret));
+        if start >= end {
+            return None;
+        }
+        let mut keys = self.arrows(caret, end);
+        keys.extend(std::iter::repeat_n(0x7f, end - start));
+        Some(keys)
     }
 
     pub fn start_selection(&mut self, clicks: usize, point: Point, side: Side) {
@@ -956,6 +1102,248 @@ mod tests {
             !sent.0.borrow().is_empty(),
             "live device-attribute query gets a reply"
         );
+    }
+
+    const LEFT: &str = "\x1b[D";
+    const RIGHT: &str = "\x1b[C";
+
+    fn prompt_with(t: &mut Terminal, text: &str) {
+        feed(t, b"\x1b]133;A\x07");
+        feed(t, text.as_bytes());
+    }
+
+    fn click(t: &Terminal, col: f32, row: f32) -> Option<String> {
+        let (point, side) = t.point_at(col, row);
+        t.move_keys(point, side)
+            .map(|k| String::from_utf8(k).unwrap())
+    }
+
+    fn select(t: &mut Terminal, from: f32, to: f32) {
+        let (start, side) = t.point_at(from, 0.);
+        t.start_selection(1, start, side);
+        let (end, side) = t.point_at(to, 0.);
+        t.update_selection(end, side);
+    }
+
+    fn deletion(t: &Terminal) -> Option<String> {
+        t.delete_selection_keys()
+            .map(|k| String::from_utf8(k).unwrap())
+    }
+
+    #[test]
+    fn at_prompt_follows_the_shell_marks() {
+        let (mut t, _) = terminal();
+        assert!(!t.at_prompt());
+        feed(&mut t, b"\x1b]133;A\x07");
+        assert!(t.at_prompt());
+        feed(&mut t, b"\x1b]133;C\x07");
+        assert!(!t.at_prompt());
+        feed(&mut t, b"\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert!(t.at_prompt());
+
+        let (mut alt, _) = terminal();
+        feed(&mut alt, b"\x1b[?1049h\x1b]133;A\x07");
+        assert!(!alt.at_prompt());
+    }
+
+    #[test]
+    fn a_click_on_the_input_line_sends_left_arrows_to_it() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        assert_eq!(click(&t, 7.2, 0.), Some(LEFT.repeat(11)));
+    }
+
+    #[test]
+    fn a_click_on_a_cells_right_half_lands_after_it() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        assert_eq!(click(&t, 7.7, 0.), Some(LEFT.repeat(10)));
+    }
+
+    #[test]
+    fn a_click_right_of_the_cursor_sends_right_arrows_and_stops_at_the_text_end() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        feed(&mut t, b"\x1b[11D");
+        assert_eq!(click(&t, 13.2, 0.), Some(RIGHT.repeat(6)));
+        assert_eq!(click(&t, 35.2, 0.), Some(RIGHT.repeat(11)));
+    }
+
+    #[test]
+    fn a_click_off_the_cursor_line_moves_nothing() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"output\r\n");
+        prompt_with(&mut t, "% ls");
+        assert_eq!(click(&t, 1.2, 2.), None);
+        assert_eq!(click(&t, 1.2, 0.), None);
+    }
+
+    #[test]
+    fn a_click_follows_soft_wrapped_rows() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, &format!("% {}", "x".repeat(50)));
+        assert_eq!(click(&t, 10.2, 0.), Some(LEFT.repeat(42)));
+    }
+
+    #[test]
+    fn wide_characters_take_one_arrow() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% a日b");
+        assert_eq!(click(&t, 3.2, 0.), Some(LEFT.repeat(2)));
+        assert_eq!(click(&t, 3.7, 0.), Some(LEFT.repeat(2)));
+        assert_eq!(click(&t, 4.2, 0.), Some(LEFT.to_string()));
+    }
+
+    #[test]
+    fn a_click_on_the_right_half_of_a_space_lands_after_it() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        assert_eq!(click(&t, 1.7, 0.), Some(LEFT.repeat(16)));
+    }
+
+    #[test]
+    fn a_selection_starting_on_a_wide_spacer_includes_the_wide_character() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% a日b");
+        select(&mut t, 4.2, 5.9);
+        assert_eq!(deletion(&t), Some("\x7f".repeat(2)));
+    }
+
+    #[test]
+    fn a_selection_from_the_output_row_above_deletes_nothing() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"output\r\n");
+        prompt_with(&mut t, "% ls");
+        let (start, side) = t.point_at(2., 0.);
+        t.start_selection(1, start, side);
+        let (end, side) = t.point_at(3.9, 1.);
+        t.update_selection(end, side);
+        assert_eq!(deletion(&t), None);
+    }
+
+    #[test]
+    fn a_selection_across_soft_wrapped_rows_counts_both() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, &format!("% {}", "x".repeat(50)));
+        let (start, side) = t.point_at(38., 0.);
+        t.start_selection(1, start, side);
+        let (end, side) = t.point_at(3.9, 1.);
+        t.update_selection(end, side);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", LEFT.repeat(8), "\x7f".repeat(6)))
+        );
+    }
+
+    #[test]
+    fn a_full_row_puts_the_caret_one_further_right() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, &format!("% {}", "x".repeat(38)));
+        assert_eq!(click(&t, 10.2, 0.), Some(LEFT.repeat(30)));
+    }
+
+    #[test]
+    fn a_caret_inside_the_selection_moves_right_to_its_end() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        feed(&mut t, b"\x1b[9D");
+        select(&mut t, 7., 11.9);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", RIGHT.repeat(3), "\x7f".repeat(5)))
+        );
+    }
+
+    #[test]
+    fn arrows_follow_application_cursor_mode() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"\x1b[?1h");
+        prompt_with(&mut t, "% echo hello world");
+        assert_eq!(click(&t, 7.2, 0.), Some("\x1bOD".repeat(11)));
+    }
+
+    #[test]
+    fn no_keys_on_the_alt_screen_or_with_mouse_reporting() {
+        for mode in ["\x1b[?1049h", "\x1b[?1000h"] {
+            let (mut t, _) = terminal();
+            prompt_with(&mut t, "% echo hello world");
+            select(&mut t, 7., 11.9);
+            feed(&mut t, mode.as_bytes());
+            assert_eq!(click(&t, 7.2, 0.), None);
+            assert_eq!(deletion(&t), None);
+        }
+    }
+
+    #[test]
+    fn text_past_a_double_blank_is_not_input() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% ls");
+        feed(&mut t, b"\x1b[35Gmain\x1b[5G");
+        assert_eq!(click(&t, 36.2, 0.), None);
+        select(&mut t, 34., 37.9);
+        assert_eq!(deletion(&t), None);
+    }
+
+    #[test]
+    fn backspace_over_a_selection_moves_to_its_end_and_deletes_it() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        select(&mut t, 7., 11.9);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", LEFT.repeat(6), "\x7f".repeat(5)))
+        );
+    }
+
+    #[test]
+    fn a_selection_right_of_the_cursor_moves_right_first() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        feed(&mut t, b"\x1b[16D");
+        select(&mut t, 13., 17.9);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", RIGHT.repeat(16), "\x7f".repeat(5)))
+        );
+    }
+
+    #[test]
+    fn a_selection_into_the_prompt_counts_every_cell() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        select(&mut t, 0., 5.9);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", LEFT.repeat(12), "\x7f".repeat(6)))
+        );
+    }
+
+    #[test]
+    fn a_selection_past_the_text_is_clipped_and_one_in_blank_space_deletes_nothing() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        select(&mut t, 13., 30.);
+        assert_eq!(deletion(&t), Some("\x7f".repeat(5)));
+        select(&mut t, 22., 30.);
+        assert_eq!(deletion(&t), None);
+    }
+
+    #[test]
+    fn a_block_or_off_line_selection_deletes_nothing() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"output\r\n");
+        prompt_with(&mut t, "% ls");
+        select(&mut t, 0., 3.);
+        assert_eq!(deletion(&t), None);
+
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        let (start, side) = t.point_at(7., 0.);
+        t.start_selection(1, start, side);
+        t.term.selection.as_mut().unwrap().ty = SelectionType::Block;
+        let (end, side) = t.point_at(11.9, 0.);
+        t.update_selection(end, side);
+        assert_eq!(deletion(&t), None);
     }
 
     #[test]

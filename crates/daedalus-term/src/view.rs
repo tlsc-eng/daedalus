@@ -454,6 +454,7 @@ impl TerminalView {
     /// Pastes `text` as the terminal's own Paste does, bracketed when the program asked for it.
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal.as_mut() {
+            terminal.clear_selection();
             terminal.paste(text);
             cx.notify();
         }
@@ -1016,6 +1017,15 @@ impl TerminalView {
         let Some(bytes) = keys::to_esc(&event.keystroke, terminal.mode()) else {
             return;
         };
+        let key = &event.keystroke;
+        let mods = &key.modifiers;
+        let bytes = if matches!(key.key.as_str(), "backspace" | "delete")
+            && !(mods.shift || mods.alt || mods.control || mods.platform)
+        {
+            self.selection_deletion().unwrap_or(bytes)
+        } else {
+            bytes
+        };
         // Before the key is written, so the program redraws at desk width.
         self.end_lease(cx);
         if let Some(terminal) = self.terminal.as_mut() {
@@ -1023,6 +1033,20 @@ impl TerminalView {
             terminal.input(bytes);
             cx.stop_propagation();
             cx.notify();
+        }
+    }
+
+    /// A stale prompt mark outlives a program started from a widget, so the foreground process vouches too.
+    fn shell_in_front(&self) -> bool {
+        self.foreground.as_ref().is_none_or(|p| is_shell(&p.name))
+    }
+
+    fn selection_deletion(&self) -> Option<Vec<u8>> {
+        let terminal = self.terminal.as_ref()?;
+        if terminal.at_prompt() && self.shell_in_front() {
+            terminal.delete_selection_keys()
+        } else {
+            None
         }
     }
 
@@ -1245,9 +1269,24 @@ impl TerminalView {
             return;
         }
         let copy = cx.global::<TerminalSettings>().copy_on_select;
+        let shell_in_front = self.shell_in_front();
         if let Some(terminal) = self.terminal.as_mut() {
             if !terminal.has_selection() {
                 terminal.clear_selection();
+                let mods = &event.modifiers;
+                let plain =
+                    event.click_count == 1 && !(mods.shift || mods.platform || mods.control);
+                if plain && (terminal.at_prompt() && shell_in_front || mods.alt) {
+                    let (col, row) = self.cell_position(event.position);
+                    let terminal = self.terminal.as_ref().expect("checked above");
+                    let (point, side) = terminal.point_at(col, row);
+                    if let Some(keys) = terminal.move_keys(point, side) {
+                        self.end_lease(cx);
+                        if let Some(terminal) = self.terminal.as_mut() {
+                            terminal.input(keys);
+                        }
+                    }
+                }
                 cx.notify();
             } else if copy
                 && let Some(text) = terminal.selection_text()
@@ -1319,6 +1358,7 @@ impl TerminalView {
             self.end_lease(cx);
         }
         if let (Some(text), Some(terminal)) = (text, self.terminal.as_mut()) {
+            terminal.clear_selection();
             terminal.paste(&text);
             cx.notify();
         }
@@ -2053,13 +2093,17 @@ impl gpui::EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.marked.clear();
+        let deletion = self.selection_deletion();
         if desk_text_ends_lease(self.terminal.is_some(), text) {
             self.end_lease(cx);
         }
         if let Some(terminal) = self.terminal.as_mut()
             && !text.is_empty()
         {
-            terminal.input(text.as_bytes().to_vec());
+            let mut bytes = deletion.unwrap_or_default();
+            bytes.extend_from_slice(text.as_bytes());
+            terminal.input(bytes);
+            terminal.clear_selection();
         }
         cx.notify();
     }
