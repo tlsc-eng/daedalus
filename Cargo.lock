@@ -1488,6 +1488,8 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tree-sitter",
+ "tree-sitter-sequel",
  "url",
 ]
 
