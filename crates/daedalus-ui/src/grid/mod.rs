@@ -20,8 +20,8 @@ use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
 use model::{
     CellPos, GridModel, Kind, MAX_COL_W, bar_offset, cell_at, column_lefts, column_width,
-    display_text, drag_width, gutter_chars, page_rows, reveal_x, scroll_strategy, style_for, thumb,
-    visible_columns, visible_rows,
+    display_text, drag_width, gutter_chars, page_rows, reveal_x, scroll_strategy, scrollable,
+    style_for, thumb, visible_columns, visible_rows,
 };
 pub use model::{GridColumn, GridMarks, RowMark};
 use value::Inspected;
@@ -995,11 +995,12 @@ impl DataGrid {
         let handle = self.scroll.0.borrow().base_handle.clone();
         let (color, bar_w, inset) = (t.color.border_strong, t.ui(4.), t.ui(2.));
         let min_len = f32::from(t.ui(24.));
+        let painted = handle.clone();
         let grid = cx.entity().downgrade();
         let gutter_w = m.gutter_w;
         let (can_v, can_h) = (
-            f32::from(handle.max_offset().height) > 0.5,
-            f32::from(handle.max_offset().width) > 0.5,
+            scrollable(f32::from(handle.max_offset().height)),
+            scrollable(f32::from(handle.max_offset().width)),
         );
         let list = uniform_list(
             "data-grid-rows",
@@ -1058,7 +1059,12 @@ impl DataGrid {
                 [v, h]
             },
             move |_, thumbs, window, cx| {
-                if (thumbs[0].is_some(), thumbs[1].is_some()) != (can_v, can_h) {
+                let max = painted.max_offset();
+                let now = (
+                    scrollable(f32::from(max.height)),
+                    scrollable(f32::from(max.width)),
+                );
+                if now != (can_v, can_h) {
                     grid.update(cx, |_, cx| cx.notify()).ok();
                 }
                 for b in thumbs.into_iter().flatten() {
@@ -1154,7 +1160,14 @@ impl DataGrid {
                             .h_full()
                             .border_1()
                             .border_color(t.color.accent)
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    if !matches!(this.drag, Some(Drag::VBar | Drag::HBar)) {
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            )
                             .child(e.input.clone())
                             .into_any_element(),
                         None => text
@@ -1189,6 +1202,9 @@ impl DataGrid {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                        if matches!(this.drag, Some(Drag::VBar | Drag::HBar)) {
+                            return;
+                        }
                         this.right_click(CellPos { row, col: c }, e.position, window, cx)
                     }),
                 )

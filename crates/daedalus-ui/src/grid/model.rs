@@ -343,6 +343,11 @@ pub(crate) fn cell_at(
     Some((row, col))
 }
 
+/// Whether an axis has enough overflow to show a scrollbar; render and paint must agree on it.
+pub(crate) fn scrollable(max_offset: f32) -> bool {
+    max_offset > 0.5
+}
+
 /// Top and length in px of a scrollbar thumb inside a track, or `None` when the content fits.
 // Mirrors the palette's scroll_thumb; daedalus-ui cannot import the app crate.
 pub(crate) fn thumb(
@@ -352,7 +357,7 @@ pub(crate) fn thumb(
     track: f32,
     min_len: f32,
 ) -> Option<(f32, f32)> {
-    if view <= 0. || max_offset <= 0.5 || track <= 0. {
+    if view <= 0. || !scrollable(max_offset) || track <= 0. {
         return None;
     }
     let len = (track * view / (view + max_offset)).max(min_len).min(track);
@@ -893,5 +898,22 @@ mod tests {
         m.select(pos(1, 1), false);
         assert_eq!(m.step(isize::MAX, isize::MAX, false), Some(pos(3, 2)));
         assert_eq!(m.step(-isize::MAX, 0, false), Some(pos(0, 2)));
+    }
+
+    #[test]
+    fn scrollable_ignores_view_and_track() {
+        assert!(scrollable(0.6));
+        assert!(!scrollable(0.5));
+        assert!(!scrollable(0.));
+        assert!(thumb(0., 100., 0., 50., 24.).is_none());
+        assert!(scrollable(100.));
+    }
+
+    #[test]
+    fn thumb_centre_round_trips_through_bar_offset() {
+        let (view, max, cur, track, min_len) = (100., 900., 300., 100., 30.);
+        let (top, len) = thumb(view, max, cur, track, min_len).unwrap();
+        let back = bar_offset(top + len / 2., track, len, max);
+        assert!((back - cur).abs() < 0.01);
     }
 }
