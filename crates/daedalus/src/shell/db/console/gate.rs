@@ -33,6 +33,12 @@ pub(super) fn gate(sql: &str, statements: &[Statement], target: &Target) -> Gate
     if statements.is_empty() {
         return Gate::Refuse(String::new());
     }
+    if statements.iter().any(|s| s.hidden) {
+        return Gate::Refuse(
+            "One of these statements has a comment that ends in a lone carriage return, which can hide SQL from Daedalus. Fix the line endings to run it."
+                .into(),
+        );
+    }
     if statements.iter().any(|s| s.kind == Kind::Transaction) {
         return Gate::Refuse(
             "BEGIN, COMMIT, ROLLBACK and SAVEPOINT can't run in the console. Use Manual mode and its Commit and Roll Back buttons."
@@ -133,6 +139,45 @@ mod tests {
             check(sql, &target(true, false)),
             Gate::Refuse(m) if m.contains("can't tell")
         ));
+    }
+
+    #[test]
+    fn bare_cr_comment_is_refused_on_read_only() {
+        assert!(matches!(
+            check("select 1; -- x\r delete from t", &target(true, false)),
+            Gate::Refuse(m) if m.contains("carriage return")
+        ));
+    }
+
+    #[test]
+    fn bare_cr_comment_is_refused_on_a_writable_target() {
+        for sql in [
+            "select 1; -- x\r delete from t",
+            "select 1; -- x\r delete from t\nselect 1",
+        ] {
+            for t in [
+                target(false, false),
+                target(false, true),
+                Target {
+                    manual: true,
+                    ..target(false, false)
+                },
+            ] {
+                assert!(matches!(
+                    check(sql, &t),
+                    Gate::Refuse(m) if m.contains("carriage return")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn other_scanner_hazards_still_run_on_a_writable_target() {
+        let t = target(false, false);
+        let my = "select 'it\\'s'";
+        assert_eq!(gate(my, &split(my, Engine::Mysql), &t), Gate::Run);
+        let pg = "select E'it\\'s'";
+        assert_eq!(gate(pg, &split(pg, Engine::Postgres), &t), Gate::Run);
     }
 
     #[test]

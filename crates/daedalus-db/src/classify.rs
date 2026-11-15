@@ -24,6 +24,8 @@ pub struct Statement {
     pub kind: Kind,
     /// An `UPDATE` or `DELETE` with no `WHERE`.
     pub unguarded: bool,
+    /// A line comment ends at a bare CR, so text the gate can't see may run.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,8 @@ enum Tok {
     Literal,
     /// A comment the server executes (MySQL `/*! */`), so the chunk cannot be trusted.
     Hazard,
+    /// A line comment holding a bare CR, which the server ends early.
+    HiddenCr,
 }
 
 type Toks = [(Tok, Range<usize>)];
@@ -83,6 +87,14 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 .iter()
                 .position(|x| *x == b'\n')
                 .map_or(b.len(), |p| i + p);
+            // Postgres ends the comment at a bare \r, so the scanner would hide what follows.
+            if b[start..i]
+                .iter()
+                .enumerate()
+                .any(|(k, x)| *x == b'\r' && b.get(start + k + 1) != Some(&b'\n'))
+            {
+                out.push((Tok::HiddenCr, start..i));
+            }
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
             if engine == Engine::Mysql
@@ -250,7 +262,7 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
     let mut body = Body::default();
     let mut tainted = false;
     for (n, (tok, span)) in toks.iter().enumerate() {
-        tainted |= *tok == Tok::Hazard;
+        tainted |= matches!(tok, Tok::Hazard | Tok::HiddenCr);
         body.feed(*tok, &sql[span.clone()]);
         let last = n + 1 == toks.len();
         if (*tok != Tok::Semi || body.open()) && !last {
@@ -269,10 +281,12 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
         } else {
             classify(sql, chunk, engine, ready.then_some(&mut parser))
         };
+        let hidden = chunk.iter().any(|(t, _)| *t == Tok::HiddenCr);
         out.push(Statement {
             range,
             kind,
             unguarded,
+            hidden,
         });
     }
     out
@@ -483,7 +497,10 @@ fn set_kind(sql: &str, toks: &Toks, engine: Engine) -> Kind {
 }
 
 fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>) -> (Kind, bool) {
-    if toks.iter().any(|t| t.0 == Tok::Hazard) {
+    if toks
+        .iter()
+        .any(|t| matches!(t.0, Tok::Hazard | Tok::HiddenCr))
+    {
         return (Kind::Unknown, false);
     }
     let mut toks = toks;
@@ -893,7 +910,7 @@ mod tests {
     fn random_input_never_panics() {
         let alphabet: Vec<&str> = vec![
             "select", "from", "'", "\"", "`", "$$", "$a$", ";", "--", "/*", "*/", "\n", " ", "(",
-            ")", "=", "é", "$1", "delete", "explain", "pragma",
+            ")", "=", "é", "$1", "delete", "explain", "pragma", "\r", "#",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         for _ in 0..300 {
@@ -904,10 +921,14 @@ mod tests {
                     .wrapping_add(1442695040888963407);
                 sql.push_str(alphabet[(seed >> 33) as usize % alphabet.len()]);
             }
-            for s in split(&sql, PG) {
-                assert!(sql.is_char_boundary(s.range.start) && sql.is_char_boundary(s.range.end));
+            for e in [PG, MY, LITE] {
+                for s in split(&sql, e) {
+                    assert!(
+                        sql.is_char_boundary(s.range.start) && sql.is_char_boundary(s.range.end)
+                    );
+                }
+                let _ = at(&sql, sql.len() / 2, e);
             }
-            let _ = at(&sql, sql.len() / 2, PG);
         }
     }
 
@@ -957,16 +978,48 @@ mod tests {
     }
 
     #[test]
+    fn bare_cr_in_line_comment_is_unknown() {
+        let pg = "select 1 where 1=1 -- x\r or nextval('s') > 0";
+        let my = "select 1 where 1=1 -- x\r or sleep(1) > 0";
+        let hash = "select 1 where 1=1 # x\r or sleep(1) > 0";
+        assert_eq!(kind_with(pg, PG), Kind::Unknown);
+        assert!(one(pg).hidden);
+        assert_eq!(kind_with(pg, LITE), Kind::Unknown);
+        assert_eq!(kind_with(my, MY), Kind::Unknown);
+        assert!(one_with(my, MY).hidden);
+        assert!(one_with(hash, MY).hidden);
+        assert!(one_with(pg, LITE).hidden);
+        assert!(!one_with("select 'it\\'s'", MY).hidden);
+        assert!(!one_with("select /*!40101 1 */", MY).hidden);
+        assert_eq!(kind_with(hash, MY), Kind::Unknown);
+        assert_eq!(kind_with("#é\r select 1", MY), Kind::Unknown);
+        let k = kinds("select 1; -- x\r delete from t", PG);
+        assert_eq!(k.last(), Some(&Kind::Unknown));
+    }
+
+    #[test]
+    fn crlf_line_comment_still_classifies() {
+        for e in [PG, MY, LITE] {
+            assert_eq!(kind_with("-- note\r\nselect 1", e), Kind::Read);
+            assert!(!split("-- note\r\nselect 1", e)[0].hidden);
+        }
+    }
+
+    #[test]
     fn sqlite_block_comments_do_not_nest() {
         let k = kinds("select 1 /* /* */ ; delete from t; /* */", LITE);
         assert_eq!(k.len(), 2);
         assert_eq!(k[1], Kind::Write);
     }
 
-    fn kind_with(sql: &str, engine: Engine) -> Kind {
+    fn one_with(sql: &str, engine: Engine) -> Statement {
         let all = split(sql, engine);
         assert_eq!(all.len(), 1, "{sql}: {all:?}");
-        all[0].kind
+        all.into_iter().next().unwrap()
+    }
+
+    fn kind_with(sql: &str, engine: Engine) -> Kind {
+        one_with(sql, engine).kind
     }
 
     #[test]
