@@ -68,6 +68,7 @@ pub(super) struct Fields {
     pub tls_touched: bool,
     pub read_only: bool,
     pub production: bool,
+    pub claude: bool,
     pub only_here: bool,
 }
 
@@ -134,7 +135,7 @@ pub(super) fn build(
         read_only: f.read_only,
         production: f.production,
         color: f.color.clone(),
-        claude: base.is_some_and(|b| b.claude),
+        claude: f.claude,
         projects,
         save_password: f.keychain && !sqlite,
     })
@@ -160,6 +161,14 @@ fn url_fields(current: &Fields, url: &Connection) -> Fields {
 }
 
 /// Whether an open session no longer matches the edited connection.
+/// True when saving turns Claude access on for a production connection that did not have both.
+pub(in crate::shell) fn asks_for_claude_on_production(
+    base: Option<&Connection>,
+    new: &Connection,
+) -> bool {
+    new.production && new.claude && !base.is_some_and(|b| b.production && b.claude)
+}
+
 pub(in crate::shell) fn needs_reconnect(old: &Connection, new: &Connection) -> bool {
     (&old.engine, &old.host, &old.port, &old.database, &old.user)
         != (&new.engine, &new.host, &new.port, &new.database, &new.user)
@@ -207,6 +216,7 @@ pub(in crate::shell) struct DbSheet {
     keychain: bool,
     read_only: bool,
     production: bool,
+    claude: bool,
     only_here: bool,
     status: Status,
     status_timer: Option<Task<()>>,
@@ -266,6 +276,7 @@ impl DbSheet {
             keychain: true,
             read_only: false,
             production: false,
+            claude: false,
             only_here: false,
             status: Status::None,
             status_timer: None,
@@ -303,6 +314,7 @@ impl DbSheet {
         self.keychain = conn.save_password;
         self.read_only = conn.read_only;
         self.production = conn.production;
+        self.claude = conn.claude;
         self.only_here = self
             .root
             .as_ref()
@@ -340,6 +352,7 @@ impl DbSheet {
             tls_touched: self.tls_touched,
             read_only: self.read_only,
             production: self.production,
+            claude: self.claude,
             only_here: self.only_here,
         }
     }
@@ -822,6 +835,14 @@ impl DbSheet {
                     |this, _| this.production = !this.production,
                     cx,
                 ))
+                .child(checkbox(
+                    "db-claude",
+                    "Claude can read".into(),
+                    self.claude,
+                    t,
+                    |this, _| this.claude = !this.claude,
+                    cx,
+                ))
                 .children(project_name.map(|name| {
                     checkbox(
                         "db-only-here",
@@ -833,6 +854,14 @@ impl DbSheet {
                     )
                 })),
         );
+        if self.claude {
+            form = form.child(
+                div()
+                    .text_size(t.typography.caption)
+                    .text_color(t.color.content_muted)
+                    .child("Claude can list tables and run read-only queries. Use a read-only database user."),
+            );
+        }
         if let Ok(conn) = &built {
             form = form.child(
                 div()
@@ -943,6 +972,7 @@ mod tests {
             tls_touched: false,
             read_only: false,
             production: false,
+            claude: false,
             only_here: false,
         }
     }
@@ -995,13 +1025,41 @@ mod tests {
     }
 
     #[test]
-    fn build_keeps_id_and_claude_from_the_base() {
+    fn build_keeps_id_from_the_base() {
         let b = base();
         let built = build(&fields(), Some(&b), None).unwrap();
         assert_eq!(built.id, "fixed");
-        assert!(built.claude);
         assert_eq!(built.ca_file, b.ca_file);
         assert_eq!(built.host, "localhost");
+    }
+
+    #[test]
+    fn build_takes_claude_from_the_form() {
+        let b = base();
+        assert!(b.claude);
+        assert!(!build(&fields(), Some(&b), None).unwrap().claude);
+        let on = Fields {
+            claude: true,
+            ..fields()
+        };
+        let mut off = base();
+        off.claude = false;
+        assert!(build(&on, Some(&off), None).unwrap().claude);
+    }
+
+    #[test]
+    fn asks_for_claude_on_production_only_when_newly_both() {
+        let mut new = base();
+        new.production = true;
+        let mut prod_only = new.clone();
+        prod_only.claude = false;
+        let mut claude_only = new.clone();
+        claude_only.production = false;
+        assert!(asks_for_claude_on_production(None, &new));
+        assert!(asks_for_claude_on_production(Some(&prod_only), &new));
+        assert!(asks_for_claude_on_production(Some(&claude_only), &new));
+        assert!(!asks_for_claude_on_production(Some(&new), &new));
+        assert!(!asks_for_claude_on_production(None, &prod_only));
     }
 
     #[test]

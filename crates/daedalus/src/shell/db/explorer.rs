@@ -30,6 +30,7 @@ pub(super) enum Row {
         color: Option<FolderColor>,
         production: bool,
         read_only: bool,
+        claude: bool,
         phase: Phase,
         expanded: bool,
     },
@@ -136,6 +137,7 @@ fn rows(
             color: data_color(l.conn.color.as_deref()),
             production: l.conn.production,
             read_only: l.conn.read_only,
+            claude: l.conn.claude,
             phase: phase.clone(),
             expanded,
         });
@@ -486,6 +488,7 @@ impl Shell {
             color,
             production,
             read_only,
+            claude,
             phase,
             expanded: _,
         } = row
@@ -608,6 +611,7 @@ impl Shell {
             .when(read_only, |el| {
                 el.child(tag("read-only", t.color.content_muted))
             })
+            .when(claude, |el| el.child(tag("claude", t.color.content_muted)))
             .when_some(server, |el, server| {
                 el.child(
                     div()

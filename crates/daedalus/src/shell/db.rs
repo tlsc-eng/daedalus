@@ -642,7 +642,7 @@ impl Shell {
                 conn,
                 origin,
                 password,
-            } => self.db_save(*conn, origin, password, window, cx),
+            } => self.db_save_confirmed(*conn, origin, password, window, cx),
             DbSheetEvent::Test {
                 conn,
                 typed,
@@ -753,6 +753,40 @@ impl Shell {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    fn db_save_confirmed(
+        &mut self,
+        conn: Connection,
+        origin: Origin,
+        password: PasswordChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let base = self
+            .db
+            .store
+            .as_ref()
+            .and_then(|s| s.connections.iter().find(|c| c.id == conn.id));
+        if !sheet::asks_for_claude_on_production(base, &conn) {
+            return self.db_save(conn, origin, password, window, cx);
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Let Claude read {}?", conn.name),
+            Some("This connection is marked production. Claude will be able to run read-only queries on it."),
+            &super::lsp::confirm_buttons("Cancel", "Allow"),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(super::lsp::CONFIRMED) = answer.await {
+                this.update_in(cx, |shell, window, cx| {
+                    shell.db_save(conn, origin, password, window, cx)
+                })
+                .ok();
+            }
         })
         .detach();
     }
