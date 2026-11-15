@@ -188,8 +188,12 @@ impl DataGrid {
         &mut self,
         base: usize,
         rows: Vec<Vec<Option<String>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editing.as_ref().is_some_and(|e| e.row >= base) {
+            self.cancel_edit(window, cx);
+        }
         self.model.replace_tail(base, rows);
         cx.notify();
     }
@@ -213,7 +217,11 @@ impl DataGrid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.commit(window, cx);
+        if !self.model.has_cell(row, col) {
+            return;
+        }
+        self.commit_edit(window, cx);
+        self.reveal(CellPos { row, col });
         let input = cx.new(|cx| TextInput::new(if null { "NULL" } else { "" }, cx));
         input.update(cx, |i, cx| {
             i.set_text(initial.clone(), cx);
@@ -225,12 +233,14 @@ impl DataGrid {
                 &input,
                 window,
                 |this, _, e: &InputEvent, window, cx| match e {
-                    InputEvent::Submit => this.commit(window, cx),
+                    InputEvent::Submit => this.commit_edit(window, cx),
                     InputEvent::Cancel => this.cancel_edit(window, cx),
                     _ => {}
                 },
             ),
-            cx.on_blur(&handle, window, |this, window, cx| this.commit(window, cx)),
+            cx.on_blur(&handle, window, |this, window, cx| {
+                this.commit_edit(window, cx)
+            }),
         ];
         self.editing = Some(Editing {
             row,
@@ -243,7 +253,8 @@ impl DataGrid {
         cx.notify();
     }
 
-    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Closes the editor and emits `Edited` if the text changed.
+    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editing) = self.editing.take() else {
             return;
         };
@@ -259,9 +270,12 @@ impl DataGrid {
         cx.notify();
     }
 
-    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing.take().is_some() {
-            window.focus(&self.focus);
+    /// Closes the editor without an event.
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editing) = self.editing.take() {
+            if editing.input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.focus);
+            }
             cx.notify();
         }
     }
@@ -366,6 +380,9 @@ impl DataGrid {
     }
 
     fn step(&mut self, d_row: isize, d_col: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return cx.propagate();
+        }
         if let Some(pos) = self.model.step(d_row, d_col, extend) {
             self.reveal(pos);
         }
@@ -390,6 +407,9 @@ impl DataGrid {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return cx.propagate();
+        }
         if let Some(text) = self.model.copy_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -772,6 +792,9 @@ impl Render for DataGrid {
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.step(0, -1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.step(0, 1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                if this.editing.is_some() {
+                    return cx.propagate();
+                }
                 this.model.select_all();
                 cx.notify();
             }))

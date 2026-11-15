@@ -113,6 +113,10 @@ impl GridModel {
         self.fetch_requested = false;
     }
 
+    pub fn has_cell(&self, row: usize, col: usize) -> bool {
+        row < self.rows.len() && col < self.columns.len()
+    }
+
     pub fn set_cell(&mut self, row: usize, col: usize, value: Option<String>) {
         let Some(slot) = self.rows.get_mut(row).and_then(|r| r.get_mut(col)) else {
             return;
@@ -126,7 +130,10 @@ impl GridModel {
     pub fn replace_tail(&mut self, base: usize, rows: Vec<Vec<Option<String>>>) {
         self.rows.truncate(base);
         self.rows.extend(shared(rows));
-        self.chars = column_chars(&self.columns, &self.rows);
+        let tail = column_chars(&self.columns, &self.rows[self.rows.len().min(base)..]);
+        for (have, new) in self.chars.iter_mut().zip(tail) {
+            *have = (*have).max(new);
+        }
         let last = self.rows.len().checked_sub(1);
         let clamp = |p: CellPos| {
             last.map(|l| CellPos {
@@ -382,6 +389,24 @@ mod tests {
         assert_eq!(m.anchor, Some(pos(2, 1)));
         m.replace_tail(0, vec![]);
         assert_eq!((m.anchor, m.active), (None, None));
+    }
+
+    #[test]
+    fn replace_tail_widens_columns_from_the_new_rows_only() {
+        let mut m = grid(2, 1, false);
+        let before = m.chars[0];
+        m.replace_tail(1, vec![vec![cell("a much longer value")]]);
+        assert_eq!(m.chars[0], "a much longer value".len());
+        m.replace_tail(1, vec![vec![cell("x")]]);
+        assert_eq!(m.chars[0], "a much longer value".len().max(before));
+    }
+
+    #[test]
+    fn has_cell_checks_both_bounds() {
+        let m = grid(2, 3, false);
+        assert!(m.has_cell(1, 2));
+        assert!(!m.has_cell(2, 0));
+        assert!(!m.has_cell(0, 3));
     }
 
     #[test]
