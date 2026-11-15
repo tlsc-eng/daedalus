@@ -65,7 +65,7 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify = "8"
 url = "2.5"
-rusqlite = { version = "0.43", default-features = false, features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "column_decltype", "limits"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

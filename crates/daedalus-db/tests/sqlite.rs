@@ -212,11 +212,12 @@ fn cancel_does_not_hit_next_run() {
 fn read_only_refuses_write() {
     let other = make_db("other");
     let main = make_db("ro");
+    let target = temp_path("vacuum");
     rusqlite::Connection::open(&main)
         .and_then(|c| c.execute_batch("create table t(x)"))
         .expect("seed");
     let mut rig = connect(conn(main.to_str().expect("utf8"), true), None);
-    rig.files.extend([main, other.clone()]);
+    rig.files.extend([main, other.clone(), target.clone()]);
     assert!(matches!(rig.next(), Update::Connected { .. }));
     rig.run(1, "insert into t values (1)", 100);
     assert!(rig.collect(1).is_err());
@@ -226,6 +227,20 @@ fn read_only_refuses_write() {
         100,
     );
     assert!(rig.collect(2).is_err());
+    for (run, sql) in [
+        (3, format!("vacuum into '{}'", target.display())),
+        (
+            4,
+            format!(
+                "pragma query_only = off; vacuum into '{}'",
+                target.display()
+            ),
+        ),
+    ] {
+        rig.run(run, &sql, 100);
+        assert!(rig.collect(run).is_err(), "{sql}");
+        assert!(!target.exists(), "{sql}");
+    }
 }
 
 #[test]
@@ -279,4 +294,103 @@ fn missing_file_is_an_error_and_is_not_created() {
     let rig = connect(conn(path.to_str().expect("utf8"), false), None);
     assert!(matches!(rig.next(), Update::Failed { .. }));
     assert!(!path.exists());
+}
+
+const BIG_SCRIPT_ROWS: usize = 20_000;
+
+fn insert_script() -> String {
+    "insert into t values (1);".repeat(BIG_SCRIPT_ROWS)
+}
+
+fn row_count(rig: &Rig, run: u64) -> usize {
+    rig.run(run, "select count(*) from t", 100);
+    let rows = rig.collect(run).expect("count");
+    rows[0][0]
+        .as_ref()
+        .expect("count cell")
+        .parse()
+        .expect("int")
+}
+
+#[test]
+fn cancel_stops_multi_statement_script() {
+    for _ in 0..5 {
+        let rig = rig(false);
+        rig.run(1, "create table t(x)", 100);
+        assert!(rig.collect(1).is_ok());
+        rig.run(2, &insert_script(), 100);
+        std::thread::sleep(Duration::from_millis(50));
+        rig.cancel(2);
+        loop {
+            match rig.next() {
+                Update::Done { truncated, .. } => {
+                    assert!(truncated);
+                    break;
+                }
+                Update::RunError { message, .. } => {
+                    assert!(message.contains("interrupt"), "{message}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(row_count(&rig, 3) < BIG_SCRIPT_ROWS);
+    }
+}
+
+#[test]
+fn timeout_stops_multi_statement_script() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    rig.handle.send(Command::Run {
+        session: S,
+        run: RunId(2),
+        sql: insert_script(),
+        page: 100,
+        timeout: Some(Duration::from_millis(50)),
+    });
+    match rig.collect(2) {
+        Err(message) => assert!(message.contains("timed out"), "{message}"),
+        Ok(_) => panic!("script finished before the timeout"),
+    }
+    assert!(row_count(&rig, 3) < BIG_SCRIPT_ROWS);
+}
+
+#[test]
+fn ddl_reports_zero_affected() {
+    let rig = rig(false);
+    for (run, sql, expected) in [
+        (1, "create table a(x)", 0),
+        (2, "insert into a values (1),(2)", 2),
+        (3, "create table b(x)", 0),
+        (4, "insert into a values (3); create table c(x)", 0),
+    ] {
+        rig.run(run, sql, 100);
+        loop {
+            if let Update::Done { affected, .. } = rig.next() {
+                assert_eq!(affected, Some(expected), "{sql}");
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn syntax_error_position_is_absolute() {
+    let rig = rig(false);
+    rig.run(1, "select 1; selec 2", 100);
+    loop {
+        match rig.next() {
+            Update::RunError {
+                message, position, ..
+            } => {
+                assert_eq!(position, Some(11));
+                assert!(!message.contains("selec 2"), "{message}");
+                break;
+            }
+            Update::Done { .. } => panic!("expected an error"),
+            _ => {}
+        }
+    }
 }
