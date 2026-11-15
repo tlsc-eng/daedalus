@@ -148,7 +148,11 @@ impl Shell {
             | AppMsg::ReadBuffer { .. }
             | AppMsg::RunTests { .. }
             | AppMsg::TestResults
-            | AppMsg::DebugState) => self.answer_tool(msg, caller, cx),
+            | AppMsg::DebugState
+            | AppMsg::DbConnections
+            | AppMsg::DbTables { .. }
+            | AppMsg::DbDescribe { .. }
+            | AppMsg::DbQuery { .. }) => self.answer_tool(msg, caller, cx),
         }
     }
 

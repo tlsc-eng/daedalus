@@ -22,6 +22,7 @@ use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
 
 mod console;
 mod explorer;
+mod mcp;
 mod sheet;
 mod tab;
 mod table;
@@ -80,6 +81,7 @@ pub(super) struct DbState {
     test: Option<(SessionId, Instant)>,
     test_done: Option<(Result<String, String>, u128)>,
     tabs: HashMap<SessionId, DbTabRef>,
+    claude: mcp::ClaudeDb,
 }
 
 #[derive(Clone, Default)]
@@ -89,6 +91,7 @@ pub(super) struct Meta {
     pub catalog: Option<Catalog>,
     pub catalog_error: Option<String>,
     pub reading: Option<Busy>,
+    pub claude_runs: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -236,6 +239,14 @@ impl DbState {
         self.test_done = Some((result, ms));
     }
 
+    /// Pairs an update with the console or table that owns its session; Err hands it back unchanged.
+    fn take_for_tab(&self, update: Update) -> Result<(DbTabRef, Update), Update> {
+        match self.tabs.get(&update.session()) {
+            Some(tab) => Ok((tab.clone(), update)),
+            None => Err(update),
+        }
+    }
+
     fn send(&self, command: Command) {
         if let Some(handle) = &self.handle {
             handle.send(command);
@@ -350,6 +361,7 @@ impl Shell {
             while let Ok(update) = rx.recv().await {
                 let kept = this.update(cx, |shell, cx| {
                     if let Some(update) = shell.db_route_tab(update, cx)
+                        && let Some(update) = shell.db_route_claude(update)
                         && let Some(cmd) = shell.db.on_update(update)
                     {
                         shell.db.send(cmd);
@@ -367,7 +379,10 @@ impl Shell {
     /// Gives a console or table its own session's updates; the rest go on to the explorer's logic.
     fn db_route_tab(&mut self, update: Update, cx: &mut Context<Self>) -> Option<Update> {
         let session = update.session();
-        let weak = self.db.tabs.get(&session).cloned()?;
+        let (weak, update) = match self.db.take_for_tab(update) {
+            Ok(found) => found,
+            Err(update) => return Some(update),
+        };
         let failed = matches!(update, Update::Failed { .. });
         match weak.upgrade() {
             Some(tab) => {
@@ -505,10 +520,13 @@ impl Shell {
     fn db_disconnect(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(meta) = self.db.meta.get_mut(key) {
             if let Some(session) = meta.session.take() {
+                let name = self.db_name_of(key);
+                self.db_fail_claude(session, &format!("The user disconnected {name}."));
                 self.db.send(Command::Disconnect { session });
             }
             if let Some(meta) = self.db.meta.get_mut(key) {
                 meta.phase = Phase::Idle;
+                meta.claude_runs = 0;
             }
         }
         self.db.forget_tree(key);
@@ -1357,6 +1375,26 @@ fn sheet_motion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_tab_session_is_taken_from_the_update_stream() {
+        let mut state = DbState::default();
+        state.tabs.insert(
+            SessionId(1),
+            DbTabRef::Console(gpui::WeakEntity::new_invalid()),
+        );
+        let other = Update::Failed {
+            session: SessionId(2),
+            error: "x".into(),
+        };
+        assert_eq!(state.take_for_tab(other.clone()).err(), Some(other));
+        let mine = Update::Failed {
+            session: SessionId(1),
+            error: "y".into(),
+        };
+        let (_, back) = state.take_for_tab(mine.clone()).ok().unwrap();
+        assert_eq!(back, mine);
+    }
 
     fn state_with(key: &str, session: u64) -> DbState {
         let mut db = DbState::default();

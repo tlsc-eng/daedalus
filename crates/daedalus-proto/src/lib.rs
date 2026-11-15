@@ -145,6 +145,33 @@ pub enum AppMsg {
         tasks: u16,
         only_shells: bool,
     },
+    /// The databases shared with Claude. The `Db*` variants go last, as with `ClaudePrompt`.
+    DbConnections,
+    DbTables {
+        connection: String,
+        schema: Option<String>,
+    },
+    DbDescribe {
+        connection: String,
+        schema: Option<String>,
+        table: String,
+    },
+    DbQuery {
+        connection: String,
+        sql: Private,
+        max_rows: u32,
+    },
+}
+
+/// Text that must never reach a log: SQL going out, rows coming back.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct Private(pub String);
+
+impl std::fmt::Debug for Private {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Private(<{} bytes>)", self.0.len())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -166,6 +193,7 @@ pub enum AppReply {
     Buffer(BufferInfo),
     Tests(TestResultsInfo),
     Debug(Box<DebugStateInfo>),
+    DbJson(Private),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -450,4 +478,35 @@ pub enum ErrorKind {
     SpawnFailed(String),
     #[error("protocol violation: {0}")]
     Protocol(String),
+}
+
+#[cfg(test)]
+mod private_tests {
+    use super::*;
+
+    #[test]
+    fn db_query_round_trips() {
+        let msg = AppMsg::DbQuery {
+            connection: "main".into(),
+            sql: Private("select 1".into()),
+            max_rows: 7,
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        assert_eq!(postcard::from_bytes::<AppMsg>(&bytes).unwrap(), msg);
+        let reply = AppReply::DbJson(Private("[1]".into()));
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(postcard::from_bytes::<AppReply>(&bytes).unwrap(), reply);
+    }
+
+    #[test]
+    fn private_debug_hides_text() {
+        let msg = AppMsg::DbQuery {
+            connection: "main".into(),
+            sql: Private("select secret from t".into()),
+            max_rows: 1,
+        };
+        let shown = format!("{msg:?} {:?}", AppReply::DbJson(Private("hunter2".into())));
+        assert!(!shown.contains("secret") && !shown.contains("hunter2"));
+        assert!(shown.contains("<20 bytes>"));
+    }
 }
