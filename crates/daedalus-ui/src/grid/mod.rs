@@ -547,12 +547,17 @@ impl DataGrid {
                 base.set_offset(point(px(-x), offset.y));
             }
         }
+        self.reveal_row(pos.row);
+    }
+
+    fn reveal_row(&mut self, row: usize) {
+        let base = self.scroll.0.borrow().base_handle.clone();
         let body_h = f32::from(base.bounds().size.height);
-        let scroll_y = -f32::from(offset.y);
+        let scroll_y = -f32::from(base.offset().y);
         if self.row_h > 0. {
             let (first, last) = visible_rows(scroll_y, body_h, self.row_h);
-            if let Some(strategy) = scroll_strategy(pos.row, first, last) {
-                self.scroll.scroll_to_item(pos.row, strategy);
+            if let Some(strategy) = scroll_strategy(row, first, last) {
+                self.scroll.scroll_to_item(row, strategy);
             }
         }
     }
@@ -804,7 +809,11 @@ impl DataGrid {
                 } else {
                     self.model.select(CellPos { row, col }, true);
                 }
-                self.reveal(CellPos { row, col });
+                if rows {
+                    self.reveal_row(row);
+                } else {
+                    self.reveal(CellPos { row, col });
+                }
                 cx.notify();
             }
             Some(Drag::VBar) => self.bar_to(pos, true, cx),
@@ -818,7 +827,7 @@ impl DataGrid {
         let b = base.bounds();
         let offset = base.offset();
         let max = base.max_offset();
-        let min_len = 24.;
+        let min_len = f32::from(cx.theme().ui(24.));
         let (p, track, view, max, cur) = if vertical {
             (
                 f32::from(pos.y - b.origin.y),
@@ -986,6 +995,7 @@ impl DataGrid {
         let handle = self.scroll.0.borrow().base_handle.clone();
         let (color, bar_w, inset) = (t.color.border_strong, t.ui(4.), t.ui(2.));
         let min_len = f32::from(t.ui(24.));
+        let grid = cx.entity().downgrade();
         let gutter_w = m.gutter_w;
         let (can_v, can_h) = (
             f32::from(handle.max_offset().height) > 0.5,
@@ -1047,7 +1057,10 @@ impl DataGrid {
                 });
                 [v, h]
             },
-            move |_, thumbs, window, _| {
+            move |_, thumbs, window, cx| {
+                if (thumbs[0].is_some(), thumbs[1].is_some()) != (can_v, can_h) {
+                    grid.update(cx, |_, cx| cx.notify()).ok();
+                }
                 for b in thumbs.into_iter().flatten() {
                     window.paint_quad(fill(b, color).corner_radii(bar_w / 2.));
                 }
@@ -1056,18 +1069,14 @@ impl DataGrid {
         .absolute()
         .size_full();
         let strip = |id: &'static str, vertical: bool, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .absolute()
-                .block_mouse_except_scroll()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                        window.focus(&this.focus);
-                        this.drag = Some(if vertical { Drag::VBar } else { Drag::HBar });
-                        this.bar_to(e.position, vertical, cx);
-                    }),
-                )
+            div().id(id).absolute().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.drag = Some(if vertical { Drag::VBar } else { Drag::HBar });
+                    this.bar_to(e.position, vertical, cx);
+                }),
+            )
         };
         div()
             .relative()
@@ -1167,6 +1176,9 @@ impl DataGrid {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                        if matches!(this.drag, Some(Drag::VBar | Drag::HBar)) {
+                            return;
+                        }
                         let pos = CellPos { row, col: c };
                         this.click(pos, e.modifiers.shift, e.click_count, window, cx);
                         if e.click_count == 1 && this.editing.is_none() {
@@ -1204,6 +1216,9 @@ impl DataGrid {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    if matches!(this.drag, Some(Drag::VBar | Drag::HBar)) {
+                        return;
+                    }
                     window.focus(&this.focus);
                     this.model.select_row(row, e.modifiers.shift);
                     if e.click_count == 1 {
