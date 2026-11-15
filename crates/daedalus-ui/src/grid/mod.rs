@@ -6,12 +6,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnyElement, App, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
+    Animation, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
     EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla,
     KeyBinding, ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
-    Subscription, Task, UniformListScrollHandle, Window, actions, div, point, prelude::*, px,
-    uniform_list,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, fill, point, prelude::*, px,
+    size, uniform_list,
 };
 
 use crate::components::Tooltip;
@@ -19,8 +19,9 @@ use crate::motion::{self, Busy, Glide, Opening};
 use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
 use model::{
-    CellPos, GridModel, Kind, MAX_COL_W, column_lefts, column_width, display_text, drag_width,
-    gutter_chars, reveal_x, scroll_strategy, style_for, visible_columns, visible_rows,
+    CellPos, GridModel, Kind, MAX_COL_W, bar_offset, cell_at, column_lefts, column_width,
+    display_text, drag_width, gutter_chars, page_rows, reveal_x, scroll_strategy, style_for, thumb,
+    visible_columns, visible_rows,
 };
 pub use model::{GridColumn, GridMarks, RowMark};
 use value::Inspected;
@@ -40,7 +41,19 @@ actions!(
         Copy,
         Edit,
         ToggleValue,
-        CloseValue
+        CloseValue,
+        JumpUp,
+        JumpDown,
+        JumpLeft,
+        JumpRight,
+        SelectJumpUp,
+        SelectJumpDown,
+        SelectJumpLeft,
+        SelectJumpRight,
+        PageUp,
+        PageDown,
+        SelectPageUp,
+        SelectPageDown
     ]
 );
 
@@ -60,6 +73,18 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("enter", Edit, ctx),
         KeyBinding::new("shift-enter", ToggleValue, ctx),
         KeyBinding::new("escape", CloseValue, ctx),
+        KeyBinding::new("cmd-up", JumpUp, ctx),
+        KeyBinding::new("cmd-down", JumpDown, ctx),
+        KeyBinding::new("cmd-left", JumpLeft, ctx),
+        KeyBinding::new("cmd-right", JumpRight, ctx),
+        KeyBinding::new("cmd-shift-up", SelectJumpUp, ctx),
+        KeyBinding::new("cmd-shift-down", SelectJumpDown, ctx),
+        KeyBinding::new("cmd-shift-left", SelectJumpLeft, ctx),
+        KeyBinding::new("cmd-shift-right", SelectJumpRight, ctx),
+        KeyBinding::new("pageup", PageUp, ctx),
+        KeyBinding::new("pagedown", PageDown, ctx),
+        KeyBinding::new("shift-pageup", SelectPageUp, ctx),
+        KeyBinding::new("shift-pagedown", SelectPageDown, ctx),
     ]);
 }
 
@@ -110,6 +135,7 @@ pub struct DataGrid {
     lefts: Vec<f32>,
     viewport_w: f32,
     row_h: f32,
+    gutter_w: f32,
     char_w: f32,
     pad_w: f32,
     drag: Option<Drag>,
@@ -150,6 +176,7 @@ impl DataGrid {
             lefts: Vec::new(),
             viewport_w: 0.,
             row_h: 0.,
+            gutter_w: 0.,
             char_w: 0.,
             pad_w: 0.,
             drag: None,
@@ -540,6 +567,18 @@ impl DataGrid {
         cx.notify();
     }
 
+    fn page(&mut self, dir: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return cx.propagate();
+        }
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let n = page_rows(f32::from(base.bounds().size.height), self.row_h);
+        let y = (-f32::from(base.offset().y) + dir as f32 * n as f32 * self.row_h)
+            .clamp(0., f32::from(base.max_offset().height));
+        base.set_offset(point(base.offset().x, px(-y)));
+        self.step(dir * n as isize, 0, extend, cx);
+    }
+
     fn click(
         &mut self,
         pos: CellPos,
@@ -624,6 +663,11 @@ enum Drag {
         start_x: f32,
         start_w: f32,
     },
+    Select {
+        rows: bool,
+    },
+    VBar,
+    HBar,
 }
 
 struct Metrics {
@@ -684,6 +728,7 @@ impl DataGrid {
         self.viewport_w = viewport_w;
         let row_h = t.size(Size::Row);
         self.row_h = f32::from(row_h);
+        self.gutter_w = gutter_w;
         self.char_w = char_w;
         self.pad_w = f32::from(pad);
         Metrics {
@@ -721,24 +766,86 @@ impl DataGrid {
         cx.notify();
     }
 
-    fn drag_move(&mut self, x: f32, pressed: Option<MouseButton>, cx: &mut Context<Self>) {
+    fn drag_move(
+        &mut self,
+        pos: Point<Pixels>,
+        pressed: Option<MouseButton>,
+        cx: &mut Context<Self>,
+    ) {
         if pressed != Some(MouseButton::Left) {
             return self.end_drag(cx);
         }
-        let Some(Drag::Column {
-            col,
-            start_x,
-            start_w,
-        }) = self.drag
-        else {
+        match self.drag {
+            Some(Drag::Column {
+                col,
+                start_x,
+                start_w,
+            }) => {
+                let min = column_width(1, self.char_w, self.pad_w, MAX_COL_W);
+                let w = drag_width(start_w, start_x, f32::from(pos.x), min);
+                if self.model.widths.get(col).copied().flatten() != Some(w) {
+                    self.model.set_width(col, w);
+                    cx.notify();
+                }
+            }
+            Some(Drag::Select { rows }) => {
+                let base = self.scroll.0.borrow().base_handle.clone();
+                let b = base.bounds();
+                let offset = base.offset();
+                let x = f32::from(pos.x - b.origin.x - offset.x) - self.gutter_w;
+                let y = f32::from(pos.y - b.origin.y - offset.y);
+                let Some((row, col)) =
+                    cell_at(x, y, &self.lefts, self.row_h, self.model.rows.len())
+                else {
+                    return;
+                };
+                if rows {
+                    self.model.select_row(row, true);
+                } else {
+                    self.model.select(CellPos { row, col }, true);
+                }
+                self.reveal(CellPos { row, col });
+                cx.notify();
+            }
+            Some(Drag::VBar) => self.bar_to(pos, true, cx),
+            Some(Drag::HBar) => self.bar_to(pos, false, cx),
+            None => {}
+        }
+    }
+
+    fn bar_to(&mut self, pos: Point<Pixels>, vertical: bool, cx: &mut Context<Self>) {
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let b = base.bounds();
+        let offset = base.offset();
+        let max = base.max_offset();
+        let min_len = 24.;
+        let (p, track, view, max, cur) = if vertical {
+            (
+                f32::from(pos.y - b.origin.y),
+                f32::from(b.size.height),
+                f32::from(b.size.height),
+                f32::from(max.height),
+                -f32::from(offset.y),
+            )
+        } else {
+            (
+                f32::from(pos.x - b.origin.x) - self.gutter_w,
+                f32::from(b.size.width) - self.gutter_w,
+                f32::from(b.size.width) - self.gutter_w,
+                f32::from(max.width),
+                -f32::from(offset.x),
+            )
+        };
+        let Some((_, len)) = thumb(view, max, cur, track, min_len) else {
             return;
         };
-        let min = column_width(1, self.char_w, self.pad_w, MAX_COL_W);
-        let w = drag_width(start_w, start_x, x, min);
-        if self.model.widths.get(col).copied().flatten() != Some(w) {
-            self.model.set_width(col, w);
-            cx.notify();
+        let v = bar_offset(p, track, len, max);
+        if vertical {
+            base.set_offset(point(offset.x, px(-v)));
+        } else {
+            base.set_offset(point(px(-v), offset.y));
         }
+        cx.notify();
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
@@ -758,7 +865,7 @@ impl DataGrid {
                     window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
                         if phase == DispatchPhase::Bubble {
                             g.update(cx, |this, cx| {
-                                this.drag_move(f32::from(e.position.x), e.pressed_button, cx)
+                                this.drag_move(e.position, e.pressed_button, cx)
                             })
                             .ok();
                         }
@@ -876,7 +983,15 @@ impl DataGrid {
                 .child("No rows")
                 .into_any_element();
         }
-        uniform_list(
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let (color, bar_w, inset) = (t.color.border_strong, t.ui(4.), t.ui(2.));
+        let min_len = f32::from(t.ui(24.));
+        let gutter_w = m.gutter_w;
+        let (can_v, can_h) = (
+            f32::from(handle.max_offset().height) > 0.5,
+            f32::from(handle.max_offset().width) > 0.5,
+        );
+        let list = uniform_list(
             "data-grid-rows",
             self.model.rows.len(),
             cx.processor(move |this, range: Range<usize>, window, cx| {
@@ -894,8 +1009,93 @@ impl DataGrid {
         .with_width_from_item(Some(0))
         .with_sizing_behavior(ListSizingBehavior::Auto)
         .track_scroll(self.scroll.clone())
-        .flex_1()
-        .into_any_element()
+        .flex_1();
+        let bars = gpui::canvas(
+            move |bounds, _, _| {
+                let off = handle.offset();
+                let max = handle.max_offset();
+                let view = handle.bounds().size;
+                let track_w = f32::from(bounds.size.width) - gutter_w;
+                let v = thumb(
+                    f32::from(view.height),
+                    f32::from(max.height),
+                    -f32::from(off.y),
+                    f32::from(bounds.size.height),
+                    min_len,
+                )
+                .map(|(top, len)| {
+                    Bounds::new(
+                        point(bounds.right() - bar_w - inset, bounds.top() + px(top)),
+                        size(bar_w, px(len)),
+                    )
+                });
+                let h = thumb(
+                    f32::from(view.width) - gutter_w,
+                    f32::from(max.width),
+                    -f32::from(off.x),
+                    track_w,
+                    min_len,
+                )
+                .map(|(left, len)| {
+                    Bounds::new(
+                        point(
+                            bounds.left() + px(gutter_w + left),
+                            bounds.bottom() - bar_w - inset,
+                        ),
+                        size(px(len), bar_w),
+                    )
+                });
+                [v, h]
+            },
+            move |_, thumbs, window, _| {
+                for b in thumbs.into_iter().flatten() {
+                    window.paint_quad(fill(b, color).corner_radii(bar_w / 2.));
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+        let strip = |id: &'static str, vertical: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .absolute()
+                .block_mouse_except_scroll()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.drag = Some(if vertical { Drag::VBar } else { Drag::HBar });
+                        this.bar_to(e.position, vertical, cx);
+                    }),
+                )
+        };
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .child(bars)
+            .when(can_v, |d| {
+                d.child(
+                    strip("grid-vbar", true, cx)
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(10.)),
+                )
+            })
+            .when(can_h, |d| {
+                d.child(
+                    strip("grid-hbar", false, cx)
+                        .left(px(gutter_w))
+                        .right_0()
+                        .bottom_0()
+                        .h(px(10.)),
+                )
+            })
+            .into_any_element()
     }
 
     fn row(&self, row: usize, m: &Metrics, focused: bool, cx: &mut Context<Self>) -> gpui::Div {
@@ -968,7 +1168,10 @@ impl DataGrid {
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                         let pos = CellPos { row, col: c };
-                        this.click(pos, e.modifiers.shift, e.click_count, window, cx)
+                        this.click(pos, e.modifiers.shift, e.click_count, window, cx);
+                        if e.click_count == 1 && this.editing.is_none() {
+                            this.drag = Some(Drag::Select { rows: false });
+                        }
                     }),
                 )
                 .on_mouse_down(
@@ -1003,6 +1206,9 @@ impl DataGrid {
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
                     this.model.select_row(row, e.modifiers.shift);
+                    if e.click_count == 1 {
+                        this.drag = Some(Drag::Select { rows: true });
+                    }
                     cx.notify();
                 }),
             )
@@ -1049,7 +1255,7 @@ impl Render for DataGrid {
             .text_size(t.typography.caption)
             .opacity(self.dim.value())
             .relative()
-            .when(self.drag.is_some(), |d| {
+            .when(matches!(self.drag, Some(Drag::Column { .. })), |d| {
                 d.cursor(CursorStyle::ResizeLeftRight)
             })
             .children(self.drag_hook(cx))
@@ -1061,6 +1267,30 @@ impl Render for DataGrid {
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.step(1, 0, true, cx)))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.step(0, -1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.step(0, 1, true, cx)))
+            .on_action(cx.listener(|this, _: &JumpUp, _, cx| this.step(-isize::MAX, 0, false, cx)))
+            .on_action(cx.listener(|this, _: &JumpDown, _, cx| this.step(isize::MAX, 0, false, cx)))
+            .on_action(
+                cx.listener(|this, _: &JumpLeft, _, cx| this.step(0, -isize::MAX, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &JumpRight, _, cx| this.step(0, isize::MAX, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectJumpUp, _, cx| this.step(-isize::MAX, 0, true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectJumpDown, _, cx| this.step(isize::MAX, 0, true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectJumpLeft, _, cx| this.step(0, -isize::MAX, true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectJumpRight, _, cx| this.step(0, isize::MAX, true, cx)),
+            )
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| this.page(-1, false, cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page(1, false, cx)))
+            .on_action(cx.listener(|this, _: &SelectPageUp, _, cx| this.page(-1, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPageDown, _, cx| this.page(1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 if this.editing.is_some() {
                     return cx.propagate();
