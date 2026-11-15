@@ -324,7 +324,7 @@ impl Shell {
             return;
         }
         if listed.conn.engine != Engine::Sqlite && !listed.conn.save_password {
-            self.db_open_sheet(SheetMode::Password { listed }, window, cx);
+            self.db_prompt_password(&key, listed, window, cx);
             return;
         }
         self.db_start_worker(cx);
@@ -356,9 +356,7 @@ impl Shell {
                 };
                 match shell.db.keychain_loaded(&key, session, loaded, conn, root) {
                     Keychain::Connect(cmd) => shell.db.send(*cmd),
-                    Keychain::Prompt => {
-                        shell.db_open_sheet(SheetMode::Password { listed }, window, cx)
-                    }
+                    Keychain::Prompt => shell.db_prompt_password(&key, listed, window, cx),
                     Keychain::Done => {}
                 }
                 cx.notify();
@@ -471,6 +469,28 @@ impl Shell {
         }
     }
 
+    fn db_prompt_password(
+        &mut self,
+        key: &str,
+        listed: Listed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.db.sheet.is_some() {
+            self.db.fail(
+                key,
+                "No saved password. Close the open sheet and connect again.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.db_open_sheet(SheetMode::Password { listed }, window, cx);
+    }
+
+    fn db_sheet_is(&self, opened: u64) -> bool {
+        self.db.sheet.is_some() && self.db.sheet_opened == opened
+    }
+
     fn db_set_store(&mut self, store: Store) {
         self.db.store = Some(store);
         self.db.load_error = None;
@@ -565,6 +585,7 @@ impl Shell {
             .cloned();
         let key = conn_key(origin, &conn.id);
         let new = conn.clone();
+        let opened = self.db.sheet_opened;
         cx.spawn_in(window, async move |this, cx| {
             let saved = cx
                 .background_executor()
@@ -590,9 +611,12 @@ impl Shell {
                         shell.db_disconnect(&key, cx);
                     }
                     shell.db.selected = Some(key);
-                    shell.db_close_sheet(window, cx);
+                    if shell.db_sheet_is(opened) {
+                        shell.db_close_sheet(window, cx);
+                    }
                 }
-                Err(e) => shell.db_sheet_error(e, cx),
+                Err(e) if shell.db_sheet_is(opened) => shell.db_sheet_error(e, cx),
+                Err(_) => {}
             })
             .ok();
         })
@@ -696,6 +720,7 @@ impl Shell {
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
         let has_secret = listed.conn.save_password && listed.conn.engine != Engine::Sqlite;
         let id = listed.conn.id;
+        let opened = self.db.sheet_opened;
         cx.spawn_in(window, async move |this, cx| {
             let (keychain, removed) = cx
                 .background_executor()
@@ -717,7 +742,7 @@ impl Shell {
                 match removed {
                     Ok(store) => {
                         shell.db_set_store(store);
-                        if shell.db.sheet.is_some() {
+                        if shell.db_sheet_is(opened) {
                             shell.db_close_sheet(window, cx);
                         }
                     }
@@ -885,6 +910,39 @@ mod tests {
         let cmd = db.keychain_loaded("g:a", SessionId(1), Ok(None), conn(), None);
         assert!(matches!(cmd, Keychain::Prompt));
         assert_eq!(db.phase("g:a"), Phase::Idle);
+    }
+
+    #[test]
+    fn a_failed_test_session_sends_nothing_and_clears_the_test() {
+        let mut db = DbState {
+            test: Some((SessionId(5), Instant::now())),
+            ..DbState::default()
+        };
+        let cmd = db.on_update(Update::Failed {
+            session: SessionId(5),
+            error: "refused".into(),
+        });
+        assert!(cmd.is_none() && db.test.is_none());
+        assert!(matches!(db.test_done, Some((Err(ref e), _)) if e == "refused"));
+    }
+
+    #[test]
+    fn a_late_connected_for_a_replaced_test_session_is_disconnected() {
+        let mut db = DbState {
+            test: Some((SessionId(6), Instant::now())),
+            ..DbState::default()
+        };
+        let cmd = db.on_update(Update::Connected {
+            session: SessionId(5),
+            server: "x".into(),
+        });
+        assert!(matches!(
+            cmd,
+            Some(Command::Disconnect {
+                session: SessionId(5)
+            })
+        ));
+        assert!(db.test.is_some() && db.test_done.is_none());
     }
 
     #[test]

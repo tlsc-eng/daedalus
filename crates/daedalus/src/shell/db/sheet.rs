@@ -50,6 +50,7 @@ pub(in crate::shell) enum DbSheetEvent {
 
 #[derive(Clone)]
 pub(super) struct Fields {
+    pub id: String,
     pub name: String,
     pub engine: Engine,
     pub color: Option<String>,
@@ -110,9 +111,10 @@ pub(super) fn build(
             projects.push(root.to_path_buf());
         }
     }
-    let id = match base {
-        Some(b) => b.id.clone(),
-        None => daedalus_db::new_id().map_err(|_| "Could not create an id")?,
+    let id = match (base, f.id.is_empty()) {
+        (Some(b), _) => b.id.clone(),
+        (None, false) => f.id.clone(),
+        (None, true) => daedalus_db::new_id().map_err(|_| "Could not create an id")?,
     };
     Ok(Connection {
         id,
@@ -184,6 +186,7 @@ pub(in crate::shell) struct DbSheet {
     only_here: bool,
     status: Status,
     status_timer: Option<Task<()>>,
+    new_id: String,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -242,6 +245,7 @@ impl DbSheet {
             only_here: false,
             status: Status::None,
             status_timer: None,
+            new_id: daedalus_db::new_id().unwrap_or_default(),
             _subscriptions: subscriptions,
         };
         if let Some(conn) = &base {
@@ -281,9 +285,31 @@ impl DbSheet {
             .is_some_and(|r| conn.projects.contains(r));
     }
 
+    /// A URL carries the server and the database, not the name, colour, flags or Keychain choice.
+    fn fill_from_url(&mut self, conn: &Connection, cx: &mut Context<Self>) {
+        let set = |input: &Entity<TextInput>, text: &str, cx: &mut Context<Self>| {
+            input.update(cx, |i, cx| i.set_text(text, cx));
+        };
+        if self.name.read(cx).text().trim().is_empty() {
+            set(&self.name, &conn.name, cx);
+        }
+        set(&self.host, &conn.host, cx);
+        set(
+            &self.port,
+            &conn.port.map(|p| p.to_string()).unwrap_or_default(),
+            cx,
+        );
+        set(&self.database, &conn.database, cx);
+        set(&self.user, &conn.user, cx);
+        self.engine = conn.engine;
+        self.tls = conn.tls;
+        self.tls_touched = true;
+    }
+
     fn fields(&self, cx: &App) -> Fields {
         let text = |i: &Entity<TextInput>| i.read(cx).text().to_owned();
         Fields {
+            id: self.new_id.clone(),
             name: text(&self.name),
             engine: self.engine,
             color: self.color.clone(),
@@ -401,8 +427,7 @@ impl DbSheet {
         let text = cx.read_from_clipboard().and_then(|c| c.text());
         match daedalus_db::from_url(text.as_deref().unwrap_or_default()) {
             Ok((conn, secret)) => {
-                self.fill(&conn, cx);
-                self.keychain = self.keychain || conn.save_password;
+                self.fill_from_url(&conn, cx);
                 if let Some(secret) = secret {
                     self.password
                         .update(cx, |i, cx| i.set_text(secret.expose(), cx));
@@ -886,6 +911,7 @@ mod tests {
 
     fn fields() -> Fields {
         Fields {
+            id: String::new(),
             name: "Local".into(),
             engine: Engine::Postgres,
             color: None,
@@ -989,6 +1015,39 @@ mod tests {
             ..remote
         };
         assert_eq!(build(&touched, None, None).unwrap().tls, Tls::Disable);
+    }
+
+    #[test]
+    fn one_new_sheet_builds_the_same_id_twice() {
+        let f = Fields {
+            id: "once".into(),
+            ..fields()
+        };
+        let a = build(&f, None, None).unwrap();
+        let b = build(&f, None, None).unwrap();
+        assert_eq!(a.id, b.id);
+    }
+
+    #[test]
+    fn paste_url_keeps_the_keychain_tick_and_production() {
+        let mut edited = base();
+        edited.production = true;
+        let (url_conn, secret) = daedalus_db::from_url("postgres://u:pw@db.example.com/x").unwrap();
+        let mut f = fields();
+        f.production = true;
+        f.host = url_conn.host.clone();
+        f.database = url_conn.database.clone();
+        let built = build(&f, Some(&edited), None).unwrap();
+        assert!(built.save_password && built.production);
+        let typed = secret.as_ref().map_or("", |s| s.expose());
+        assert!(matches!(
+            password_change(Some(&edited), &built, typed),
+            PasswordChange::Set(_)
+        ));
+        assert!(matches!(
+            password_change(Some(&edited), &built, ""),
+            PasswordChange::Keep
+        ));
     }
 
     #[test]
