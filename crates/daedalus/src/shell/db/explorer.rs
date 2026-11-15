@@ -383,9 +383,45 @@ impl Shell {
                 base(format!("db-table:{conn}:{schema}:{name}"), 2)
                     .cursor_pointer()
                     .hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.db_toggle(node.clone(), None, window, cx)
+                    .on_click(cx.listener({
+                        let (conn, schema, name) = (conn.clone(), schema.clone(), name.clone());
+                        move |this, event: &ClickEvent, window, cx| {
+                            if event.click_count() >= 2 {
+                                this.db_open_table(
+                                    conn.clone(),
+                                    schema.clone(),
+                                    name.clone(),
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.db_toggle(node.clone(), None, window, cx)
+                            }
+                        }
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let (conn, schema, name) = (conn.clone(), schema.clone(), name.clone());
+                            move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                let open = shell_item("Open Table", cx, {
+                                    let (conn, schema, name) =
+                                        (conn.clone(), schema.clone(), name.clone());
+                                    move |this, window, cx| {
+                                        this.db_open_table(
+                                            conn.clone(),
+                                            schema.clone(),
+                                            name.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                });
+                                this.open_context_menu(event.position, vec![open], window, cx);
+                            }
+                        }),
+                    )
                     .child(slot().child(chevron(turn, &t)))
                     .child(div().min_w_0().ellipsis().child(name))
                     .when(kind == TableKind::View, |el| {

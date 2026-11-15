@@ -71,6 +71,7 @@ fn not_on_disk(kind: &ItemKind) -> bool {
             ItemKind::Settings
                 | ItemKind::Shortcuts
                 | ItemKind::DbConsole { .. }
+                | ItemKind::DbTable { .. }
                 | ItemKind::Session { .. }
         )
 }
@@ -752,6 +753,11 @@ mod tests {
             ItemKind::Shortcuts,
             ItemKind::DbConsole {
                 connection: "g:one".into(),
+            },
+            ItemKind::DbTable {
+                connection: "g:one".into(),
+                schema: "public".into(),
+                table: "users".into(),
             },
             ItemKind::Editor {
                 path: "/p/a.rs".into(),

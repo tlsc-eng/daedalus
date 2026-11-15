@@ -70,7 +70,7 @@ pub(super) struct Batch {
     current: Option<Current>,
 }
 
-fn grid_columns(columns: &[Column]) -> Vec<GridColumn> {
+pub(in crate::shell::db) fn grid_columns(columns: &[Column]) -> Vec<GridColumn> {
     columns
         .iter()
         .map(|c| GridColumn {

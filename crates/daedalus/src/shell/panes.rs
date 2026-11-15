@@ -421,6 +421,11 @@ impl Shell {
             ItemKind::Settings => self.new_settings_view(root, cx),
             ItemKind::Shortcuts => self.new_shortcuts_view(cx),
             ItemKind::DbConsole { connection } => self.new_db_console_view(root, connection, cx),
+            ItemKind::DbTable {
+                connection,
+                schema,
+                table,
+            } => self.new_db_table_view(connection, schema, table, cx),
             ItemKind::Session { id } => {
                 self.refresh_session_view(id, cx);
                 ItemView::Session(SessionTab {
@@ -530,6 +535,7 @@ impl Shell {
             (None, ItemKind::Settings) => "Settings".into(),
             (None, ItemKind::Shortcuts) => "Keyboard Shortcuts".into(),
             (None, ItemKind::DbConsole { .. }) => "Console".into(),
+            (None, ItemKind::DbTable { table, .. }) => table.clone(),
         }
     }
 
