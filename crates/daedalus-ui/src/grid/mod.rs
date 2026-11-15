@@ -149,7 +149,9 @@ impl DataGrid {
         cx: &mut Context<Self>,
     ) {
         self.model.show(columns, rows, more);
-        self.editing = None;
+        if let Some(editing) = self.editing.take() {
+            self.refocus_if_focused(editing.input.focus_handle(cx), cx);
+        }
         self.clear_stale(cx);
         self.generation += 1;
         self.opened = Some(Opening::now());
@@ -266,7 +268,9 @@ impl DataGrid {
                 text,
             });
         }
-        window.focus(&self.focus);
+        if editing.input.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus);
+        }
         cx.notify();
     }
 
@@ -278,6 +282,22 @@ impl DataGrid {
             }
             cx.notify();
         }
+    }
+
+    /// `show` has no window, so the check and the focus move run in a deferred window update.
+    fn refocus_if_focused(&self, editor: FocusHandle, cx: &mut Context<Self>) {
+        let (Some(window), grid) = (cx.active_window(), self.focus.clone()) else {
+            return;
+        };
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, _| {
+                    if editor.is_focused(window) {
+                        window.focus(&grid);
+                    }
+                })
+                .ok();
+        });
     }
 
     fn request_edit(&mut self, pos: CellPos, cx: &mut Context<Self>) {
