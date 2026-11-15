@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use daedalus_db::catalog::Catalog;
 use daedalus_db::worker::{Command, Handle, SessionId, Update};
 use daedalus_db::{Connection, Engine, Listed, Origin, Secret, Store};
 use daedalus_ui::motion::{self, Busy, Closing};
@@ -12,11 +13,27 @@ use gpui::{
 };
 
 use super::Shell;
+use super::sidebar::Tween;
 use crate::db_secrets;
 use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
 
 mod explorer;
 mod sheet;
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) enum NodeKey {
+    Conn(String),
+    Schema(String, String),
+    Table(String, String, String),
+}
+
+impl NodeKey {
+    fn conn(&self) -> &str {
+        match self {
+            Self::Conn(c) | Self::Schema(c, _) | Self::Table(c, _, _) => c,
+        }
+    }
+}
 
 struct OpenSheet {
     entity: Entity<DbSheet>,
@@ -39,6 +56,8 @@ pub(super) struct DbState {
     loaded: bool,
     load_task: Option<Task<()>>,
     meta: HashMap<String, Meta>,
+    expanded: HashSet<NodeKey>,
+    turning: HashMap<NodeKey, Tween>,
     next_session: u64,
     selected: Option<String>,
     spin: Option<Task<()>>,
@@ -53,6 +72,9 @@ pub(super) struct DbState {
 pub(super) struct Meta {
     pub session: Option<SessionId>,
     pub phase: Phase,
+    pub catalog: Option<Catalog>,
+    pub catalog_error: Option<String>,
+    pub reading: Option<Busy>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -102,9 +124,60 @@ impl DbState {
     fn animating(&self, now: Instant, delay: Duration, hold: Duration) -> bool {
         self.meta.values().any(|m| match &m.phase {
             Phase::Connecting(_) => true,
-            Phase::Connected { busy, at, .. } => spinner_lingers(*busy, *at, now, delay, hold),
+            Phase::Connected { busy, at, .. } => {
+                m.reading.is_some() || spinner_lingers(*busy, *at, now, delay, hold)
+            }
             _ => false,
         })
+    }
+
+    /// Flips a node open or shut and eases its chevron; returns whether it is now open.
+    fn toggle(&mut self, node: NodeKey, reduced: bool, fast: Duration) -> bool {
+        let open = !self.expanded.contains(&node);
+        let from = self.turn_of(&node, fast);
+        match Tween::start(reduced, open, from) {
+            Some(tween) => self.turning.insert(node.clone(), tween),
+            None => self.turning.remove(&node),
+        };
+        if open {
+            self.expanded.insert(node);
+        } else {
+            self.expanded.remove(&node);
+        }
+        open
+    }
+
+    /// How far the node's chevron has turned, from 0 (shut) to 1 (open).
+    fn turn_of(&self, node: &NodeKey, fast: Duration) -> f32 {
+        self.turning
+            .get(node)
+            .map_or(f32::from(self.expanded.contains(node)), |t| {
+                t.at(Instant::now(), fast, motion::ease_standard())
+            })
+    }
+
+    /// Starts reading the catalog of a connected, idle-of-catalog row; None when it cannot be asked.
+    fn introspect(&mut self, key: &str) -> Option<Command> {
+        let meta = self.meta.get_mut(key)?;
+        let session = meta.session?;
+        if !matches!(meta.phase, Phase::Connected { .. }) {
+            return None;
+        }
+        meta.catalog_error = None;
+        meta.reading = Some(Busy::start());
+        Some(Command::Introspect { session })
+    }
+
+    /// Drops what was read from a connection and folds its tree below the connection row.
+    fn forget_tree(&mut self, key: &str) {
+        if let Some(meta) = self.meta.get_mut(key) {
+            meta.catalog = None;
+            meta.catalog_error = None;
+            meta.reading = None;
+        }
+        let below = |n: &NodeKey| n.conn() == key && !matches!(n, NodeKey::Conn(_));
+        self.expanded.retain(|n| !below(n));
+        self.turning.retain(|n, _| !below(n));
     }
 
     /// Decides what a finished Keychain read means; the secret moves straight into the command.
@@ -170,6 +243,7 @@ impl DbState {
             Meta {
                 session: Some(session),
                 phase: Phase::Connecting(Busy::start()),
+                ..Meta::default()
             },
         );
         session
@@ -181,6 +255,7 @@ impl DbState {
             Meta {
                 session: None,
                 phase: Phase::Failed(error),
+                ..Meta::default()
             },
         );
     }
@@ -197,19 +272,24 @@ impl DbState {
                 None
             }
             Update::Connected { session, server } => {
-                let key = self.key_of(session).map(str::to_owned);
-                match key.and_then(|k| self.meta.get_mut(&k)) {
-                    Some(meta) => {
-                        if let Phase::Connecting(busy) = meta.phase {
-                            meta.phase = Phase::Connected {
-                                server,
-                                busy,
-                                at: Instant::now(),
-                            };
-                        }
-                        None
-                    }
-                    None => Some(Command::Disconnect { session }),
+                let Some(key) = self.key_of(session).map(str::to_owned) else {
+                    return Some(Command::Disconnect { session });
+                };
+                let meta = self.meta.get_mut(&key)?;
+                if let Phase::Connecting(busy) = meta.phase {
+                    meta.phase = Phase::Connected {
+                        server,
+                        busy,
+                        at: Instant::now(),
+                    };
+                }
+                let wanted =
+                    meta.catalog.is_none() && self.expanded.contains(&NodeKey::Conn(key.clone()));
+                if wanted {
+                    self.introspect(&key)
+                } else {
+                    self.meta.get_mut(&key)?.reading = None;
+                    None
                 }
             }
             Update::Failed { session, error } => {
@@ -218,11 +298,27 @@ impl DbState {
                 }
                 None
             }
+            Update::Catalog { session, catalog } => {
+                let key = self.key_of(session).map(str::to_owned)?;
+                let meta = self.meta.get_mut(&key)?;
+                meta.reading = None;
+                match catalog {
+                    Ok(c) => {
+                        meta.catalog_error = None;
+                        if let [only] = c.schemas.as_slice() {
+                            self.expanded
+                                .insert(NodeKey::Schema(key, only.name.clone()));
+                        }
+                        meta.catalog = Some(c);
+                    }
+                    Err(e) => meta.catalog_error = Some(e),
+                }
+                None
+            }
             Update::Columns { .. }
             | Update::Rows { .. }
             | Update::Done { .. }
-            | Update::RunError { .. }
-            | Update::Catalog { .. } => None,
+            | Update::RunError { .. } => None,
         }
     }
 }
@@ -374,6 +470,59 @@ impl Shell {
             if let Some(meta) = self.db.meta.get_mut(key) {
                 meta.phase = Phase::Idle;
             }
+        }
+        self.db.forget_tree(key);
+        cx.notify();
+    }
+
+    fn db_toggle(
+        &mut self,
+        node: NodeKey,
+        listed: Option<Listed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = &cx.theme().motion;
+        let (reduced, fast) = (m.reduced, m.fast);
+        let open = self.db.toggle(node.clone(), reduced, fast);
+        let NodeKey::Conn(key) = node else {
+            cx.notify();
+            return;
+        };
+        if open {
+            match self.db.phase(&key) {
+                Phase::Idle | Phase::Failed(_) => {
+                    if let Some(listed) = listed {
+                        self.db_connect(listed, window, cx);
+                    }
+                }
+                Phase::Connected { .. } if self.db.meta[&key].catalog.is_none() => {
+                    self.db_introspect(&key, cx);
+                }
+                _ => {}
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drops finished chevron turns and keeps frames coming while one runs on screen.
+    pub(super) fn sync_db_motion(&mut self, window: &mut Window, cx: &Context<Self>) {
+        if !self.data_shown() {
+            self.db.turning.clear();
+            return;
+        }
+        let fast = cx.theme().motion.fast;
+        let now = Instant::now();
+        self.db.turning.retain(|_, t| t.running(now, fast));
+        if !self.db.turning.is_empty() {
+            window.request_animation_frame();
+        }
+    }
+
+    fn db_introspect(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(command) = self.db.introspect(key) {
+            self.db.send(command);
+            self.db_start_spin(cx);
         }
         cx.notify();
     }
@@ -824,6 +973,7 @@ mod tests {
             Meta {
                 session: Some(SessionId(session)),
                 phase: Phase::Connecting(Busy::start()),
+                ..Meta::default()
             },
         );
         db
@@ -963,6 +1113,163 @@ mod tests {
         ));
         assert!(db.test.is_none());
         assert!(matches!(db.test_done, Some((Ok(ref s), _)) if s == "SQLite 3.45"));
+    }
+
+    fn catalog_of(names: &[&str]) -> Catalog {
+        Catalog {
+            schemas: names
+                .iter()
+                .map(|n| daedalus_db::catalog::Schema {
+                    name: (*n).into(),
+                    tables: vec![],
+                })
+                .collect(),
+            truncated: false,
+        }
+    }
+
+    fn connected(key: &str, session: u64) -> DbState {
+        let mut db = state_with(key, session);
+        db.meta.get_mut(key).unwrap().phase = Phase::Connected {
+            server: "x".into(),
+            busy: Busy::start(),
+            at: Instant::now(),
+        };
+        db
+    }
+
+    #[test]
+    fn expanding_an_idle_connection_marks_it_open() {
+        let mut db = DbState::default();
+        let open = db.toggle(NodeKey::Conn("g:a".into()), true, Duration::ZERO);
+        assert!(open && db.expanded.contains(&NodeKey::Conn("g:a".into())));
+        let open = db.toggle(NodeKey::Conn("g:a".into()), true, Duration::ZERO);
+        assert!(!open && db.expanded.is_empty());
+    }
+
+    #[test]
+    fn connected_for_an_expanded_row_asks_for_the_catalog() {
+        let mut db = state_with("g:a", 1);
+        db.expanded.insert(NodeKey::Conn("g:a".into()));
+        let cmd = db.on_update(Update::Connected {
+            session: SessionId(1),
+            server: "x".into(),
+        });
+        assert!(matches!(
+            cmd,
+            Some(Command::Introspect {
+                session: SessionId(1)
+            })
+        ));
+        assert!(db.meta["g:a"].reading.is_some());
+    }
+
+    #[test]
+    fn connected_for_a_collapsed_row_does_not_introspect() {
+        let mut db = state_with("g:a", 1);
+        let cmd = db.on_update(Update::Connected {
+            session: SessionId(1),
+            server: "x".into(),
+        });
+        assert!(cmd.is_none() && db.meta["g:a"].reading.is_none());
+    }
+
+    #[test]
+    fn a_catalog_error_keeps_the_last_good_catalog() {
+        let mut db = connected("g:a", 1);
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Ok(catalog_of(&["a", "b"])),
+        });
+        db.meta.get_mut("g:a").unwrap().reading = Some(Busy::start());
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Err("gone".into()),
+        });
+        let meta = &db.meta["g:a"];
+        assert_eq!(meta.catalog.as_ref().map(|c| c.schemas.len()), Some(2));
+        assert_eq!(meta.catalog_error.as_deref(), Some("gone"));
+        assert!(meta.reading.is_none());
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Ok(catalog_of(&["a"])),
+        });
+        assert!(db.meta["g:a"].catalog_error.is_none());
+    }
+
+    #[test]
+    fn a_single_schema_is_expanded_automatically() {
+        let mut db = connected("g:a", 1);
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Ok(catalog_of(&["main"])),
+        });
+        assert!(
+            db.expanded
+                .contains(&NodeKey::Schema("g:a".into(), "main".into()))
+        );
+        let mut db = connected("g:a", 1);
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Ok(catalog_of(&["a", "b"])),
+        });
+        assert!(db.expanded.is_empty());
+    }
+
+    #[test]
+    fn catalog_for_an_unknown_session_is_ignored() {
+        let mut db = connected("g:a", 1);
+        let cmd = db.on_update(Update::Catalog {
+            session: SessionId(9),
+            catalog: Ok(catalog_of(&["main"])),
+        });
+        assert!(cmd.is_none() && db.meta["g:a"].catalog.is_none() && db.expanded.is_empty());
+    }
+
+    #[test]
+    fn refresh_asks_again_and_shows_reading() {
+        let mut db = connected("g:a", 1);
+        db.meta.get_mut("g:a").unwrap().catalog_error = Some("old".into());
+        assert!(matches!(
+            db.introspect("g:a"),
+            Some(Command::Introspect {
+                session: SessionId(1)
+            })
+        ));
+        let meta = &db.meta["g:a"];
+        assert!(meta.reading.is_some() && meta.catalog_error.is_none());
+        assert!(state_with("g:b", 2).introspect("g:b").is_none());
+    }
+
+    #[test]
+    fn forgetting_a_tree_clears_its_catalog_and_child_keys_only() {
+        let mut db = connected("g:a", 1);
+        db.on_update(Update::Catalog {
+            session: SessionId(1),
+            catalog: Ok(catalog_of(&["main"])),
+        });
+        db.expanded.insert(NodeKey::Conn("g:a".into()));
+        db.expanded.insert(NodeKey::Conn("g:b".into()));
+        db.expanded
+            .insert(NodeKey::Table("g:a".into(), "main".into(), "t".into()));
+        db.forget_tree("g:a");
+        assert!(db.meta["g:a"].catalog.is_none());
+        assert_eq!(db.expanded.len(), 2);
+        assert!(db.expanded.contains(&NodeKey::Conn("g:a".into())));
+        assert!(db.expanded.contains(&NodeKey::Conn("g:b".into())));
+    }
+
+    #[test]
+    fn collapsed_while_connecting_clears_reading() {
+        let mut db = state_with("g:a", 1);
+        db.meta.get_mut("g:a").unwrap().reading = Some(Busy::start());
+        let cmd = db.on_update(Update::Connected {
+            session: SessionId(1),
+            server: "x".into(),
+        });
+        assert!(cmd.is_none() && db.meta["g:a"].reading.is_none());
+        let (delay, hold) = (Duration::from_millis(250), Duration::from_millis(400));
+        assert!(!db.animating(Instant::now(), delay, hold));
     }
 
     #[test]

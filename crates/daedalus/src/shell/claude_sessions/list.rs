@@ -156,7 +156,7 @@ fn unix_secs(time: SystemTime) -> i64 {
 }
 
 /// The disclosure arrow, pointing right and turned down once `turn` reaches 1.
-fn chevron(turn: f32, t: &Theme) -> Svg {
+pub(in crate::shell) fn chevron(turn: f32, t: &Theme) -> Svg {
     svg()
         .path("ui/chevron.svg")
         .size(t.ui(10.))

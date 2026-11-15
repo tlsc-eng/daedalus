@@ -24,7 +24,7 @@ use super::sidebar::Tween;
 use crate::snapshots::{self, Before};
 use crate::transcripts::{self, Profile};
 
-mod list;
+pub(super) mod list;
 pub(super) mod live;
 mod session_view;
 
