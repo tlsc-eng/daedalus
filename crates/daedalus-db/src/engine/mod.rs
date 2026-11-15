@@ -74,12 +74,12 @@ impl Driver {
         }
     }
 
-    /// The query that lists this engine's tables and columns in the catalog row contract.
-    pub fn catalog_sql(&self) -> &'static str {
+    /// Streams the catalog rows in the 7-column contract of `catalog::from_rows`.
+    pub fn catalog(&self) -> ItemStream {
         match self {
-            Driver::Postgres(_) => pg::CATALOG_SQL,
-            Driver::Sqlite(_) => sqlite::CATALOG_SQL,
-            Driver::Mysql(_) => mysql::CATALOG_SQL,
+            Driver::Postgres(pg) => pg.query(pg::CATALOG_SQL.to_owned()),
+            Driver::Sqlite(db) => db.catalog(),
+            Driver::Mysql(m) => m.query(mysql::CATALOG_SQL.to_owned()),
         }
     }
 

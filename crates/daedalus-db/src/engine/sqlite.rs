@@ -16,12 +16,10 @@ use crate::value::{Cell, Column};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
-pub const CATALOG_SQL: &str = "SELECT 'main', m.name, m.type, p.name, p.type, \
-CASE WHEN p.\"notnull\" THEN '0' ELSE '1' END, CASE WHEN p.pk > 0 THEN '1' ELSE '0' END \
-FROM (SELECT name, type FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' \
-AND coalesce(sql,'') NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name LIMIT 5001) m \
-JOIN pragma_table_info(m.name) p ORDER BY m.name, p.cid";
+/// Lists tables and views; columns come from a per-object pragma so one broken view cannot fail the catalog.
+const CATALOG_OBJECTS_SQL: &str = "SELECT name, type FROM sqlite_schema WHERE type IN ('table','view') \
+AND substr(name, 1, 7) <> 'sqlite_' AND coalesce(sql,'') NOT LIKE 'CREATE VIRTUAL TABLE%' \
+ORDER BY name LIMIT 5001";
 
 pub struct Sqlite {
     conn: Arc<Mutex<Db>>,
@@ -38,10 +36,15 @@ pub struct SqliteCanceller {
 // Each query() installs a fresh flag so a late cancel for run N cannot be cleared by run N+1.
 type CurrentRun = Arc<Mutex<Arc<AtomicBool>>>;
 
+enum Work {
+    Sql(String),
+    Catalog,
+}
+
 enum RunState {
     NotStarted {
         conn: Arc<Mutex<Db>>,
-        sql: String,
+        work: Work,
         cancelled: Arc<AtomicBool>,
     },
     Running(mpsc::Receiver<Result<Item, Failure>>),
@@ -135,6 +138,57 @@ type Tx = mpsc::Sender<Result<Item, Failure>>;
 
 fn send(tx: &Tx, item: Result<Item, Failure>) -> bool {
     tx.blocking_send(item).is_ok()
+}
+
+fn run_catalog(db: &Db, tx: &Tx, cancelled: &AtomicBool) {
+    let objects: Result<Vec<(String, String)>, Error> =
+        db.prepare(CATALOG_OBJECTS_SQL).and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        });
+    let objects = match objects {
+        Ok(o) => o,
+        Err(e) => {
+            send(tx, Err(failure(&e, CATALOG_OBJECTS_SQL)));
+            return;
+        }
+    };
+    for (name, kind) in objects {
+        if cancelled.load(Ordering::SeqCst) {
+            send(tx, Err(interrupted()));
+            return;
+        }
+        let columns: Result<Vec<Vec<Cell>>, Error> = db
+            .prepare("SELECT name, type, \"notnull\", pk FROM pragma_table_info(?1) ORDER BY cid")
+            .and_then(|mut stmt| {
+                stmt.query_map([&name], |r| {
+                    let notnull: i64 = r.get(2)?;
+                    let pk: i64 = r.get(3)?;
+                    Ok(vec![
+                        Some(r.get::<_, String>(0)?),
+                        Some(r.get::<_, String>(1)?),
+                        Some(if notnull != 0 { "0" } else { "1" }.to_owned()),
+                        Some(if pk > 0 { "1" } else { "0" }.to_owned()),
+                    ])
+                })?
+                .collect()
+            });
+        if cancelled.load(Ordering::SeqCst) {
+            send(tx, Err(interrupted()));
+            return;
+        }
+        let head = [Some("main".to_owned()), Some(name), Some(kind)];
+        let rows = match columns {
+            Ok(rows) if !rows.is_empty() => rows,
+            _ => vec![vec![None; 4]],
+        };
+        for tail in rows {
+            let row = head.iter().cloned().chain(tail).collect();
+            if !send(tx, Ok(Item::Row(row))) {
+                return;
+            }
+        }
+    }
 }
 
 fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
@@ -253,11 +307,20 @@ impl Sqlite {
     }
 
     pub fn query(&self, sql: String) -> ItemStream {
+        self.start(Work::Sql(sql))
+    }
+
+    /// Streams the catalog in the engine's 7-column row contract.
+    pub fn catalog(&self) -> ItemStream {
+        self.start(Work::Catalog)
+    }
+
+    fn start(&self, work: Work) -> ItemStream {
         let cancelled = Arc::new(AtomicBool::new(false));
         *self.current.lock().unwrap_or_else(|e| e.into_inner()) = cancelled.clone();
         let start = RunState::NotStarted {
             conn: self.conn.clone(),
-            sql,
+            work,
             cancelled,
         };
         // Spawning on first poll means a stream dropped unpolled never runs a statement.
@@ -265,12 +328,15 @@ impl Sqlite {
             let mut rx = match state {
                 RunState::NotStarted {
                     conn,
-                    sql,
+                    work,
                     cancelled,
                 } => {
                     let (tx, rx) = mpsc::channel(1);
                     tokio::task::spawn_blocking(move || match conn.lock() {
-                        Ok(db) => run_script(&db, &sql, &tx, &cancelled),
+                        Ok(db) => match work {
+                            Work::Sql(sql) => run_script(&db, &sql, &tx, &cancelled),
+                            Work::Catalog => run_catalog(&db, &tx, &cancelled),
+                        },
                         Err(_) => {
                             send(&tx, Err(lock_failure()));
                         }

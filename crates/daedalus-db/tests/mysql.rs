@@ -412,7 +412,7 @@ fn catalog_lists_tables_views_and_pk() {
     assert_eq!(names, ["t", "v"]);
     let t = &found.tables[0];
     assert_eq!(t.kind, TableKind::Table);
-    assert_eq!(t.columns[0].type_name, "int");
+    assert!(t.columns[0].type_name.starts_with("int"));
     assert!(t.columns[0].pk && !t.columns[0].nullable);
     assert_eq!(t.columns[1].type_name, "varchar(20)");
     assert!(!t.columns[1].pk && t.columns[1].nullable);

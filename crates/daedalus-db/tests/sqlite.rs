@@ -465,3 +465,67 @@ fn catalog_lists_tables_columns_and_pk() {
         ]
     );
 }
+
+impl Rig {
+    fn catalog(&self) -> daedalus_db::catalog::Catalog {
+        self.handle.send(Command::Introspect { session: S });
+        loop {
+            if let Update::Catalog { catalog, .. } = self.next() {
+                return catalog.expect("catalog");
+            }
+        }
+    }
+
+    fn exec(&self, run: u64, sql: &str) {
+        self.run(run, sql, 10);
+        self.collect(run).expect("exec");
+    }
+}
+
+#[test]
+fn catalog_survives_a_broken_view() {
+    let rig = rig(false);
+    rig.exec(1, "create table gone(x integer)");
+    rig.exec(2, "create view orphan as select x from gone");
+    rig.exec(3, "create table keep(id integer primary key)");
+    rig.exec(4, "drop table gone");
+    let catalog = rig.catalog();
+    let tables = &catalog.schemas[0].tables;
+    let names: Vec<_> = tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["keep", "orphan"]);
+    assert!(tables[0].columns[0].pk);
+    assert!(tables[1].columns.is_empty());
+}
+
+#[test]
+fn sqlite_prefixed_user_tables_are_listed() {
+    let rig = rig(false);
+    rig.exec(1, "create table sqlite3_data(x)");
+    rig.exec(2, "create table SQLiteStats(x)");
+    let catalog = rig.catalog();
+    let names: Vec<_> = catalog.schemas[0]
+        .tables
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert_eq!(names, ["SQLiteStats", "sqlite3_data"]);
+}
+
+#[test]
+fn introspect_queued_during_connect_is_answered() {
+    let path = make_db("early");
+    let mut rig = connect(conn(path.to_str().expect("utf8"), false), None);
+    rig.files.push(path);
+    rig.handle.send(Command::Introspect { session: S });
+    assert!(matches!(rig.next(), Update::Connected { .. }));
+    assert!(matches!(rig.next(), Update::Catalog { catalog: Ok(_), .. }));
+}
+
+#[test]
+fn run_sent_during_introspect_runs_after_it_in_order() {
+    let rig = rig(false);
+    rig.handle.send(Command::Introspect { session: S });
+    rig.run(1, "select 1", 10);
+    assert!(matches!(rig.next(), Update::Catalog { .. }));
+    assert_eq!(rig.collect(1).expect("run"), [[Some("1".to_owned())]]);
+}

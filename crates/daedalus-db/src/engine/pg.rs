@@ -20,7 +20,7 @@ CASE WHEN a.attnum IS NULL THEN NULL WHEN a.attnotnull THEN '0' ELSE '1' END, \
 CASE WHEN a.attnum IS NULL THEN NULL \
 WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = t.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) THEN '1' ELSE '0' END \
 FROM (SELECT c.oid, n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema') \
+WHERE c.relkind IN ('r','p','v','m','f') AND NOT c.relispartition AND n.nspname NOT IN ('pg_catalog','information_schema') \
 AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp_%' \
 ORDER BY n.nspname, c.relname LIMIT 5001) t \
 LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped \

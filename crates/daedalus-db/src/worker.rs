@@ -305,46 +305,65 @@ async fn introspect(
     session: SessionId,
 ) -> bool {
     let canceller = driver.canceller();
-    // Detached and bounded so a dead network cannot wedge the session.
-    let cancel_detached = || {
-        let canceller = canceller.clone();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
-        });
+    // Bounded so a dead network cannot wedge the session; an idle backend just ignores the signal.
+    let cancel = || async {
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
     };
-    let collect = async {
-        let mut stream = driver.query(driver.catalog_sql().to_owned());
-        let mut rows = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(Item::Row(row)) => rows.push(row),
-                Ok(_) => {}
-                Err(failure) => return Err(failure.message),
+    let mut stream = driver.catalog();
+    let deadline = Instant::now() + INTROSPECT_TIMEOUT;
+    let mut timed_out = false;
+    let mut resend = tokio::time::interval(CANCEL_RESEND);
+    resend.reset();
+    let mut rows = Vec::new();
+    let mut failed: Option<String> = None;
+    loop {
+        let sleep = async {
+            if timed_out {
+                std::future::pending().await
+            } else {
+                tokio::time::sleep_until(deadline).await
             }
-        }
-        Ok(rows)
-    };
-    let collect = tokio::time::timeout(INTROSPECT_TIMEOUT, collect);
-    tokio::pin!(collect);
-    let rows = loop {
+        };
+        let resend_tick = async {
+            if timed_out {
+                resend.tick().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             biased;
             command = rx.recv() => match command {
                 None | Some(Command::Disconnect { .. }) => {
-                    cancel_detached();
+                    drop(stream);
+                    let canceller = canceller.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
+                    });
                     return false;
                 }
                 Some(c) => queued.push_back(c),
             },
-            result = &mut collect => break result,
+            () = sleep => {
+                cancel().await;
+                timed_out = true;
+                resend.reset();
+            }
+            () = resend_tick => cancel().await,
+            item = stream.next() => match item {
+                Some(Ok(Item::Row(row))) => rows.push(row),
+                Some(Ok(_)) => {}
+                Some(Err(failure)) => {
+                    failed.get_or_insert(failure.message);
+                }
+                None => break,
+            },
         }
-    };
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(_) => {
-            cancel_detached();
-            Err("catalog timed out after 30s".into())
-        }
+    }
+    let rows = if timed_out {
+        Err("catalog timed out after 30s".into())
+    } else {
+        failed.map_or(Ok(rows), Err)
     };
     let catalog = rows.and_then(catalog::from_rows);
     updates
