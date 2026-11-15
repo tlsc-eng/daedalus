@@ -72,16 +72,37 @@ pub(super) enum Tone {
     Danger,
 }
 
-impl Row {
-    /// The node whose chevron turn fades this row in.
-    fn parent(&self) -> Option<NodeKey> {
-        match self {
-            Row::Schema { conn, .. } => Some(NodeKey::Conn(conn.clone())),
-            Row::Table { conn, schema, .. } => Some(NodeKey::Schema(conn.clone(), schema.clone())),
-            Row::Column { parent, .. } | Row::Note { parent, .. } => Some(parent.clone()),
-            Row::Conn { .. } | Row::Error { .. } => None,
-        }
-    }
+/// Each row's opacity: the smallest chevron turn among its ancestors, so a whole subtree fades in together.
+fn fades(rows: &[Row], turn: impl Fn(&NodeKey) -> f32) -> Vec<f32> {
+    let (mut conn, mut schema, mut table) = (1f32, 1f32, 1f32);
+    rows.iter()
+        .map(|row| match row {
+            Row::Conn { key, .. } => {
+                conn = turn(&NodeKey::Conn(key.clone()));
+                1.
+            }
+            Row::Error { .. } => 1.,
+            Row::Schema { conn: c, name, .. } => {
+                schema = conn.min(turn(&NodeKey::Schema(c.clone(), name.clone())));
+                conn
+            }
+            Row::Table {
+                conn: c,
+                schema: s,
+                name,
+                ..
+            } => {
+                table = schema.min(turn(&NodeKey::Table(c.clone(), s.clone(), name.clone())));
+                schema
+            }
+            Row::Column { .. } => table,
+            Row::Note { parent, .. } => match parent {
+                NodeKey::Conn(_) => conn,
+                NodeKey::Schema(..) => schema,
+                NodeKey::Table(..) => table,
+            },
+        })
+        .collect()
 }
 
 fn data_color(name: Option<&str>) -> Option<FolderColor> {
@@ -264,21 +285,21 @@ impl Shell {
             } else {
                 let delay = t.motion.indicator_delay;
                 let rows = rows(&listed, &self.db.meta, &self.db.expanded, delay);
+                let fade = fades(&rows, |n| self.db.turn_of(n, t.motion.fast));
                 div()
                     .id("data-explorer-rows")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(rows.into_iter().map(|row| {
-                        let fade = row.parent().map(|p| self.db.turn_of(&p, t.motion.fast));
+                    .children(rows.into_iter().zip(fade).map(|(row, fade)| {
                         let el = match row {
                             Row::Conn { .. } => self.render_conn_row(row, &listed, cx),
                             Row::Error { key, message } => self.render_error_row(key, message, cx),
                             row => self.render_node_row(row, cx),
                         };
-                        match fade {
-                            Some(f) if f < 1. => div().opacity(f).child(el).into_any_element(),
-                            _ => el,
+                        match fade < 1. {
+                            true => div().opacity(fade).child(el).into_any_element(),
+                            false => el,
                         }
                     }))
                     .into_any_element()
@@ -854,6 +875,28 @@ mod tests {
             out.last(),
             Some(Row::Note { text, tone: Tone::Muted, .. }) if text == "Only the first 5,000 tables are listed"
         ));
+    }
+
+    #[test]
+    fn a_row_fades_with_the_smallest_turn_among_its_ancestors() {
+        let (listed, meta, open) = setup(
+            vec![schema(
+                "main",
+                vec![table(
+                    "t",
+                    TableKind::Table,
+                    vec![column("id", true, false)],
+                )],
+            )],
+            false,
+            &[schema_key("main"), table_key("main", "t")],
+        );
+        let out = rows(&listed, &meta, &open, Duration::ZERO);
+        let turn = |n: &NodeKey| match n {
+            NodeKey::Conn(_) => 0.25,
+            _ => 1.,
+        };
+        assert_eq!(fades(&out, turn), [1., 0.25, 0.25, 0.25]);
     }
 
     #[test]

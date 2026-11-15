@@ -168,15 +168,16 @@ impl DbState {
         Some(Command::Introspect { session })
     }
 
-    /// Drops what was read from a connection and folds its whole tree.
+    /// Drops what was read from a connection and folds its tree below the connection row.
     fn forget_tree(&mut self, key: &str) {
         if let Some(meta) = self.meta.get_mut(key) {
             meta.catalog = None;
             meta.catalog_error = None;
             meta.reading = None;
         }
-        self.expanded.retain(|n| n.conn() != key);
-        self.turning.retain(|n, _| n.conn() != key);
+        let below = |n: &NodeKey| n.conn() == key && !matches!(n, NodeKey::Conn(_));
+        self.expanded.retain(|n| !below(n));
+        self.turning.retain(|n, _| !below(n));
     }
 
     /// Decides what a finished Keychain read means; the secret moves straight into the command.
@@ -284,7 +285,12 @@ impl DbState {
                 }
                 let wanted =
                     meta.catalog.is_none() && self.expanded.contains(&NodeKey::Conn(key.clone()));
-                if wanted { self.introspect(&key) } else { None }
+                if wanted {
+                    self.introspect(&key)
+                } else {
+                    self.meta.get_mut(&key)?.reading = None;
+                    None
+                }
             }
             Update::Failed { session, error } => {
                 if let Some(key) = self.key_of(session).map(str::to_owned) {
@@ -488,9 +494,6 @@ impl Shell {
                 Phase::Idle | Phase::Failed(_) => {
                     if let Some(listed) = listed {
                         self.db_connect(listed, window, cx);
-                        if let Some(meta) = self.db.meta.get_mut(&key) {
-                            meta.reading = Some(Busy::start());
-                        }
                     }
                 }
                 Phase::Connected { .. } if self.db.meta[&key].catalog.is_none() => {
@@ -1251,8 +1254,22 @@ mod tests {
             .insert(NodeKey::Table("g:a".into(), "main".into(), "t".into()));
         db.forget_tree("g:a");
         assert!(db.meta["g:a"].catalog.is_none());
-        assert_eq!(db.expanded.len(), 1);
+        assert_eq!(db.expanded.len(), 2);
+        assert!(db.expanded.contains(&NodeKey::Conn("g:a".into())));
         assert!(db.expanded.contains(&NodeKey::Conn("g:b".into())));
+    }
+
+    #[test]
+    fn collapsed_while_connecting_clears_reading() {
+        let mut db = state_with("g:a", 1);
+        db.meta.get_mut("g:a").unwrap().reading = Some(Busy::start());
+        let cmd = db.on_update(Update::Connected {
+            session: SessionId(1),
+            server: "x".into(),
+        });
+        assert!(cmd.is_none() && db.meta["g:a"].reading.is_none());
+        let (delay, hold) = (Duration::from_millis(250), Duration::from_millis(400));
+        assert!(!db.animating(Instant::now(), delay, hold));
     }
 
     #[test]
