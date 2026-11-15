@@ -239,6 +239,11 @@ impl DbState {
         self.test_done = Some((result, ms));
     }
 
+    /// The console or table that owns `session`; None means the explorer's logic handles it.
+    fn tab_of(&self, session: SessionId) -> Option<DbTabRef> {
+        self.tabs.get(&session).cloned()
+    }
+
     fn send(&self, command: Command) {
         if let Some(handle) = &self.handle {
             handle.send(command);
@@ -371,7 +376,9 @@ impl Shell {
     /// Gives a console or table its own session's updates; the rest go on to the explorer's logic.
     fn db_route_tab(&mut self, update: Update, cx: &mut Context<Self>) -> Option<Update> {
         let session = update.session();
-        let weak = self.db.tabs.get(&session).cloned()?;
+        let Some(weak) = self.db.tab_of(session) else {
+            return Some(update);
+        };
         let failed = matches!(update, Update::Failed { .. });
         match weak.upgrade() {
             Some(tab) => {
@@ -1363,6 +1370,17 @@ fn sheet_motion(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_tab_session_is_taken_from_the_update_stream() {
+        let mut state = DbState::default();
+        state.tabs.insert(
+            SessionId(1),
+            DbTabRef::Console(gpui::WeakEntity::new_invalid()),
+        );
+        assert!(state.tab_of(SessionId(1)).is_some());
+        assert!(state.tab_of(SessionId(2)).is_none());
+    }
+
     use super::*;
 
     fn state_with(key: &str, session: u64) -> DbState {
