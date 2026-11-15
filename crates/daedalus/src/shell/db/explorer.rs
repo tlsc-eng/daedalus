@@ -12,6 +12,7 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 
+use super::sheet::SheetMode;
 use super::{Meta, Phase, conn_key};
 use crate::shell::Shell;
 use crate::shell::menus::shell_item;
@@ -90,10 +91,23 @@ impl Shell {
                     .child("Databases"),
             )
             .child(
-                IconButton::new("db-reload")
-                    .label("Reload")
-                    .tooltip("Reload databases.json")
-                    .on_click(cx.listener(|this, _, _, cx| this.db_reload(cx))),
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        IconButton::new("db-new")
+                            .label("New")
+                            .tooltip("New connection")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.db_open_sheet(SheetMode::New, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("db-reload")
+                            .label("Reload")
+                            .tooltip("Reload databases.json")
+                            .on_click(cx.listener(|this, _, _, cx| this.db_reload(cx))),
+                    ),
             );
         let body = if let Some(error) = self.db.load_error.clone() {
             let reload = Button::new("db-reload-empty", "Reload", ButtonKind::Ghost)
@@ -110,10 +124,14 @@ impl Shell {
                 .map(|s| daedalus_db::for_project(s, root.as_deref()))
                 .unwrap_or_default();
             if self.db.loaded && listed.is_empty() {
+                let new = Button::new("db-new-empty", "New connection", ButtonKind::Secondary)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.db_open_sheet(SheetMode::New, window, cx)
+                    }));
                 empty_state(
                     "No databases",
-                    "Add connections in databases.json, or use New connection once it ships.",
-                    None,
+                    "Add a connection here, or edit databases.json.",
+                    Some(new),
                     cx,
                 )
                 .p(t.space(Space::Lg))
@@ -209,11 +227,11 @@ impl Shell {
             .cloned();
         let toggle = {
             let (key, listed_conn) = (key.clone(), listed_conn.clone());
-            move |this: &mut Shell, cx: &mut Context<Shell>| {
+            move |this: &mut Shell, window: &mut Window, cx: &mut Context<Shell>| {
                 if connected {
                     this.db_disconnect(&key, cx);
                 } else if let Some(l) = listed_conn.clone() {
-                    this.db_connect(l, cx);
+                    this.db_connect(l, window, cx);
                 }
             }
         };
@@ -253,10 +271,10 @@ impl Shell {
             )
             .on_click(cx.listener({
                 let key = key.clone();
-                move |this, event: &ClickEvent, _, cx| {
+                move |this, event: &ClickEvent, window, cx| {
                     this.db.selected = Some(key.clone());
                     if event.click_count() >= 2 {
-                        click_toggle(this, cx);
+                        click_toggle(this, window, cx);
                     }
                     cx.notify();
                 }
@@ -267,9 +285,9 @@ impl Shell {
                     .w(t.ui(10.))
                     .flex_none()
                     .text_color(t.color.content_muted)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         cx.stop_propagation();
-                        marker_toggle(this, cx);
+                        marker_toggle(this, window, cx);
                     }))
                     .child(if connected { "▾" } else { "▸" }),
             )
@@ -327,15 +345,26 @@ impl Shell {
             }),
             false => shell_item("Connect", cx, {
                 let listed = listed.clone();
-                move |this, _, cx| this.db_connect(listed.clone(), cx)
+                move |this, window, cx| this.db_connect(listed.clone(), window, cx)
             }),
         };
         let url = daedalus_db::redacted_url(&listed.conn);
         let items = vec![
             toggle,
+            shell_item("Edit…", cx, {
+                let listed = listed.clone();
+                move |this, window, cx| {
+                    this.db_open_sheet(SheetMode::Edit(listed.clone()), window, cx)
+                }
+            }),
             MenuItem::separator(),
             MenuItem::new("Copy URL", move |_, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+            }),
+            MenuItem::separator(),
+            shell_item("Delete…", cx, {
+                let listed = listed.clone();
+                move |this, window, cx| this.db_delete(listed.clone(), window, cx)
             }),
         ];
         self.open_context_menu(event.position, items, window, cx);

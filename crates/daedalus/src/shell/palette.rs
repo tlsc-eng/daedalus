@@ -568,6 +568,10 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Show explorer", Box::new(actions::ShowExplorer)),
         ("Show git", Box::new(actions::ShowGit)),
         ("Show data", Box::new(actions::ShowData)),
+        (
+            "New database connection",
+            Box::new(actions::NewDatabaseConnection),
+        ),
         ("Problems", Box::new(actions::ShowProblems)),
         ("Go to next problem", Box::new(actions::NextProblem)),
         ("Go to previous problem", Box::new(actions::PrevProblem)),
