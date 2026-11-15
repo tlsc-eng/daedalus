@@ -262,6 +262,14 @@ impl Batch {
         self.current.as_ref().is_some_and(|c| !c.paused)
     }
 
+    pub fn paused(&self) -> bool {
+        self.current.as_ref().is_some_and(|c| c.paused)
+    }
+
+    pub fn idle(&self) -> bool {
+        self.current.is_none()
+    }
+
     pub fn reset(&mut self) {
         self.session = None;
         self.pending.clear();
@@ -484,5 +492,16 @@ mod tests {
         ));
         assert!(b.running());
         assert!(b.fetch_more().is_empty());
+    }
+
+    #[test]
+    fn a_paused_batch_is_not_idle() {
+        let mut b = started(vec![piece("select 1", 0)]);
+        assert!(!b.idle());
+        b.on(columns(0));
+        b.on(rows(0, 1, true));
+        assert!(b.paused());
+        assert!(!b.running());
+        assert!(!b.idle());
     }
 }

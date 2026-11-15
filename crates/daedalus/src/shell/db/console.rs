@@ -301,7 +301,11 @@ impl DbConsoleView {
                 if let Some(message) = error {
                     self.error = Some(ErrorBanner { message, at: None });
                     self.tab = ResultTab::Result;
-                    self.log("The transaction ended unexpectedly.".into(), true);
+                    let text = match open {
+                        true => "The transaction is still open.",
+                        false => "The transaction ended.",
+                    };
+                    self.log(text.into(), true);
                 }
             }
             Update::Catalog { .. } => {}
@@ -569,9 +573,14 @@ impl DbConsoleView {
         if self.manual == manual {
             return;
         }
-        if self.tx_open {
+        let refusal = match (self.tx_open, self.batch.idle()) {
+            (true, _) => Some("Commit or roll back the open transaction first."),
+            (false, false) => Some("Wait for the run to finish or stop it first."),
+            (false, true) => None,
+        };
+        if let Some(message) = refusal {
             self.error = Some(ErrorBanner {
-                message: "Commit or roll back the open transaction first.".into(),
+                message: message.into(),
                 at: None,
             });
             self.tab = ResultTab::Result;
@@ -581,12 +590,16 @@ impl DbConsoleView {
         cx.notify();
     }
 
-    fn end_transaction(&mut self, op: TxOp) {
-        let (Some(session), Some(handle)) = (self.session, &self.handle) else {
+    fn end_transaction(&mut self, op: TxOp, cx: &mut Context<Self>) {
+        let (Some(session), Some(handle)) = (self.session, self.handle.clone()) else {
             return;
         };
         if self.batch.running() || !self.tx_open {
             return;
+        }
+        if self.batch.paused() {
+            let effects = self.batch.stop();
+            self.apply(effects, cx);
         }
         handle.send(Command::Transaction { session, op });
     }
@@ -652,7 +665,7 @@ impl DbConsoleView {
             let end = |id: &'static str, label: &'static str, op: TxOp| match tx_ready {
                 true => Button::new(id, label, ButtonKind::Secondary)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.end_transaction(op);
+                        this.end_transaction(op, cx);
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -667,11 +680,11 @@ impl DbConsoleView {
                 .gap(t.space(Space::Sm))
                 .child(pick("db-console-auto", "Auto", !manual))
                 .child(pick("db-console-manual", "Manual", manual))
-                .when(manual, |el| {
+                .when(manual || self.tx_open, |el| {
                     el.child(end("db-console-commit", "Commit", TxOp::Commit))
                         .child(end("db-console-rollback", "Roll Back", TxOp::Rollback))
                 })
-                .when(manual && self.tx_open, |el| {
+                .when(self.tx_open, |el| {
                     el.child(tag("Transaction open", t.color.warning))
                 })
         });
