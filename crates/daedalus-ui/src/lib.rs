@@ -1,6 +1,7 @@
 mod assets;
 mod components;
 mod fonts;
+mod grid;
 mod icons;
 mod input;
 mod logo;
@@ -15,6 +16,7 @@ pub use components::{
     Badge, Button, ButtonKind, DotState, IconButton, ListRow, SegmentedControl, StatusDot, Tab,
     TabBar, Tooltip, empty_state,
 };
+pub use grid::{DataGrid, GridColumn, GridEvent};
 pub use icons::{FileIcon, ICON_SIZE, file_icon, icon_for};
 pub use input::{InputEvent, TextInput};
 pub use logo::{Glyph, Lockup};
@@ -31,6 +33,7 @@ pub fn init(cx: &mut App) {
     fonts::register(cx);
     input::init(cx);
     menu::init(cx);
+    grid::init(cx);
     let appearance = system_appearance(cx);
     cx.set_global(Theme::new(appearance, motion::system_reduce_motion()));
 }
