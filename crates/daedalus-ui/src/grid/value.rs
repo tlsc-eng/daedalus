@@ -5,6 +5,9 @@ pub(crate) const PANEL_BYTES: usize = 64 * 1024;
 // A hex dump is about four times longer than its bytes, so it gets a tighter cap.
 pub(crate) const HEX_BYTES: usize = 4096;
 
+// Deep nesting multiplies indentation, so the pretty output needs its own bound.
+pub(crate) const PRETTY_BYTES: usize = 4 * PANEL_BYTES;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueKind {
     Null,
@@ -44,11 +47,14 @@ pub(crate) fn inspect(value: Option<&str>) -> Inspected {
         && v.len() <= PANEL_BYTES
         && serde_json::from_str::<serde_json::Value>(v).is_ok()
     {
-        return Inspected {
-            kind: ValueKind::Json,
-            body: pretty_json(trimmed).into(),
-            summary: format!("json · {}", human_bytes(v.len())).into(),
-        };
+        let pretty = pretty_json(trimmed);
+        if pretty.len() <= PRETTY_BYTES {
+            return Inspected {
+                kind: ValueKind::Json,
+                body: pretty.into(),
+                summary: format!("json · {}", human_bytes(v.len())).into(),
+            };
+        }
     }
     let mut summary = format!("text · {}", human_bytes(v.len()));
     if v.len() > PANEL_BYTES {
@@ -287,5 +293,24 @@ mod tests {
         v.push('1');
         v.push(']');
         assert_eq!(inspect(Some(&v)).kind, ValueKind::Text);
+    }
+
+    #[test]
+    fn inspect_deeply_nested_json_stays_bounded() {
+        let depth = 100;
+        let mut v = String::new();
+        while v.len() + depth < PANEL_BYTES / 2 {
+            for _ in 0..depth {
+                v.push('[');
+            }
+            for _ in 0..depth {
+                v.push(']');
+            }
+            v.push(',');
+        }
+        let v = format!("[{}[]]", v);
+        let i = inspect(Some(&v));
+        assert_eq!(i.kind, ValueKind::Text);
+        assert!(i.body.len() <= PRETTY_BYTES);
     }
 }

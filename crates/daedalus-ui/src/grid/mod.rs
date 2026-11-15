@@ -1030,7 +1030,7 @@ impl Render for DataGrid {
         {
             window.focus(&self.focus);
         }
-        let shown = self.inspected();
+        let shown = self.value_open.then(|| self.inspected()).flatten();
         let m = self.metrics(window, cx);
         let t = m.theme.clone();
         if self.dim.running() {
