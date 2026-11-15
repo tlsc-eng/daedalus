@@ -1,0 +1,334 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
+use rusqlite::fallible_iterator::FallibleIterator;
+use rusqlite::limits::Limit;
+use rusqlite::types::ValueRef;
+use rusqlite::{Batch, Connection as Db, Error, InterruptHandle, OpenFlags};
+use tokio::sync::mpsc;
+
+use super::{Failure, Item, ItemStream};
+use crate::config::Connection;
+use crate::value::{Cell, Column};
+
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct Sqlite {
+    conn: Arc<Mutex<Db>>,
+    interrupt: Arc<InterruptHandle>,
+    current: CurrentRun,
+}
+
+#[derive(Clone)]
+pub struct SqliteCanceller {
+    interrupt: Arc<InterruptHandle>,
+    current: CurrentRun,
+}
+
+// Each query() installs a fresh flag so a late cancel for run N cannot be cleared by run N+1.
+type CurrentRun = Arc<Mutex<Arc<AtomicBool>>>;
+
+enum RunState {
+    NotStarted {
+        conn: Arc<Mutex<Db>>,
+        sql: String,
+        cancelled: Arc<AtomicBool>,
+    },
+    Running(mpsc::Receiver<Result<Item, Failure>>),
+}
+
+fn resolve(database: &str, root: Option<&Path>) -> Result<PathBuf, String> {
+    let path = Path::new(database);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    match root {
+        Some(root) => Ok(root.join(path)),
+        None => Err("a relative SQLite path needs a project".into()),
+    }
+}
+
+fn open(path: &Path, read_only: bool) -> Result<Db, Error> {
+    let mode = if read_only {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+    let db = Db::open_with_flags(path, mode | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    db.busy_timeout(BUSY_TIMEOUT)?;
+    if read_only {
+        // ATTACH inherits the read-only open flag, so query_only mostly guards temp tables.
+        db.pragma_update(None, "query_only", true)?;
+        // Blocks ATTACH and VACUUM INTO, which could otherwise write a file even with query_only on.
+        db.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+    }
+    Ok(db)
+}
+
+fn cell(value: ValueRef<'_>) -> Cell {
+    match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => {
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("\\x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            Some(hex)
+        }
+    }
+}
+
+const INTERRUPTED: &str = "interrupted";
+
+fn failure(e: &Error, script: &str) -> Failure {
+    match e {
+        // The error carries the unprepared tail of the script, so the offset is relative to it.
+        Error::SqlInputError {
+            msg, sql, offset, ..
+        } => Failure {
+            message: msg.clone(),
+            position: script
+                .len()
+                .checked_sub(sql.len())
+                .zip(usize::try_from(*offset).ok())
+                .map(|(base, o)| {
+                    let abs = base + o;
+                    script.char_indices().take_while(|(i, _)| *i < abs).count() + 1
+                }),
+        },
+        _ => Failure {
+            message: e.to_string(),
+            position: None,
+        },
+    }
+}
+
+fn interrupted() -> Failure {
+    Failure {
+        message: INTERRUPTED.into(),
+        position: None,
+    }
+}
+
+fn lock_failure() -> Failure {
+    Failure {
+        message: "the SQLite connection is unavailable".into(),
+        position: None,
+    }
+}
+
+type Tx = mpsc::Sender<Result<Item, Failure>>;
+
+fn send(tx: &Tx, item: Result<Item, Failure>) -> bool {
+    tx.blocking_send(item).is_ok()
+}
+
+fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
+    let mut batch = Batch::new(db, sql);
+    loop {
+        // SQLite drops an interrupt that lands between statements, so the flag is the source of truth.
+        if cancelled.load(Ordering::SeqCst) {
+            send(tx, Err(interrupted()));
+            return;
+        }
+        let mut stmt = match batch.next() {
+            Ok(Some(stmt)) => stmt,
+            Ok(None) => return,
+            Err(e) => {
+                send(tx, Err(failure(&e, sql)));
+                return;
+            }
+        };
+        let width = stmt.column_count();
+        if width == 0 {
+            let before = db.total_changes();
+            match stmt.execute([]) {
+                Ok(changes) => {
+                    // changes() keeps the previous statement's count after DDL.
+                    let affected = if db.total_changes() != before {
+                        changes as u64
+                    } else {
+                        0
+                    };
+                    if !send(tx, Ok(Item::Complete(affected))) {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    send(tx, Err(failure(&e, sql)));
+                    return;
+                }
+            }
+            continue;
+        }
+        let columns: Vec<Column> = stmt
+            .columns()
+            .map(|c| Column {
+                name: c.name().to_owned(),
+                type_name: c.decl_type().map(str::to_lowercase).unwrap_or_default(),
+                table: None,
+            })
+            .collect();
+        if !send(tx, Ok(Item::Columns(columns))) {
+            return;
+        }
+        let mut rows = match stmt.query([]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                send(tx, Err(failure(&e, sql)));
+                return;
+            }
+        };
+        let mut count = 0u64;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                send(tx, Err(interrupted()));
+                return;
+            }
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let cells = (0..width)
+                        .map(|i| row.get_ref(i).map(cell).unwrap_or(None))
+                        .collect();
+                    if !send(tx, Ok(Item::Row(cells))) {
+                        return;
+                    }
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    send(tx, Err(failure(&e, sql)));
+                    return;
+                }
+            }
+        }
+        if !send(tx, Ok(Item::Complete(count))) {
+            return;
+        }
+    }
+}
+
+impl Sqlite {
+    pub async fn connect(
+        conn: &Connection,
+        root: Option<&Path>,
+    ) -> Result<(Sqlite, String), String> {
+        let path = resolve(&conn.database, root)?;
+        let read_only = conn.read_only;
+        let shown = path.display().to_string();
+        let db = tokio::task::spawn_blocking(move || open(&path, read_only))
+            .await
+            .map_err(|_| "opening the SQLite file failed".to_string())?
+            .map_err(|e| format!("{shown}: {e}"))?;
+        let interrupt = Arc::new(db.get_interrupt_handle());
+        Ok((
+            Sqlite {
+                conn: Arc::new(Mutex::new(db)),
+                interrupt,
+                current: Arc::new(Mutex::new(Arc::new(AtomicBool::new(false)))),
+            },
+            format!("SQLite {}", rusqlite::version()),
+        ))
+    }
+
+    pub fn canceller(&self) -> SqliteCanceller {
+        SqliteCanceller {
+            interrupt: self.interrupt.clone(),
+            current: self.current.clone(),
+        }
+    }
+
+    pub fn query(&self, sql: String) -> ItemStream {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = cancelled.clone();
+        let start = RunState::NotStarted {
+            conn: self.conn.clone(),
+            sql,
+            cancelled,
+        };
+        // Spawning on first poll means a stream dropped unpolled never runs a statement.
+        futures::stream::unfold(start, |state| async move {
+            let mut rx = match state {
+                RunState::NotStarted {
+                    conn,
+                    sql,
+                    cancelled,
+                } => {
+                    let (tx, rx) = mpsc::channel(1);
+                    tokio::task::spawn_blocking(move || match conn.lock() {
+                        Ok(db) => run_script(&db, &sql, &tx, &cancelled),
+                        Err(_) => {
+                            send(&tx, Err(lock_failure()));
+                        }
+                    });
+                    rx
+                }
+                RunState::Running(rx) => rx,
+            };
+            rx.recv().await.map(|item| (item, RunState::Running(rx)))
+        })
+        .boxed()
+    }
+}
+
+impl SqliteCanceller {
+    pub async fn cancel(&self) {
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, Ordering::SeqCst);
+        self.interrupt.interrupt();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_cancel_does_not_hit_next_query() {
+        let path =
+            std::env::temp_dir().join(format!("daedalus-sqlite-unit-{}.db", std::process::id()));
+        Db::open(&path).expect("create");
+        let conn = Connection {
+            id: "t".into(),
+            name: "t".into(),
+            engine: crate::config::Engine::Sqlite,
+            host: String::new(),
+            port: None,
+            database: path.to_str().expect("utf8").into(),
+            user: String::new(),
+            tls: crate::config::Tls::Prefer,
+            ca_file: None,
+            read_only: false,
+            production: false,
+            claude: false,
+            projects: Vec::new(),
+            save_password: false,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let items = rt.block_on(async {
+            let (db, _) = Sqlite::connect(&conn, None).await.expect("connect");
+            db.canceller().cancel().await;
+            db.query("select 1".into()).collect::<Vec<_>>().await
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            items.as_slice(),
+            [
+                Ok(Item::Columns(_)),
+                Ok(Item::Row(_)),
+                Ok(Item::Complete(1))
+            ]
+        ));
+    }
+}
