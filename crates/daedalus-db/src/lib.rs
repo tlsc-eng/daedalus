@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod classify;
 pub mod config;
+pub mod edit;
 pub mod engine;
 pub mod secret;
 pub mod value;
