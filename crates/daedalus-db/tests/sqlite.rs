@@ -935,4 +935,10 @@ fn disconnect_during_apply_changes_nothing() {
         scalar(&second, 1, "select x from t"),
         vec![Some("0".into())]
     );
+    second.run(2, "update t set x = 7 where id = 1", 100);
+    assert!(second.collect(2).is_ok());
+    assert_eq!(
+        scalar(&second, 3, "select x from t"),
+        vec![Some("7".into())]
+    );
 }

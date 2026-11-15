@@ -4,8 +4,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{FilterExt, Targets};
 use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// A log larger than this is moved to `<name>.log.1` at startup.
 const MAX_LOG: u64 = 5 * 1024 * 1024;
@@ -28,36 +33,44 @@ pub fn init(path: &Path, env: &str) -> io::Result<()> {
     } else {
         BoxMakeWriter::new(file)
     };
-    let filter =
-        quiet_drivers(EnvFilter::try_from_env(env).unwrap_or_else(|_| EnvFilter::new("info")));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let env_filter = EnvFilter::try_from_env(env).unwrap_or_else(|_| EnvFilter::new("info"));
+    let layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(false)
+        .with_filter(env_filter.and(driver_cap()));
+    tracing_subscriber::registry()
+        .with(layer)
         .try_init()
         .map_err(io::Error::other)
 }
 
-/// Added last so no DAEDALUS_LOG value can make a driver log SQL text or bound cell values.
-fn quiet_drivers(filter: EnvFilter) -> EnvFilter {
-    ["tokio_postgres=warn", "mysql_async=warn", "rusqlite=warn"]
-        .into_iter()
-        .fold(filter, |f, d| {
-            f.add_directive(d.parse().expect("static directive"))
-        })
+/// A separate filter that must also pass, so no DAEDALUS_LOG target (however specific) lets a driver log SQL or cell values.
+fn driver_cap() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_target("tokio_postgres", LevelFilter::WARN)
+        .with_target("mysql_async", LevelFilter::WARN)
+        .with_target("rusqlite", LevelFilter::WARN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Level;
 
     #[test]
-    fn debug_cannot_unmute_the_db_drivers() {
-        let filter = quiet_drivers(EnvFilter::new("debug"));
-        let text = filter.to_string();
-        assert!(text.contains("tokio_postgres=warn"), "{text}");
-        assert!(text.contains("mysql_async=warn"), "{text}");
-        assert!(text.contains("rusqlite=warn"), "{text}");
+    fn no_env_value_unmutes_the_db_drivers() {
+        let cap = driver_cap();
+        for target in [
+            "tokio_postgres",
+            "tokio_postgres::query",
+            "mysql_async::conn",
+            "rusqlite",
+        ] {
+            assert!(!cap.would_enable(target, &Level::DEBUG), "{target}");
+            assert!(cap.would_enable(target, &Level::WARN), "{target}");
+        }
+        assert!(cap.would_enable("daedalus", &Level::TRACE));
     }
 
     #[test]
