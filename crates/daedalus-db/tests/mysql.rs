@@ -283,28 +283,24 @@ fn cancel_before_start_does_not_execute() {
     let rig = rig(false);
     rig.run(1, "create temporary table cbs (x int)", 100, None);
     scalar(&rig, 1);
-    for i in 0..5u64 {
-        let ins = i * 2 + 2;
-        rig.run(ins, "insert into cbs select sleep(1)", 100, None);
-        cancel(&rig, ins);
-        loop {
-            match rig.next() {
-                Update::Done { run, .. } if run == RunId(ins) => break,
-                Update::RunError { run, message, .. } if run == RunId(ins) => {
-                    assert!(
-                        message.contains("cancel") || message.contains("interrupted"),
-                        "{message}"
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let started = Instant::now();
-        rig.run(ins + 1, "select count(*) from cbs", 100, None);
-        assert_eq!(scalar(&rig, ins + 1), Some("0".into()));
-        assert!(started.elapsed() < Duration::from_millis(500));
+    rig.run(2, "select sleep(2)", 100, None);
+    std::thread::sleep(Duration::from_millis(300));
+    let targets: Vec<u64> = (0..5).map(|i| 10 + i).collect();
+    for run in &targets {
+        rig.run(*run, "insert into cbs values (1)", 100, None);
+        cancel(&rig, *run);
     }
+    let mut pending: Vec<u64> = targets.iter().copied().chain([2]).collect();
+    while !pending.is_empty() {
+        match rig.next() {
+            Update::Done { run, .. } | Update::RunError { run, .. } => {
+                pending.retain(|r| RunId(*r) != run);
+            }
+            _ => {}
+        }
+    }
+    rig.run(30, "select count(*) from cbs", 100, None);
+    assert_eq!(scalar(&rig, 30), Some("0".into()));
 }
 
 const SERIES: &str = "select 1 as g \

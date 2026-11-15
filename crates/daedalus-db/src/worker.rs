@@ -676,10 +676,8 @@ async fn end_tx(
 ) -> Ended {
     let statements = tx_sql(engine, op);
     let first = exec(driver, statements[0], rx, queued).await;
-    if op == TxOp::Commit {
-        if let Err(e) = first {
-            return Ended::Failed(e);
-        }
+    if let (TxOp::Commit, Err(e)) = (op, &first) {
+        return Ended::Failed(e.clone());
     }
     for sql in &statements[1..] {
         if exec(driver, sql, rx, queued).await.is_err() {

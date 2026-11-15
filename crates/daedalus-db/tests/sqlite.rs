@@ -411,27 +411,28 @@ fn cancel_before_start_does_not_execute() {
     let rig = rig(false);
     rig.run(1, "create table t(x)", 100);
     assert!(rig.collect(1).is_ok());
-    let mut completed = 0usize;
-    for i in 0..20u64 {
-        let run = 2 + i * 2;
-        rig.run(run, "insert into t values (1)", 100);
-        rig.cancel(run);
-        loop {
-            match rig.next() {
-                Update::Done {
-                    run: r, truncated, ..
-                } if r == RunId(run) => {
-                    if !truncated {
-                        completed += 1;
-                    }
-                    break;
-                }
-                Update::RunError { run: r, .. } if r == RunId(run) => break,
-                _ => {}
-            }
-        }
-        assert_eq!(row_count(&rig, run + 1), completed);
+    rig.run(
+        2,
+        "select count(*) from (with recursive c(x) as (select 1 union all select x+1 from c where x < 1000000000) select x from c)",
+        100,
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let targets: Vec<u64> = (0..5).map(|i| 10 + i).collect();
+    for run in &targets {
+        rig.run(*run, "insert into t values (1)", 100);
+        rig.cancel(*run);
     }
+    rig.cancel(2);
+    let mut pending: Vec<u64> = targets.iter().copied().chain([2]).collect();
+    while !pending.is_empty() {
+        match rig.next() {
+            Update::Done { run, .. } | Update::RunError { run, .. } => {
+                pending.retain(|r| RunId(*r) != run);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(row_count(&rig, 30), 0);
 }
 
 #[test]
