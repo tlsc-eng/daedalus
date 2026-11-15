@@ -31,10 +31,15 @@ const KEEP_CORRUPT: usize = 5;
 /// Writes via temp file and rename so a crash never leaves a half-written workspace.
 pub fn save(path: &Path, workspace: &Workspace) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
+    // A stale temp may be world-readable or held open by another process.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", tmp.display())),
+    }
     let mut out = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
@@ -152,6 +157,26 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_temp_file_is_replaced_not_reused() {
+        let dir = {
+            let d =
+                std::env::temp_dir().join(format!("daedalus-persist-stale-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let path = dir.join("workspace.json");
+        let tmp = path.with_extension("json.tmp");
+        let link = dir.join("stale-link");
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&tmp, &link).unwrap();
+        save(&path, &Workspace::default()).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"stale");
         fs::remove_dir_all(&dir).unwrap();
     }
 
