@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1226,8 +1227,19 @@ pub fn revert_file_bytes(
         ".{}.daedalus-revert",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    std::fs::write(&tmp, contents)?;
-    if let Ok(meta) = std::fs::metadata(&path) {
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let meta = std::fs::metadata(&path).ok();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    if let Some(meta) = &meta {
+        // Created owner-only files must never exist wider than the target, even briefly.
+        opts.mode(meta.permissions().mode() & 0o7777);
+    }
+    opts.open(&tmp)?.write_all(contents)?;
+    if let Some(meta) = &meta {
         std::fs::set_permissions(&tmp, meta.permissions())?;
     }
     std::fs::rename(&tmp, &path)?;
@@ -3067,6 +3079,28 @@ mod tests {
         assert!(err.is::<Cancelled>(), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(2));
         stopper.join().unwrap();
+    }
+
+    #[test]
+    fn reverting_owner_only_file_never_creates_wider_temp() {
+        if !available() {
+            return;
+        }
+        let dir = committed_repo("revert-perms", "a\n");
+        let path = dir.join("f.txt");
+        let backup = dir.join("backup");
+        std::fs::write(&path, "b\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let tmp = dir.join(".f.txt.daedalus-revert");
+        let other = dir.join("other");
+        std::fs::write(&other, "old").unwrap();
+        std::fs::hard_link(&other, &tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        revert_file(&dir, Path::new("f.txt"), "b\n", "a\n", &backup).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old");
     }
 
     #[test]
