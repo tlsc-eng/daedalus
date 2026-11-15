@@ -136,6 +136,14 @@ mod tests {
     }
 
     #[test]
+    fn bare_cr_comment_is_refused_on_read_only() {
+        assert!(matches!(
+            check("select 1; -- x\r delete from t", &target(true, false)),
+            Gate::Refuse(m) if m.contains("can't tell")
+        ));
+    }
+
+    #[test]
     fn transaction_statements_are_refused() {
         let sql = "begin";
         assert_eq!(split(sql, Engine::Postgres)[0].kind, Kind::Transaction);

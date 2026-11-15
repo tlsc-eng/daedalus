@@ -89,7 +89,7 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 .enumerate()
                 .any(|(k, x)| *x == b'\r' && b.get(start + k + 1) != Some(&b'\n'))
             {
-                out.push((Tok::Hazard, start..start + 2));
+                out.push((Tok::Hazard, start..i));
             }
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
@@ -901,7 +901,7 @@ mod tests {
     fn random_input_never_panics() {
         let alphabet: Vec<&str> = vec![
             "select", "from", "'", "\"", "`", "$$", "$a$", ";", "--", "/*", "*/", "\n", " ", "(",
-            ")", "=", "é", "$1", "delete", "explain", "pragma",
+            ")", "=", "é", "$1", "delete", "explain", "pragma", "\r", "#",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         for _ in 0..300 {
@@ -912,10 +912,14 @@ mod tests {
                     .wrapping_add(1442695040888963407);
                 sql.push_str(alphabet[(seed >> 33) as usize % alphabet.len()]);
             }
-            for s in split(&sql, PG) {
-                assert!(sql.is_char_boundary(s.range.start) && sql.is_char_boundary(s.range.end));
+            for e in [PG, MY, LITE] {
+                for s in split(&sql, e) {
+                    assert!(
+                        sql.is_char_boundary(s.range.start) && sql.is_char_boundary(s.range.end)
+                    );
+                }
+                let _ = at(&sql, sql.len() / 2, e);
             }
-            let _ = at(&sql, sql.len() / 2, PG);
         }
     }
 
@@ -973,6 +977,9 @@ mod tests {
         assert_eq!(kind_with(pg, LITE), Kind::Unknown);
         assert_eq!(kind_with(my, MY), Kind::Unknown);
         assert_eq!(kind_with(hash, MY), Kind::Unknown);
+        assert_eq!(kind_with("#é\r select 1", MY), Kind::Unknown);
+        let k = kinds("select 1; -- x\r delete from t", PG);
+        assert_eq!(k.last(), Some(&Kind::Unknown));
     }
 
     #[test]
