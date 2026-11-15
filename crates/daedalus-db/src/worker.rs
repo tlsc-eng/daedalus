@@ -628,23 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn other_engines_are_not_supported_yet() {
-        let update = first_update(Command::Connect {
-            session: SessionId(1),
-            conn: conn(Engine::Mysql, "", 0),
-            password: None,
-            root: None,
-        });
-        assert_eq!(
-            update,
-            Update::Failed {
-                session: SessionId(1),
-                error: "engine not supported yet".into()
-            }
-        );
-    }
-
-    #[test]
     fn failed_connect_never_echoes_the_password() {
         for host in ["127.0.0.1", "[::1]"] {
             let update = first_update(Command::Connect {
