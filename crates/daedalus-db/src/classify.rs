@@ -83,6 +83,14 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 .iter()
                 .position(|x| *x == b'\n')
                 .map_or(b.len(), |p| i + p);
+            // Postgres ends the comment at a bare \r, so the scanner would hide what follows.
+            if b[start..i]
+                .iter()
+                .enumerate()
+                .any(|(k, x)| *x == b'\r' && b.get(start + k + 1) != Some(&b'\n'))
+            {
+                out.push((Tok::Hazard, start..start + 2));
+            }
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
             if engine == Engine::Mysql
@@ -954,6 +962,24 @@ mod tests {
             kind_with("select * into outfile '/tmp/x' from t", MY),
             Kind::Write
         );
+    }
+
+    #[test]
+    fn bare_cr_in_line_comment_is_unknown() {
+        let pg = "select 1 where 1=1 -- x\r or nextval('s') > 0";
+        let my = "select 1 where 1=1 -- x\r or sleep(1) > 0";
+        let hash = "select 1 where 1=1 # x\r or sleep(1) > 0";
+        assert_eq!(kind_with(pg, PG), Kind::Unknown);
+        assert_eq!(kind_with(pg, LITE), Kind::Unknown);
+        assert_eq!(kind_with(my, MY), Kind::Unknown);
+        assert_eq!(kind_with(hash, MY), Kind::Unknown);
+    }
+
+    #[test]
+    fn crlf_line_comment_still_classifies() {
+        for e in [PG, MY, LITE] {
+            assert_eq!(kind_with("-- note\r\nselect 1", e), Kind::Read);
+        }
     }
 
     #[test]
