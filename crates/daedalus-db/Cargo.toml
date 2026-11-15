@@ -22,3 +22,4 @@ rustls-native-certs.workspace = true
 tree-sitter.workspace = true
 tree-sitter-sequel.workspace = true
 rusqlite.workspace = true
+mysql_async.workspace = true
