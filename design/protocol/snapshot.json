@@ -71,14 +71,17 @@
         ],
         "highlight": 0,
         "partial": false
-      }
+      },
+      "running": "Claude"
     },
     {
       "pane": 124,
       "project": "/Users/jason/code/daedalus",
       "title": "zsh",
+      "program": "cargo",
       "rows": 24,
-      "cols": 80
+      "cols": 80,
+      "running": "cargo"
     }
   ]
 }

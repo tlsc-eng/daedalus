@@ -42,6 +42,7 @@ pub(super) struct TerminalInput {
     pub dialog: Option<Dialog>,
     pub suggestion: Option<String>,
     pub background: Option<u16>,
+    pub running: Option<String>,
 }
 
 pub(super) struct SessionInput {
@@ -152,6 +153,7 @@ fn terminal(input: &TerminalInput) -> Option<Terminal> {
         dialog: input.dialog.clone(),
         suggestion: input.suggestion.clone(),
         background: input.background,
+        running: input.running.clone(),
     })
 }
 
@@ -281,6 +283,7 @@ impl Shell {
                     dialog,
                     suggestion,
                     background: view.claude_waiting(),
+                    running: view.running_program(),
                 }
             })
             .collect();
@@ -368,6 +371,7 @@ mod tests {
             dialog: None,
             suggestion: None,
             background: None,
+            running: None,
         }
     }
 
@@ -413,6 +417,15 @@ mod tests {
         let got = to_snapshot(vec![window(Vec::new(), vec![running, term(Some(2))])]);
         assert_eq!(got.terminals[0].claude, Some(SessionState::Running));
         assert_eq!(got.terminals[1].claude, None);
+    }
+
+    #[test]
+    fn a_terminal_carries_its_running_program() {
+        let mut busy = term(Some(1));
+        busy.running = Some("vim".into());
+        let got = to_snapshot(vec![window(Vec::new(), vec![busy, term(Some(2))])]);
+        assert_eq!(got.terminals[0].running.as_deref(), Some("vim"));
+        assert_eq!(got.terminals[1].running, None);
     }
 
     #[test]
