@@ -347,14 +347,18 @@ async fn session_task(
                         }
                         if !tx_open {
                             match begin_tx(&driver, conn.engine, &mut rx, &mut queued).await {
-                                Ok(()) => {
+                                Began::Done => {
                                     tx_open = true;
                                     begun = true;
                                     if !send_tx(&updates, session, true, None).await {
                                         return;
                                     }
                                 }
-                                Err(message) => {
+                                Began::Lost => {
+                                    let _ = updates.send(lost_autocommit(session)).await;
+                                    return;
+                                }
+                                Began::Failed(message) => {
                                     if !send_run_error(&updates, session, run, message).await {
                                         return;
                                     }
@@ -447,11 +451,15 @@ async fn session_task(
                     TxOp::Begin if conn.read_only => (false, Some(READ_ONLY_NO_TX.to_owned())),
                     TxOp::Begin => {
                         match begin_tx(&driver, conn.engine, &mut rx, &mut queued).await {
-                            Ok(()) => {
+                            Began::Done => {
                                 tx_open = true;
                                 (true, None)
                             }
-                            Err(e) => (false, Some(e)),
+                            Began::Lost => {
+                                let _ = updates.send(lost_autocommit(session)).await;
+                                return;
+                            }
+                            Began::Failed(e) => (false, Some(e)),
                         }
                     }
                     TxOp::Rollback => {
@@ -646,18 +654,29 @@ async fn exec_all(
     Ok(())
 }
 
+enum Began {
+    Done,
+    Failed(String),
+    Lost,
+}
+
 async fn begin_tx(
     driver: &Driver,
     engine: Engine,
     rx: &mut mpsc::UnboundedReceiver<Command>,
     queued: &mut VecDeque<Command>,
-) -> Result<(), String> {
-    let result = exec_all(driver, tx_sql(engine, TxOp::Begin), rx, queued).await;
-    if result.is_err() && engine == Engine::Mysql {
-        // A half-applied begin must not leave autocommit off.
-        let _ = exec(driver, MYSQL_AUTOCOMMIT_ON, rx, queued).await;
+) -> Began {
+    match exec_all(driver, tx_sql(engine, TxOp::Begin), rx, queued).await {
+        Ok(()) => Began::Done,
+        Err(e) if engine == Engine::Mysql => {
+            // A half-applied begin must not leave autocommit off.
+            match exec(driver, MYSQL_AUTOCOMMIT_ON, rx, queued).await {
+                Ok(()) => Began::Failed(e),
+                Err(_) => Began::Lost,
+            }
+        }
+        Err(e) => Began::Failed(e),
     }
-    result
 }
 
 enum Ended {
@@ -666,7 +685,7 @@ enum Ended {
     Lost,
 }
 
-/// A failed COMMIT keeps the transaction open, so autocommit is only restored after it succeeds; ROLLBACK always restores it.
+/// Restoring autocommit commits an open MySQL transaction, so it only runs after a successful COMMIT or ROLLBACK; a failed MySQL ROLLBACK loses the session instead.
 async fn end_tx(
     driver: &Driver,
     engine: Engine,
@@ -676,15 +695,19 @@ async fn end_tx(
 ) -> Ended {
     let statements = tx_sql(engine, op);
     let first = exec(driver, statements[0], rx, queued).await;
-    if let (TxOp::Commit, Err(e)) = (op, &first) {
-        return Ended::Failed(e.clone());
+    if let Err(e) = &first {
+        return if op == TxOp::Rollback && statements.len() > 1 {
+            Ended::Lost
+        } else {
+            Ended::Failed(e.clone())
+        };
     }
     for sql in &statements[1..] {
         if exec(driver, sql, rx, queued).await.is_err() {
             return Ended::Lost;
         }
     }
-    first.map_or_else(Ended::Failed, |()| Ended::Done)
+    Ended::Done
 }
 
 /// Returns false when the session should end.

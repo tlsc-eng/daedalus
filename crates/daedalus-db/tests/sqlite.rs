@@ -657,3 +657,48 @@ fn engine_ended_transaction_is_reported() {
     assert_eq!(next_tx(&rig), (false, None));
     assert_eq!(row_count(&rig, 5), 0);
 }
+
+#[test]
+fn cancel_queued_during_connect_never_executes() {
+    for _ in 0..20 {
+        let path = make_db("idle");
+        rusqlite::Connection::open(&path)
+            .expect("open")
+            .execute("create table t(x)", [])
+            .expect("create");
+        let (tx, updates) = async_channel::unbounded();
+        let handle = start(tx);
+        handle.send(Command::Connect {
+            session: S,
+            conn: conn(path.to_str().expect("utf8"), false),
+            password: None,
+            root: None,
+        });
+        handle.send(Command::Run {
+            session: S,
+            run: RunId(1),
+            sql: "insert into t values (1)".into(),
+            page: 100,
+            timeout: None,
+            mode: RunMode::Auto,
+        });
+        handle.send(Command::Cancel {
+            session: S,
+            run: RunId(1),
+        });
+        let rig = Rig {
+            handle,
+            updates,
+            files: vec![path.clone()],
+        };
+        assert!(matches!(rig.next(), Update::Connected { .. }));
+        assert!(matches!(
+            rig.next(),
+            Update::Done {
+                truncated: true,
+                ..
+            }
+        ));
+        assert_eq!(row_count(&rig, 2), 0);
+    }
+}
