@@ -69,6 +69,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 const ALIAS_STOPS: &[&str] = &[
+    ",",
     "where",
     "on",
     "join",
@@ -119,118 +120,186 @@ fn ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
-fn qualifier(before: &str) -> Option<String> {
+/// The last identifier of `s`, quotes stripped, and what precedes it.
+fn last_ident(s: &str) -> Option<(&str, &str)> {
+    match s.chars().next_back() {
+        Some(q @ ('"' | '`')) => {
+            let inner = &s[..s.len() - 1];
+            let open = inner.rfind(q)?;
+            Some((&inner[open + 1..], &inner[..open]))
+        }
+        _ => {
+            let at = s.trim_end_matches(ident_char).len();
+            Some((&s[at..], &s[..at]))
+        }
+    }
+}
+
+/// The optional schema and the name before the `.` that precedes the word being typed.
+fn qualifier(before: &str) -> Option<(Option<String>, String)> {
     let word_start = before.trim_end_matches(ident_char).len();
     let head = before[..word_start].strip_suffix('.')?;
-    let name = match head.chars().next_back() {
-        Some(q @ ('"' | '`')) => {
-            let inner = &head[..head.len() - 1];
-            let open = inner.rfind(q)?;
-            &inner[open + 1..]
-        }
-        _ => &head[head.trim_end_matches(ident_char).len()..],
-    };
-    Some(name.to_owned())
+    let (name, rest) = last_ident(head)?;
+    let schema = rest
+        .strip_suffix('.')
+        .and_then(last_ident)
+        .map(|(s, _)| s.to_owned());
+    Some((schema, name.to_owned()))
 }
 
 fn tokens(statement: &str) -> Vec<String> {
     statement
         .to_lowercase()
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';'))
+        .replace(',', " , ")
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';'))
         .filter(|t| !t.is_empty())
         .map(|t| t.replace(['"', '`'], ""))
         .collect()
 }
 
-/// Each FROM/JOIN table with its alias, if any.
-fn aliases(statement: &str) -> Vec<(String, Option<String>)> {
+struct Source {
+    schema: Option<String>,
+    table: String,
+    alias: Option<String>,
+}
+
+fn aliases(statement: &str) -> Vec<Source> {
     let toks = tokens(statement);
     let mut out = Vec::new();
     for (i, tok) in toks.iter().enumerate() {
         if tok != "from" && tok != "join" {
             continue;
         }
-        let Some(table) = toks.get(i + 1) else {
-            continue;
-        };
-        let table = table.rsplit('.').next().unwrap_or(table).to_owned();
-        let mut next = i + 2;
-        if toks.get(next).is_some_and(|t| t == "as") {
-            next += 1;
+        let mut at = i + 1;
+        while let Some(name) = toks.get(at) {
+            let mut parts = name.rsplit('.');
+            let table = parts.next().unwrap_or_default().to_owned();
+            let schema = parts.next().map(str::to_owned);
+            at += 1;
+            if toks.get(at).is_some_and(|t| t == "as") {
+                at += 1;
+            }
+            let alias = toks
+                .get(at)
+                .filter(|t| !ALIAS_STOPS.contains(&t.as_str()) && *t != "from")
+                .cloned();
+            if alias.is_some() {
+                at += 1;
+            }
+            out.push(Source {
+                schema,
+                table,
+                alias,
+            });
+            if toks.get(at).is_some_and(|t| t == ",") {
+                at += 1;
+            } else {
+                break;
+            }
         }
-        let alias = toks
-            .get(next)
-            .filter(|t| !ALIAS_STOPS.contains(&t.as_str()) && *t != "from")
-            .cloned();
-        out.push((table, alias));
     }
     out
 }
 
-fn columns(catalog: &Catalog, table: &str) -> Vec<Completion> {
+/// A subsequence match, as the editor's fuzzy filter also accepts.
+fn matches(word: &str, label: &str) -> bool {
+    let mut label = label.chars().flat_map(char::to_lowercase);
+    word.chars()
+        .flat_map(char::to_lowercase)
+        .all(|w| label.any(|c| c == w))
+}
+
+/// Columns of one table: the named schema's, else the first schema in catalog order that holds it.
+fn columns(catalog: &Catalog, schema: Option<&str>, table: &str) -> Vec<Completion> {
     catalog
         .schemas
         .iter()
-        .flat_map(|s| &s.tables)
-        .filter(|t| t.name.eq_ignore_ascii_case(table))
-        .flat_map(|t| &t.columns)
-        .map(|c| item(&c.name, 5, COLUMN, Some(c.type_name.clone())))
+        .filter(|s| schema.is_none_or(|n| s.name.eq_ignore_ascii_case(n)))
+        .find_map(|s| s.tables.iter().find(|t| t.name.eq_ignore_ascii_case(table)))
+        .map(|t| {
+            t.columns
+                .iter()
+                .map(|c| item(&c.name, 5, COLUMN, Some(c.type_name.clone())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tables_of(schema: &daedalus_db::catalog::Schema) -> Vec<Completion> {
+    schema
+        .tables
+        .iter()
+        .map(|t| item(&t.name, 7, TABLE, Some(schema.name.clone())))
         .collect()
 }
 
-/// Suggestions for the word before the cursor: `before` is the text up to it, `statement` the one it sits in.
+/// Suggestions matching the word before the cursor, and whether the cap dropped any.
+///
+/// `before` is the text up to the cursor, `statement` the one it sits in.
 pub(super) fn complete(
     before: &str,
     statement: &str,
     catalog: Option<&Catalog>,
-) -> Vec<Completion> {
-    let mut out = match qualifier(before) {
-        Some(q) => {
+) -> (Vec<Completion>, bool) {
+    let word = &before[before.trim_end_matches(ident_char).len()..];
+    // Filled in this order so a cap drops tables before keywords.
+    let mut columns_out = Vec::new();
+    let mut keywords = Vec::new();
+    let mut schemas = Vec::new();
+    let mut tables = Vec::new();
+    match qualifier(before) {
+        Some((schema, q)) => {
             let Some(catalog) = catalog else {
-                return vec![];
+                return (vec![], false);
             };
-            if let Some(schema) = catalog
-                .schemas
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(&q))
-            {
-                schema
-                    .tables
+            let as_schema = schema.is_none().then(|| {
+                catalog
+                    .schemas
                     .iter()
-                    .map(|t| item(&t.name, 7, TABLE, Some(schema.name.clone())))
-                    .collect()
-            } else {
-                let aliased = aliases(statement)
-                    .into_iter()
-                    .find(|(_, alias)| alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&q)))
-                    .map(|(table, _)| table);
-                columns(catalog, aliased.as_deref().unwrap_or(&q))
+                    .find(|s| s.name.eq_ignore_ascii_case(&q))
+            });
+            match as_schema.flatten() {
+                Some(s) => tables = tables_of(s),
+                None => {
+                    let source = schema.is_none().then(|| {
+                        aliases(statement).into_iter().find(|a| {
+                            a.alias
+                                .as_deref()
+                                .is_some_and(|a| a.eq_ignore_ascii_case(&q))
+                        })
+                    });
+                    columns_out = match source.flatten() {
+                        Some(a) => columns(catalog, a.schema.as_deref(), &a.table),
+                        None => columns(catalog, schema.as_deref(), &q),
+                    };
+                }
             }
         }
         None => {
-            let mut out = Vec::new();
+            keywords = KEYWORDS
+                .iter()
+                .map(|k| item(k, 14, KEYWORD, None))
+                .collect();
             if let Some(catalog) = catalog {
-                for schema in &catalog.schemas {
-                    out.extend(
-                        schema
-                            .tables
-                            .iter()
-                            .map(|t| item(&t.name, 7, TABLE, Some(schema.name.clone()))),
-                    );
-                }
-                out.extend(
-                    catalog
-                        .schemas
-                        .iter()
-                        .map(|s| item(&s.name, 9, SCHEMA, None)),
-                );
+                schemas = catalog
+                    .schemas
+                    .iter()
+                    .map(|s| item(&s.name, 9, SCHEMA, None))
+                    .collect();
+                tables = catalog.schemas.iter().flat_map(tables_of).collect();
             }
-            out.extend(KEYWORDS.iter().map(|k| item(k, 14, KEYWORD, None)));
-            out
         }
-    };
+    }
+    let mut out: Vec<Completion> = columns_out
+        .into_iter()
+        .chain(keywords)
+        .chain(schemas)
+        .chain(tables)
+        .filter(|i| matches(word, &i.label))
+        .collect();
+    let dropped = out.len() > CAP;
     out.truncate(CAP);
-    out
+    (out, dropped)
 }
 
 #[cfg(test)]
@@ -268,13 +337,17 @@ mod tests {
         }
     }
 
+    fn go(before: &str, statement: &str, catalog: Option<&Catalog>) -> Vec<Completion> {
+        complete(before, statement, catalog).0
+    }
+
     fn labels(items: &[Completion]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_str()).collect()
     }
 
     #[test]
     fn keywords_without_catalog() {
-        let items = complete("sel", "sel", None);
+        let items = go("sel", "sel", None);
         assert!(labels(&items).contains(&"SELECT"));
         assert!(items.iter().all(|i| i.kind == Some(14)));
     }
@@ -282,7 +355,7 @@ mod tests {
     #[test]
     fn tables_after_schema_dot() {
         let c = catalog();
-        let items = complete("select * from audit.", "select * from audit.", Some(&c));
+        let items = go("select * from audit.", "select * from audit.", Some(&c));
         assert_eq!(labels(&items), ["log"]);
         assert_eq!(items[0].detail.as_deref(), Some("audit"));
         assert_eq!(items[0].kind, Some(7));
@@ -291,7 +364,7 @@ mod tests {
     #[test]
     fn columns_after_table_dot() {
         let c = catalog();
-        let items = complete("select users.", "select users.", Some(&c));
+        let items = go("select users.", "select users.", Some(&c));
         assert_eq!(labels(&items), ["id", "email"]);
         assert_eq!(items[0].detail.as_deref(), Some("int4"));
         assert_eq!(items[0].kind, Some(5));
@@ -301,18 +374,18 @@ mod tests {
     fn columns_after_alias_dot() {
         let c = catalog();
         let sql = "select u.e from public.users as u join orders o on o.id = u.id";
-        let items = complete("select u.e", sql, Some(&c));
-        assert_eq!(labels(&items), ["id", "email"]);
-        let items = complete("select o.", sql, Some(&c));
+        let items = go("select u.e", sql, Some(&c));
+        assert_eq!(labels(&items), ["email"]);
+        let items = go("select o.", sql, Some(&c));
         assert_eq!(labels(&items), ["total"]);
     }
 
     #[test]
     fn quoted_qualifier_is_stripped() {
         let c = catalog();
-        let items = complete("select \"users\".", "select \"users\".", Some(&c));
+        let items = go("select \"users\".", "select \"users\".", Some(&c));
         assert_eq!(labels(&items), ["id", "email"]);
-        let items = complete("select `PUBLIC`.", "select `PUBLIC`.", Some(&c));
+        let items = go("select `PUBLIC`.", "select `PUBLIC`.", Some(&c));
         assert_eq!(labels(&items), ["users", "orders"]);
     }
 
@@ -332,6 +405,45 @@ mod tests {
             }],
             truncated: false,
         };
-        assert_eq!(complete("", "", Some(&c)).len(), CAP);
+        let (items, dropped) = complete("", "", Some(&c));
+        assert_eq!(items.len(), CAP);
+        assert!(dropped);
+        let (items, _) = complete("SEL", "", Some(&c));
+        assert!(labels(&items).contains(&"SELECT"));
+        let last = format!("t{}", CAP + 49);
+        let (items, dropped) = complete("t20", "", Some(&c));
+        assert!(labels(&items).contains(&last.as_str()));
+        assert!(!dropped);
+    }
+
+    #[test]
+    fn columns_follow_the_qualified_schema() {
+        let mut c = catalog();
+        c.schemas[1].tables.push(Table {
+            name: "users".into(),
+            kind: TableKind::Table,
+            columns: vec![CatalogColumn {
+                name: "actor".into(),
+                type_name: "text".into(),
+                nullable: true,
+                pk: false,
+            }],
+        });
+        let items = go("select audit.users.", "select audit.users.", Some(&c));
+        assert_eq!(labels(&items), ["actor"]);
+        let sql = "select u. from audit.users u";
+        assert_eq!(labels(&go("select u.", sql, Some(&c))), ["actor"]);
+        let items = go("select users.", "select users.", Some(&c));
+        assert_eq!(labels(&items), ["id", "email"]);
+    }
+
+    #[test]
+    fn comma_separated_tables_are_not_aliases() {
+        let found = aliases("select * from users, orders o, audit.log where 1");
+        let got: Vec<_> = found
+            .iter()
+            .map(|a| (a.table.as_str(), a.alias.as_deref()))
+            .collect();
+        assert_eq!(got, [("users", None), ("orders", Some("o")), ("log", None)]);
     }
 }

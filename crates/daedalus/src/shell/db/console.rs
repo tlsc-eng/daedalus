@@ -232,8 +232,13 @@ impl DbConsoleView {
         self.catalog = Some(catalog);
     }
 
-    pub fn introspect(&self) {
+    /// Asks for the catalog on the console's own session, never inside an open transaction.
+    pub fn introspect(&mut self) {
+        if self.tx_open {
+            return;
+        }
         if let (Some(session), Some(handle)) = (self.session, &self.handle) {
+            self.catalog_asked = true;
             handle.send(Command::Introspect { session });
         }
     }
@@ -241,22 +246,23 @@ impl DbConsoleView {
     fn complete(&mut self, request: u64, at: (u32, u32), cx: &mut Context<Self>) {
         let connected = matches!(self.phase, ConsolePhase::Connected { .. });
         if connected && self.catalog.is_none() && !self.catalog_asked {
-            self.catalog_asked = true;
             cx.emit(DbConsoleEvent::WantCatalog);
         }
-        let Some(engine) = self.info.as_ref().map(|i| i.engine) else {
-            return;
+        let engine = self.info.as_ref().map(|i| i.engine);
+        let text = self.editor.read(cx).text();
+        let (items, incomplete) = match (engine, text) {
+            (Some(engine), Some(text)) => {
+                let byte = text::byte_at(&text, at);
+                let statement = classify::at(&text, byte, engine)
+                    .and_then(|s| text.get(s.range))
+                    .unwrap_or("");
+                complete::complete(&text[..byte], statement, self.catalog.as_deref())
+            }
+            _ => (Vec::new(), false),
         };
-        let Some(text) = self.editor.read(cx).text() else {
-            return;
-        };
-        let byte = text::byte_at(&text, at);
-        let statement = classify::at(&text, byte, engine)
-            .and_then(|s| text.get(s.range))
-            .unwrap_or("");
-        let items = complete::complete(&text[..byte], statement, self.catalog.as_deref());
-        self.editor
-            .update(cx, |e, cx| e.show_completions(request, items, false, cx));
+        self.editor.update(cx, |e, cx| {
+            e.show_completions(request, items, incomplete, cx)
+        });
     }
 
     pub fn needs_connect(&self) -> bool {

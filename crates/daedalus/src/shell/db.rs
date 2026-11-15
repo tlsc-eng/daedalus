@@ -930,7 +930,7 @@ impl Shell {
                 let key = view.read(cx).key().to_owned();
                 match this.db.meta.get(&key).and_then(|m| m.catalog.clone()) {
                     Some(c) => view.update(cx, |v, _| v.set_catalog(Arc::new(c))),
-                    None => view.read(cx).introspect(),
+                    None => view.update(cx, |v, _| v.introspect()),
                 }
                 return;
             }
