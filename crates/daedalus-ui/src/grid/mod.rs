@@ -16,7 +16,8 @@ use crate::{ActiveTheme, Ellipsis, Size, Space, Theme};
 
 pub use model::GridColumn;
 use model::{
-    CellPos, GridModel, column_width, display_text, gutter_chars, reveal_x, visible_columns,
+    CellPos, GridModel, column_width, display_text, gutter_chars, reveal_x, scroll_strategy,
+    visible_columns,
 };
 
 actions!(
@@ -69,6 +70,7 @@ pub struct DataGrid {
     opened: Option<Opening>,
     lefts: Vec<f32>,
     viewport_w: f32,
+    row_h: f32,
 }
 
 impl EventEmitter<GridEvent> for DataGrid {}
@@ -97,6 +99,7 @@ impl DataGrid {
             opened: None,
             lefts: Vec::new(),
             viewport_w: 0.,
+            row_h: 0.,
         }
     }
 
@@ -185,7 +188,15 @@ impl DataGrid {
                 base.set_offset(point(px(-x), offset.y));
             }
         }
-        self.scroll.scroll_to_item(pos.row, ScrollStrategy::Top);
+        let body_h = f32::from(base.bounds().size.height);
+        let scroll_y = -f32::from(offset.y);
+        if self.row_h > 0. {
+            let first = (scroll_y / self.row_h).ceil() as usize;
+            let last = ((scroll_y + body_h) / self.row_h).floor() as usize;
+            if let Some(strategy) = scroll_strategy(pos.row, first, last) {
+                self.scroll.scroll_to_item(pos.row, strategy);
+            }
+        }
     }
 
     fn step(&mut self, d_row: isize, d_col: isize, extend: bool, cx: &mut Context<Self>) {
@@ -270,9 +281,14 @@ impl DataGrid {
             f32::from(window.viewport_size().width)
         };
         let viewport_w = list_w - gutter_w;
-        let vis = visible_columns(&lefts, scroll_x, viewport_w);
+        let vis = visible_columns(
+            &lefts,
+            scroll_x,
+            f32::from(window.viewport_size().width) - gutter_w,
+        );
         self.lefts = lefts.clone();
         self.viewport_w = viewport_w;
+        self.row_h = f32::from(t.size(Size::Row));
         Metrics {
             row_h: t.size(Size::Row),
             theme: t,
@@ -299,6 +315,9 @@ impl DataGrid {
                 .id(("grid-col", c))
                 .w(px(width))
                 .flex_none()
+                .h_full()
+                .flex()
+                .items_center()
                 .px(m.pad)
                 .border_r_1()
                 .border_color(t.color.border)
@@ -456,6 +475,7 @@ impl DataGrid {
             .items_center()
             .justify_end()
             .px(m.pad)
+            .block_mouse_except_scroll()
             .bg(t.color.surface)
             .border_r_1()
             .border_color(t.color.border)

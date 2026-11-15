@@ -1,8 +1,8 @@
 use std::ops::Range;
 
-use gpui::SharedString;
+use gpui::{ScrollStrategy, SharedString};
 
-/// Rows still unloaded below the viewport that trigger a fetch.
+/// Number of loaded rows left below the visible end at which fetch-more fires.
 pub(crate) const FETCH_AHEAD: usize = 100;
 pub(crate) const DISPLAY_BYTES: usize = 4096;
 /// Fits "NULL".
@@ -215,6 +215,20 @@ pub(crate) fn visible_columns(lefts: &[f32], scroll_x: f32, width: f32) -> Range
     start..end.max(start)
 }
 
+pub(crate) fn scroll_strategy(
+    target: usize,
+    first_visible: usize,
+    last_visible: usize,
+) -> Option<ScrollStrategy> {
+    if target < first_visible {
+        Some(ScrollStrategy::Top)
+    } else if target > last_visible {
+        Some(ScrollStrategy::Bottom)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn reveal_x(scroll_x: f32, left: f32, right: f32, width: f32) -> f32 {
     if left < scroll_x {
         left
@@ -412,6 +426,21 @@ mod tests {
         assert_eq!(visible_columns(&lefts, 150., 100.), 1..3);
         assert_eq!(visible_columns(&lefts, 0., 1000.), 0..4);
         assert_eq!(visible_columns(&[0.], 0., 100.), 0..0);
+    }
+
+    #[test]
+    fn scroll_strategy_moves_only_when_target_is_off_screen() {
+        assert_eq!(scroll_strategy(5, 3, 10), None);
+        assert_eq!(scroll_strategy(3, 3, 10), None);
+        assert_eq!(scroll_strategy(10, 3, 10), None);
+        assert!(matches!(
+            scroll_strategy(2, 3, 10),
+            Some(ScrollStrategy::Top)
+        ));
+        assert!(matches!(
+            scroll_strategy(11, 3, 10),
+            Some(ScrollStrategy::Bottom)
+        ));
     }
 
     #[test]
