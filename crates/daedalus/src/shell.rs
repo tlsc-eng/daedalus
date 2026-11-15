@@ -630,6 +630,7 @@ impl Render for Shell {
         crate::actions::sync_recent_menu(&self.workspace.recent, cx);
         self.sync_sidebar_motion(window, cx);
         self.sync_sessions_motion(window, cx);
+        self.sync_db_motion(window, cx);
         let t = cx.theme().clone();
         let sidebar = self.render_sidebar(cx);
         // The sidebar draws over its slot, so it paints above the content as it narrows.
