@@ -68,6 +68,7 @@ pub struct TextInput {
     all_selected: bool,
     marked: Option<Range<usize>>,
     placeholder: SharedString,
+    masked: bool,
     focus: FocusHandle,
     /// Each drawn line with the byte its text starts at.
     layout: Vec<(usize, ShapedLine)>,
@@ -96,6 +97,7 @@ impl TextInput {
             all_selected: false,
             marked: None,
             placeholder: placeholder.into(),
+            masked: false,
             focus: cx.focus_handle(),
             layout: Vec::new(),
             bounds: None,
@@ -110,6 +112,17 @@ impl TextInput {
     pub fn multiline(mut self, max_rows: usize) -> Self {
         self.max_rows = Some(max_rows.max(1));
         self
+    }
+
+    /// Draws one bullet per character and never hands the text to the system, for passwords.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
+    }
+
+    /// Byte length the characters in `text[from..to]` take once drawn.
+    fn shown_len(&self, from: usize, to: usize) -> usize {
+        shown_span(&self.text, from, to, self.masked)
     }
 
     /// Byte ranges of the text's lines, without their line breaks.
@@ -313,6 +326,37 @@ struct InputFrame {
     scroll_x: Pixels,
 }
 
+const BULLET: char = '\u{2022}';
+
+fn shown(text: &str, masked: bool) -> std::borrow::Cow<'_, str> {
+    match masked {
+        true => text.chars().map(|_| BULLET).collect::<String>().into(),
+        false => text.into(),
+    }
+}
+
+fn shown_utf16(text: &str, masked: bool) -> String {
+    match masked {
+        true => text.encode_utf16().map(|_| BULLET).collect(),
+        false => text.to_owned(),
+    }
+}
+
+fn shown_span(text: &str, from: usize, to: usize, masked: bool) -> usize {
+    shown(&text[from..to], masked).len()
+}
+
+/// Byte offset of `b` into the line starting at `at`, or the shown-bullet offset for masked text.
+/// Layout starts are stale until the next paint, so a masked slice may not land on a char boundary.
+fn line_offset(text: &str, at: usize, b: usize, masked: bool) -> usize {
+    let plain = b.saturating_sub(at);
+    if !masked {
+        return plain;
+    }
+    let b = b.min(text.len()).max(at);
+    text.get(at..b).map_or(plain, |s| shown(s, true).len())
+}
+
 /// Byte ranges of `text`'s lines without their breaks; a single-line box has one line.
 fn line_ranges(text: &str, multiline: bool) -> Vec<Range<usize>> {
     if !multiline {
@@ -418,7 +462,10 @@ impl Element for InputElement {
             let (text, color) = if input.text.is_empty() {
                 (input.placeholder.to_string(), theme.color.content_disabled)
             } else {
-                (input.text[range.clone()].to_string(), theme.color.content)
+                (
+                    shown(&input.text[range.clone()], input.masked).into_owned(),
+                    theme.color.content,
+                )
             };
             let base = TextRun {
                 len: text.len(),
@@ -432,7 +479,9 @@ impl Element for InputElement {
                 .marked
                 .as_ref()
                 .filter(|m| !input.text.is_empty() && m.start >= range.start && m.end <= range.end)
-                .map(|m| m.start - range.start..m.end - range.start);
+                .map(|m| {
+                    input.shown_len(range.start, m.start)..input.shown_len(range.start, m.end)
+                });
             let runs = match marked {
                 Some(m) => {
                     let underline = gpui::UnderlineStyle {
@@ -468,7 +517,7 @@ impl Element for InputElement {
         }
         let cursor_x = |line: &ShapedLine, start: usize| match input.text.is_empty() {
             true => px(0.),
-            false => line.x_for_index(input.cursor - start),
+            false => line.x_for_index(input.shown_len(start, input.cursor)),
         };
         let scroll_x = match lines.get(cursor_line) {
             Some((start, line)) if !input.text.is_empty() => scrolled_x(
@@ -564,7 +613,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range);
         *actual = Some(self.to_utf16(range.start)..self.to_utf16(range.end));
-        Some(self.text[range].to_string())
+        Some(shown_utf16(&self.text[range], self.masked))
     }
 
     fn selected_text_range(
@@ -638,7 +687,9 @@ impl EntityInputHandler for TextInput {
         let rows = self.layout.len().clamp(1, self.max_rows.unwrap_or(1));
         let lh = bounds.size.height / rows as f32;
         let top = bounds.top() + lh * (row as f32 - self.scroll_row as f32);
-        let x = |b: usize| line.x_for_index(b.saturating_sub(*at).min(line.len()));
+        let x = |b: usize| {
+            line.x_for_index(line_offset(&self.text, *at, b, self.masked).min(line.len()))
+        };
         Some(Bounds::from_corners(
             point(bounds.left() + x(start) - self.scroll_x, top),
             point(bounds.left() + x(end) - self.scroll_x, top + lh),
@@ -658,6 +709,35 @@ impl EntityInputHandler for TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masked_text_is_bullets_same_length() {
+        assert_eq!(shown("p\u{e9}w", true), "\u{2022}\u{2022}\u{2022}");
+        assert_eq!(shown("", true), "");
+        assert_eq!(shown("abc", false), "abc");
+    }
+
+    #[test]
+    fn masked_offsets_map_bytes_to_bullets() {
+        assert_eq!(shown_span("p\u{e4}\u{20ac}", 0, 3, true), 6);
+        assert_eq!(shown_span("p\u{e4}\u{20ac}", 0, 6, true), 9);
+        assert_eq!(shown_span("p\u{e4}\u{20ac}", 0, 3, false), 3);
+    }
+
+    #[test]
+    fn bounds_never_panic_on_stale_line_start() {
+        let text = "x\n\u{304b}d";
+        assert_eq!(line_offset(text, 2, 5, true), 3);
+        assert_eq!(line_offset(text, 3, 5, true), 2);
+        assert_eq!(line_offset(text, 3, 5, false), 2);
+        assert_eq!(line_offset(text, 9, 4, true), 0);
+    }
+
+    #[test]
+    fn masked_text_for_range_has_one_bullet_per_utf16_unit() {
+        assert_eq!(shown_utf16("a\u{1f600}", true).chars().count(), 3);
+        assert_eq!(shown_utf16("a\u{1f600}", false), "a\u{1f600}");
+    }
 
     #[test]
     fn a_multiline_box_splits_at_breaks_and_scrolls_the_cursor_into_view() {

@@ -81,6 +81,7 @@ daedalus-preview = { path = "crates/daedalus-preview" }
 daedalus-lsp = { path = "crates/daedalus-lsp" }
 daedalus-dap = { path = "crates/daedalus-dap" }
 daedalus-db = { path = "crates/daedalus-db" }
+security-framework = "3.7"
 
 [profile.release]
 lto = "thin"

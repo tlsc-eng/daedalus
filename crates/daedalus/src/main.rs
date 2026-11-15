@@ -3,6 +3,8 @@ mod app_socket;
 mod claude_hooks;
 mod cli;
 mod companion;
+#[cfg(target_os = "macos")]
+mod db_secrets;
 mod ide;
 mod keymap;
 mod mcp;
