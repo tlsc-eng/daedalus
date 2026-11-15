@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use daedalus_db::catalog::Catalog;
 use daedalus_db::classify::{self, Statement};
 use daedalus_db::worker::{Command, Handle, RunMode, SessionId, TxOp, Update};
 use daedalus_db::{Engine, Listed};
@@ -24,6 +26,7 @@ use batch::{Batch, Effect, Piece};
 use gate::{Gate, Target};
 
 mod batch;
+mod complete;
 mod gate;
 mod text;
 
@@ -53,6 +56,7 @@ impl From<&Listed> for Info {
 
 pub(in crate::shell) enum DbConsoleEvent {
     Connect,
+    WantCatalog,
 }
 
 enum ConsolePhase {
@@ -91,6 +95,8 @@ pub(in crate::shell) struct DbConsoleView {
     session: Option<SessionId>,
     manual: bool,
     tx_open: bool,
+    catalog: Option<Arc<Catalog>>,
+    catalog_asked: bool,
     handle: Option<Handle>,
     setup_error: Option<String>,
     editor: Entity<EditorView>,
@@ -152,11 +158,17 @@ impl DbConsoleView {
             e.set_minimap(false, cx);
             e.set_code_lens(false, cx);
             e.set_inlay_hints(false, cx);
+            e.set_completion_triggers(Some(vec![".".into()]));
         });
-        let autosave = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
-            if matches!(event, EditorEvent::Edited { .. }) {
-                this.editor.update(cx, |e, cx| e.schedule_autosave(cx));
-            }
+        let autosave = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| match event {
+            EditorEvent::Edited { .. } => this.editor.update(cx, |e, cx| e.schedule_autosave(cx)),
+            EditorEvent::Complete {
+                request,
+                line,
+                character,
+                ..
+            } => this.complete(*request, (*line, *character), cx),
+            _ => {}
         });
         let grid = cx.new(DataGrid::new);
         let fetch = cx.subscribe(&grid, |this, _, _: &GridEvent, cx| this.fetch_more(cx));
@@ -170,6 +182,8 @@ impl DbConsoleView {
             session: None,
             manual: false,
             tx_open: false,
+            catalog: None,
+            catalog_asked: false,
             handle: None,
             setup_error,
             editor,
@@ -214,6 +228,37 @@ impl DbConsoleView {
         self.tx_open
     }
 
+    pub fn set_catalog(&mut self, catalog: Arc<Catalog>) {
+        self.catalog = Some(catalog);
+    }
+
+    pub fn introspect(&self) {
+        if let (Some(session), Some(handle)) = (self.session, &self.handle) {
+            handle.send(Command::Introspect { session });
+        }
+    }
+
+    fn complete(&mut self, request: u64, at: (u32, u32), cx: &mut Context<Self>) {
+        let connected = matches!(self.phase, ConsolePhase::Connected { .. });
+        if connected && self.catalog.is_none() && !self.catalog_asked {
+            self.catalog_asked = true;
+            cx.emit(DbConsoleEvent::WantCatalog);
+        }
+        let Some(engine) = self.info.as_ref().map(|i| i.engine) else {
+            return;
+        };
+        let Some(text) = self.editor.read(cx).text() else {
+            return;
+        };
+        let byte = text::byte_at(&text, at);
+        let statement = classify::at(&text, byte, engine)
+            .and_then(|s| text.get(s.range))
+            .unwrap_or("");
+        let items = complete::complete(&text[..byte], statement, self.catalog.as_deref());
+        self.editor
+            .update(cx, |e, cx| e.show_completions(request, items, false, cx));
+    }
+
     pub fn needs_connect(&self) -> bool {
         matches!(self.phase, ConsolePhase::Idle | ConsolePhase::Failed(_))
     }
@@ -231,6 +276,8 @@ impl DbConsoleView {
     ) {
         self.session = Some(session);
         self.tx_open = false;
+        self.catalog = None;
+        self.catalog_asked = false;
         self.handle = Some(handle);
         self.info = Some(info);
         self.phase = ConsolePhase::Connecting(Busy::start());
@@ -308,7 +355,10 @@ impl DbConsoleView {
                     self.log(text.into(), true);
                 }
             }
-            Update::Catalog { .. } => {}
+            Update::Catalog { catalog, .. } => match catalog {
+                Ok(c) => self.catalog = Some(Arc::new(c)),
+                Err(_) => self.log("Could not read the schema for completion.".into(), true),
+            },
         }
         cx.notify();
     }
