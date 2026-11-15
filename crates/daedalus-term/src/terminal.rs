@@ -1191,7 +1191,7 @@ mod tests {
         prompt_with(&mut t, "% a日b");
         assert_eq!(click(&t, 3.2, 0.), Some(LEFT.repeat(2)));
         assert_eq!(click(&t, 3.7, 0.), Some(LEFT.repeat(2)));
-        assert_eq!(click(&t, 4.2, 0.), Some(LEFT.repeat(1)));
+        assert_eq!(click(&t, 4.2, 0.), Some(LEFT.to_string()));
     }
 
     #[test]
