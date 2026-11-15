@@ -68,7 +68,10 @@ fn not_on_disk(kind: &ItemKind) -> bool {
     never_saved(kind)
         || matches!(
             kind,
-            ItemKind::Settings | ItemKind::Shortcuts | ItemKind::Session { .. }
+            ItemKind::Settings
+                | ItemKind::Shortcuts
+                | ItemKind::DbConsole { .. }
+                | ItemKind::Session { .. }
         )
 }
 
@@ -747,6 +750,9 @@ mod tests {
         let pane = layout.focused;
         for kind in [
             ItemKind::Shortcuts,
+            ItemKind::DbConsole {
+                connection: "g:one".into(),
+            },
             ItemKind::Editor {
                 path: "/p/a.rs".into(),
             },

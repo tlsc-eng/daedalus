@@ -45,6 +45,8 @@ fn main() {
             actions::init(cx);
             daedalus_term::init(cx);
             daedalus_editor::init(cx);
+            // After the editor's bindings so cmd-enter runs SQL inside a console.
+            actions::bind_console_keys(cx);
 
             let mut path = workspace_path();
             let mut workspace = daedalus_workspace::load(&path).unwrap_or_else(|err| {

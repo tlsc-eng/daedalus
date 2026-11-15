@@ -7,18 +7,24 @@ use daedalus_db::worker::{Command, Handle, SessionId, Update};
 use daedalus_db::{Connection, Engine, Listed, Origin, Secret, Store};
 use daedalus_ui::motion::{self, Busy, Closing};
 use daedalus_ui::{ActiveTheme, Theme};
+use daedalus_workspace::ItemKind;
 use gpui::{
-    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, Subscription, Task, Window,
-    div, prelude::*, px,
+    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, Subscription, Task,
+    WeakEntity, Window, div, prelude::*, px,
 };
 
 use super::Shell;
+use super::item::ItemView;
 use super::sidebar::Tween;
 use crate::db_secrets;
 use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
 
+mod console;
 mod explorer;
 mod sheet;
+
+pub(super) use console::DbConsoleView;
+use console::{DbConsoleEvent, Info};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) enum NodeKey {
@@ -66,6 +72,7 @@ pub(super) struct DbState {
     sheet_opened: u64,
     test: Option<(SessionId, Instant)>,
     test_done: Option<(Result<String, String>, u128)>,
+    consoles: HashMap<SessionId, WeakEntity<DbConsoleView>>,
 }
 
 #[derive(Clone, Default)]
@@ -334,7 +341,9 @@ impl Shell {
         self.db._updates = Some(cx.spawn(async move |this, cx| {
             while let Ok(update) = rx.recv().await {
                 let kept = this.update(cx, |shell, cx| {
-                    if let Some(cmd) = shell.db.on_update(update) {
+                    if let Some(update) = shell.db_route_console(update, cx)
+                        && let Some(cmd) = shell.db.on_update(update)
+                    {
                         shell.db.send(cmd);
                     }
                     shell.db_report_test(cx);
@@ -345,6 +354,28 @@ impl Shell {
                 }
             }
         }));
+    }
+
+    /// Gives a console its own session's updates; the rest go on to the explorer's logic.
+    fn db_route_console(&mut self, update: Update, cx: &mut Context<Self>) -> Option<Update> {
+        let session = update.session();
+        let weak = self.db.consoles.get(&session).cloned()?;
+        let failed = matches!(update, Update::Failed { .. });
+        match weak.upgrade() {
+            Some(view) => {
+                view.update(cx, |c, cx| c.on_update(update, cx));
+                if failed {
+                    self.db.consoles.remove(&session);
+                }
+            }
+            None => {
+                self.db.consoles.remove(&session);
+                if !failed {
+                    self.db.send(Command::Disconnect { session });
+                }
+            }
+        }
+        None
     }
 
     /// Redraws the connecting spinner on a timer while the Data panel is on screen.
@@ -614,7 +645,8 @@ impl Shell {
                 listed,
                 password,
                 save,
-            } => self.db_unlock(listed, password, save, window, cx),
+                console,
+            } => self.db_unlock(listed, password, save, console, window, cx),
             DbSheetEvent::Close => self.db_close_sheet(window, cx),
         }
     }
@@ -634,7 +666,14 @@ impl Shell {
             cx.notify();
             return;
         }
-        self.db_open_sheet(SheetMode::Password { listed }, window, cx);
+        self.db_open_sheet(
+            SheetMode::Password {
+                listed,
+                console: None,
+            },
+            window,
+            cx,
+        );
     }
 
     fn db_sheet_is(&self, opened: u64) -> bool {
@@ -778,20 +817,35 @@ impl Shell {
         listed: Listed,
         password: Secret,
         save: bool,
+        console: Option<WeakEntity<DbConsoleView>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.db_close_sheet(window, cx);
         let key = conn_key(listed.origin, &listed.conn.id);
-        if matches!(
-            self.db.phase(&key),
-            Phase::Connecting(_) | Phase::Connected { .. }
-        ) {
-            return;
-        }
-        self.db_start_worker(cx);
-        let session = self.db.begin(&key);
-        self.db_start_spin(cx);
+        let session = match console {
+            Some(weak) => {
+                let Some(view) = weak.upgrade().filter(|v| v.read(cx).needs_connect()) else {
+                    return;
+                };
+                let Some(session) = self.db_console_session(&view, &listed, cx) else {
+                    return;
+                };
+                session
+            }
+            None => {
+                if matches!(
+                    self.db.phase(&key),
+                    Phase::Connecting(_) | Phase::Connected { .. }
+                ) {
+                    return;
+                }
+                self.db_start_worker(cx);
+                let session = self.db.begin(&key);
+                self.db_start_spin(cx);
+                session
+            }
+        };
         let root = self.active_root();
         let typed = (!password.is_empty()).then(|| password.clone());
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
@@ -833,6 +887,187 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    /// Opens (or focuses) the console tab of a connection and connects it when it is not yet.
+    pub(super) fn db_open_console(
+        &mut self,
+        listed: Listed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = conn_key(listed.origin, &listed.conn.id);
+        self.open_kind(
+            ItemKind::DbConsole {
+                connection: key.clone(),
+            },
+            window,
+            cx,
+        );
+        let Some(root) = self.active_root() else {
+            return;
+        };
+        let view = self.items.iter().find_map(|((r, _), v)| match v {
+            ItemView::DbConsole(c) if *r == root && c.read(cx).key() == key => Some(c.clone()),
+            _ => None,
+        });
+        if let Some(view) = view.filter(|v| v.read(cx).needs_connect()) {
+            self.db_connect_console(view, listed, window, cx);
+        }
+    }
+
+    pub(super) fn new_db_console_view(
+        &mut self,
+        root: &std::path::Path,
+        connection: &str,
+        cx: &mut Context<Self>,
+    ) -> ItemView {
+        let view = cx.new(|cx| DbConsoleView::new(root.to_path_buf(), connection.to_owned(), cx));
+        // The click that asks to connect carries no window, so the sheet is opened from a deferred one.
+        cx.subscribe(&view, |_, view, _: &DbConsoleEvent, cx| {
+            let (shell, view) = (cx.entity(), view.clone());
+            cx.defer(move |cx| {
+                let Some(window) = cx.active_window() else {
+                    return;
+                };
+                window
+                    .update(cx, |_, window, cx| {
+                        shell.update(cx, |this, cx| this.db_reconnect_console(view, window, cx))
+                    })
+                    .ok();
+            });
+        })
+        .detach();
+        ItemView::DbConsole(view)
+    }
+
+    fn db_reconnect_console(
+        &mut self,
+        view: Entity<DbConsoleView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = view.read(cx).key().to_owned();
+        let listed = self.db.store.as_ref().and_then(|store| {
+            daedalus_db::for_project(store, self.active_root().as_deref())
+                .into_iter()
+                .find(|l| conn_key(l.origin, &l.conn.id) == key)
+        });
+        match listed {
+            Some(listed) => self.db_connect_console(view, listed, window, cx),
+            None => view.update(cx, |c, cx| c.fail("This connection no longer exists.", cx)),
+        }
+    }
+
+    /// Registers a new session for a console and marks it connecting; None when no worker runs.
+    fn db_console_session(
+        &mut self,
+        view: &Entity<DbConsoleView>,
+        listed: &Listed,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionId> {
+        self.db_start_worker(cx);
+        let handle = self.db.handle.clone()?;
+        let session = SessionId(self.db.next_session);
+        self.db.next_session += 1;
+        self.db.consoles.insert(session, view.downgrade());
+        let info = Info::from(listed);
+        view.update(cx, |c, cx| c.connecting(session, handle, info, cx));
+        Some(session)
+    }
+
+    fn db_connect_console(
+        &mut self,
+        view: Entity<DbConsoleView>,
+        listed: Listed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(e) = view.read(cx).setup_error() {
+            view.update(cx, |c, cx| c.fail(e, cx));
+            return;
+        }
+        let prompt = listed.conn.engine != Engine::Sqlite && !listed.conn.save_password;
+        if prompt {
+            // No session yet: closing the sheet must leave the console on its Connect button.
+            let info = Info::from(&listed);
+            view.update(cx, |c, cx| c.prompting(info, cx));
+            self.db_prompt_console(&view, listed, window, cx);
+            return;
+        }
+        let Some(session) = self.db_console_session(&view, &listed, cx) else {
+            return;
+        };
+        let root = self.active_root();
+        let conn = listed.conn.clone();
+        if conn.engine == Engine::Sqlite {
+            self.db.send(Command::Connect {
+                session,
+                conn,
+                password: None,
+                root,
+            });
+            return;
+        }
+        let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &conn);
+        let weak = view.downgrade();
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded: Result<Option<Secret>, String> = cx
+                .background_executor()
+                .spawn(async move { db_secrets::load(&account).map_err(|e| e.to_string()) })
+                .await;
+            this.update_in(cx, |shell, window, cx| {
+                let Some(view) = weak.upgrade() else {
+                    shell.db.consoles.remove(&session);
+                    return;
+                };
+                if !shell.db.consoles.contains_key(&session) {
+                    return;
+                }
+                match loaded {
+                    Ok(Some(secret)) => shell.db.send(Command::Connect {
+                        session,
+                        conn,
+                        password: Some(secret),
+                        root,
+                    }),
+                    Ok(None) => {
+                        shell.db.consoles.remove(&session);
+                        view.update(cx, |c, cx| c.idle(cx));
+                        shell.db_prompt_console(&view, listed, window, cx);
+                    }
+                    Err(e) => {
+                        shell.db.consoles.remove(&session);
+                        view.update(cx, |c, cx| c.fail(e, cx));
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn db_prompt_console(
+        &mut self,
+        view: &Entity<DbConsoleView>,
+        listed: Listed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.db.sheet.is_some() {
+            view.update(cx, |c, cx| {
+                c.fail("Close the open sheet and connect again.", cx)
+            });
+            return;
+        }
+        self.db_open_sheet(
+            SheetMode::Password {
+                listed,
+                console: Some(view.downgrade()),
+            },
+            window,
+            cx,
+        );
     }
 
     pub(super) fn db_delete(

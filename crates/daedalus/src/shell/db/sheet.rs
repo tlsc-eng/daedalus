@@ -8,16 +8,20 @@ use daedalus_ui::{
 use daedalus_workspace::FolderColor;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable, FontWeight, MouseButton,
-    Render, Subscription, Task, Window, div, prelude::*, px,
+    Render, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
 };
 
+use super::console::DbConsoleView;
 use crate::actions::{NextField, PrevField};
 use crate::shell::sidebar::folder_color;
 
 pub(in crate::shell) enum SheetMode {
     New,
     Edit(Listed),
-    Password { listed: Listed },
+    Password {
+        listed: Listed,
+        console: Option<WeakEntity<DbConsoleView>>,
+    },
 }
 
 #[derive(Clone)]
@@ -44,6 +48,7 @@ pub(in crate::shell) enum DbSheetEvent {
         listed: Listed,
         password: Secret,
         save: bool,
+        console: Option<WeakEntity<DbConsoleView>>,
     },
     Close,
 }
@@ -376,15 +381,16 @@ impl DbSheet {
     }
 
     fn unlock(&mut self, cx: &mut Context<Self>) {
-        let SheetMode::Password { listed } = &self.mode else {
+        let SheetMode::Password { listed, console } = &self.mode else {
             return;
         };
-        let listed = listed.clone();
+        let (listed, console) = (listed.clone(), console.clone());
         let password = Secret::new(self.typed_password(cx));
         cx.emit(DbSheetEvent::Unlock {
             listed,
             password,
             save: self.keychain,
+            console,
         });
     }
 
@@ -894,7 +900,7 @@ impl Render for DbSheet {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let body = match &self.mode {
-            SheetMode::Password { listed } => {
+            SheetMode::Password { listed, .. } => {
                 let listed = listed.clone();
                 self.render_password(&listed, &t, cx)
             }
