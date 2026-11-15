@@ -105,11 +105,11 @@ fn fades(rows: &[Row], turn: impl Fn(&NodeKey) -> f32) -> Vec<f32> {
         .collect()
 }
 
-fn data_color(name: Option<&str>) -> Option<FolderColor> {
+pub(super) fn data_color(name: Option<&str>) -> Option<FolderColor> {
     serde_json::from_value(serde_json::Value::String(name?.to_owned())).ok()
 }
 
-fn engine_label(engine: Engine) -> &'static str {
+pub(super) fn engine_label(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "PostgreSQL",
         Engine::Mysql => "MySQL",
@@ -619,6 +619,11 @@ impl Shell {
         });
         let url = daedalus_db::redacted_url(&listed.conn);
         let mut items = vec![
+            shell_item("New Console", cx, {
+                let listed = listed.clone();
+                move |this, window, cx| this.db_open_console(listed.clone(), window, cx)
+            }),
+            MenuItem::separator(),
             toggle,
             shell_item("Edit…", cx, {
                 let listed = listed.clone();
@@ -643,7 +648,7 @@ impl Shell {
     }
 }
 
-fn dot_shape(filled: bool, tint: gpui::Hsla, t: &daedalus_ui::Theme) -> AnyElement {
+pub(super) fn dot_shape(filled: bool, tint: gpui::Hsla, t: &daedalus_ui::Theme) -> AnyElement {
     let size = t.ui(8.);
     div()
         .size(size)
@@ -655,7 +660,7 @@ fn dot_shape(filled: bool, tint: gpui::Hsla, t: &daedalus_ui::Theme) -> AnyEleme
         .into_any_element()
 }
 
-fn tag(label: &'static str, color: gpui::Hsla) -> AnyElement {
+pub(super) fn tag(label: &'static str, color: gpui::Hsla) -> AnyElement {
     div()
         .flex_none()
         .text_color(color)

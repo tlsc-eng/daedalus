@@ -420,6 +420,7 @@ impl Shell {
             ItemKind::Diff { path, base } => self.new_diff_view(root, path, base, cx),
             ItemKind::Settings => self.new_settings_view(root, cx),
             ItemKind::Shortcuts => self.new_shortcuts_view(cx),
+            ItemKind::DbConsole { connection } => self.new_db_console_view(root, connection, cx),
             ItemKind::Session { id } => {
                 self.refresh_session_view(id, cx);
                 ItemView::Session(SessionTab {
@@ -528,6 +529,7 @@ impl Shell {
             (None, ItemKind::Diff { path, base }) => super::review::diff_title(path, base),
             (None, ItemKind::Settings) => "Settings".into(),
             (None, ItemKind::Shortcuts) => "Keyboard Shortcuts".into(),
+            (None, ItemKind::DbConsole { .. }) => "Console".into(),
         }
     }
 

@@ -56,6 +56,10 @@ pub enum ItemKind {
     Settings,
     /// The keyboard shortcuts editor.
     Shortcuts,
+    /// A SQL console on one connection, named by its `conn_key`; never saved with the workspace.
+    DbConsole {
+        connection: String,
+    },
     /// One Claude session's plan, changes and review comments; never saved with the workspace.
     Session {
         id: String,
@@ -105,6 +109,7 @@ impl ItemKind {
             | Self::Preview { .. }
             | Self::Settings
             | Self::Shortcuts
+            | Self::DbConsole { .. }
             | Self::Session { .. } => None,
         }
     }

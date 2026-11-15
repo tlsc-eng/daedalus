@@ -57,6 +57,17 @@ impl Shell {
     /// A quit that skipped the Save question (Dock, logout, `osascript`) saves what auto save would
     /// and keeps recovery copies of the rest, so nothing unsaved is dropped.
     pub(super) fn flush_unsaved(&mut self, cx: &mut Context<Self>) {
+        let consoles: Vec<_> = self
+            .items
+            .values()
+            .filter_map(|v| match v {
+                ItemView::DbConsole(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        for console in consoles {
+            console.update(cx, |c, cx| c.save_text(cx));
+        }
         if self.quit_settled {
             return;
         }

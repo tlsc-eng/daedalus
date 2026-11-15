@@ -104,6 +104,8 @@ actions!(
 
 actions!(daedalus, [GitOpenTimeline, GitToggleFileBlame]);
 
+actions!(daedalus, [RunStatement, RunAll, StopRun]);
+
 actions!(
     daedalus,
     [
@@ -499,6 +501,16 @@ fn menus(recent: &[PathBuf]) -> Vec<Menu> {
             ],
         },
     ]
+}
+
+/// Binds the SQL console's keys inside its own context so they win over the editor's.
+pub fn bind_console_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-enter", RunStatement, Some("DbConsole > Editor")),
+        KeyBinding::new("cmd-alt-enter", RunAll, Some("DbConsole > Editor")),
+        KeyBinding::new("cmd-.", StopRun, Some("DbConsole > Editor")),
+        KeyBinding::new("cmd-.", StopRun, Some("DbConsole")),
+    ]);
 }
 
 #[cfg(test)]

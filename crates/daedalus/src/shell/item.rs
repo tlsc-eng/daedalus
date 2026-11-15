@@ -6,6 +6,7 @@ use daedalus_term::{ClaudeState, TerminalView};
 use gpui::{AnyElement, AnyView, App, Entity, FocusHandle, Focusable, IntoElement, Render, div};
 use gpui::{StyleRefinement, Styled};
 
+use super::db::DbConsoleView;
 use super::settings_ui::SettingsView;
 use super::shortcuts_ui::ShortcutsView;
 
@@ -22,6 +23,7 @@ pub(super) enum ItemView {
     Diff(Entity<DiffView>),
     Settings(Entity<SettingsView>),
     Shortcuts(Entity<ShortcutsView>),
+    DbConsole(Entity<DbConsoleView>),
     /// Drawn by the shell itself, which holds the session's plan, files and comments.
     Session(SessionTab),
 }
@@ -45,6 +47,7 @@ impl ItemView {
             Self::Diff(v) => v.focus_handle(cx),
             Self::Settings(v) => v.focus_handle(cx),
             Self::Shortcuts(v) => v.focus_handle(cx),
+            Self::DbConsole(v) => v.focus_handle(cx),
             Self::Session(v) => v.focus.clone(),
         }
     }
@@ -69,6 +72,7 @@ impl ItemView {
             Self::Diff(v) => view(v, cached),
             Self::Settings(v) => view(v, cached),
             Self::Shortcuts(v) => view(v, cached),
+            Self::DbConsole(v) => view(v, cached),
             Self::Session(_) => div().into_any_element(),
         }
     }
@@ -91,6 +95,7 @@ impl ItemView {
             Self::Diff(v) => v.read(cx).label(),
             Self::Settings(v) => v.read(cx).label(),
             Self::Shortcuts(v) => v.read(cx).label(),
+            Self::DbConsole(v) => v.read(cx).label(),
             Self::Session(_) => "Session".into(),
         }
     }
@@ -106,6 +111,7 @@ impl ItemView {
             | Self::Diff(_)
             | Self::Settings(_)
             | Self::Shortcuts(_)
+            | Self::DbConsole(_)
             | Self::Session(_) => None,
         }
     }
