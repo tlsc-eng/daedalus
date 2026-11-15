@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daedalus_db::catalog::Catalog;
@@ -924,7 +925,15 @@ impl Shell {
     ) -> ItemView {
         let view = cx.new(|cx| DbConsoleView::new(root.to_path_buf(), connection.to_owned(), cx));
         // The click that asks to connect carries no window, so the sheet is opened from a deferred one.
-        cx.subscribe(&view, |_, view, _: &DbConsoleEvent, cx| {
+        cx.subscribe(&view, |this, view, event: &DbConsoleEvent, cx| {
+            if matches!(event, DbConsoleEvent::WantCatalog) {
+                let key = view.read(cx).key().to_owned();
+                match this.db.meta.get(&key).and_then(|m| m.catalog.clone()) {
+                    Some(c) => view.update(cx, |v, _| v.set_catalog(Arc::new(c))),
+                    None => view.update(cx, |v, _| v.introspect()),
+                }
+                return;
+            }
             let (shell, view) = (cx.entity(), view.clone());
             cx.defer(move |cx| {
                 let Some(window) = cx.active_window() else {
