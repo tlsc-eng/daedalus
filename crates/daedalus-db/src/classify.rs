@@ -95,6 +95,10 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
             {
                 out.push((Tok::HiddenCr, start..i));
             }
+        } else if c == b'-' && next == Some(b'-') && engine == Engine::Mysql {
+            // The parser may read this as a comment while the scanner does not, so the chunk cannot be trusted.
+            out.push((Tok::Hazard, start..start + 2));
+            i += 2;
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
             if engine == Engine::Mysql
@@ -862,6 +866,14 @@ mod tests {
         assert_eq!(kind("explain select 1"), Kind::Read);
         assert_eq!(split("explain select 1", MY)[0].kind, Kind::Read);
         assert_eq!(kind("explain delete from t"), Kind::Read);
+    }
+
+    #[test]
+    fn mysql_double_dash_without_space_is_not_read() {
+        assert_ne!(split("select 1 --1", MY)[0].kind, Kind::Read);
+        assert_eq!(split("select 1 -- 1", MY)[0].kind, Kind::Read);
+        assert_eq!(split("select 1 - -1", MY)[0].kind, Kind::Read);
+        assert_eq!(kind("select 1 --1"), Kind::Read);
     }
 
     #[test]

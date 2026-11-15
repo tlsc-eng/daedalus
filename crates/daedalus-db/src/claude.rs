@@ -79,7 +79,13 @@ fn words(sql: &str, engine: Engine) -> Vec<String> {
         let skip_to = |pred: &dyn Fn(usize) -> bool| (i..chars.len()).find(|&j| pred(j));
         let comment_end = match quote {
             Some(_) => None,
-            None if c == '-' && next == Some('-') => {
+            None if c == '-'
+                && next == Some('-')
+                && (engine != Engine::Mysql
+                    || chars
+                        .get(i + 2)
+                        .is_none_or(|x| x.is_whitespace() || x.is_control())) =>
+            {
                 Some(skip_to(&|j| matches!(chars[j], '\n' | '\r')).unwrap_or(chars.len()))
             }
             None if c == '#' && engine == Engine::Mysql => {
@@ -379,6 +385,20 @@ mod tests {
         assert!(!lock("select 1 -- for update", PG));
         assert!(!lock("select 1 /* for update */", PG));
         assert!(!lock("select a # for update", Engine::Mysql));
+    }
+
+    #[test]
+    fn gate_refuses_mysql_double_dash_without_space() {
+        assert!(gate("select * from t where a = 1 --1 for update", Engine::Mysql).is_err());
+        assert!(has_locking_clause(&words(
+            "select 1 --1 for update",
+            Engine::Mysql
+        )));
+        assert!(!has_locking_clause(&words(
+            "select 1 -- for update",
+            Engine::Mysql
+        )));
+        assert!(!has_locking_clause(&words("select 1 --for update", PG)));
     }
 
     #[test]
