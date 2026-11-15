@@ -12,6 +12,7 @@ use crate::secret::Secret;
 use crate::value::{Budget, Cell, Column};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CANCEL_RESEND: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -392,6 +393,8 @@ async fn run_job(
     let mut deadline = timeout.map(|t| started + t);
     let mut stop: Option<Stop> = None;
     let mut first_item = true;
+    let mut resend = tokio::time::interval(CANCEL_RESEND);
+    resend.reset();
     let mut stream = driver.query(sql);
     let mut buffer: Vec<Vec<Cell>> = Vec::new();
     let mut limit = page;
@@ -432,6 +435,14 @@ async fn run_job(
                 _ => std::future::pending().await,
             }
         };
+        let waiting_on_cancel = first_item && stop == Some(Stop::User);
+        let resend_tick = async {
+            if waiting_on_cancel {
+                resend.tick().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let item = tokio::select! {
             biased;
             command = rx.recv() => {
@@ -453,6 +464,11 @@ async fn run_job(
             () = sleep => {
                 cancel().await;
                 stop = Some(Stop::Timeout);
+                continue;
+            }
+            () = resend_tick => {
+                // Statements without a RowDescription give no early item, so a cancel sent before the backend was busy is lost.
+                cancel().await;
                 continue;
             }
             item = stream.next() => item,

@@ -187,6 +187,33 @@ fn cancel_right_after_run_stops_it() {
 
 #[test]
 #[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn cancel_right_after_run_stops_a_write() {
+    let rig = rig(false);
+    rig.run(1, "create temp table cancel_t as select 1 as a", 500, None);
+    loop {
+        match rig.next() {
+            Update::Done { run: RunId(1), .. } => break,
+            Update::Columns { .. } | Update::Rows { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    for i in 0..5 {
+        let run = 2 + i;
+        let started = Instant::now();
+        rig.run(
+            run,
+            "update cancel_t set a = length(pg_sleep(3)::text)",
+            500,
+            None,
+        );
+        cancel(&rig, run);
+        done_or_cancel_error(&rig, run);
+        assert!(started.elapsed() < Duration::from_millis(2500));
+    }
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
 fn cancel_queued_run_never_runs() {
     let rig = rig(false);
     let started = Instant::now();

@@ -48,8 +48,9 @@ mod tests {
     #[test]
     fn byte_cap_truncates() {
         let mut budget = Budget::default();
+        let overhead = std::mem::size_of::<Vec<Cell>>() + std::mem::size_of::<Cell>();
         let big = vec![Some(
-            String::from_utf8(vec![b'x'; MAX_BYTES / 2 - 48]).unwrap(),
+            String::from_utf8(vec![b'x'; MAX_BYTES / 2 - overhead]).unwrap(),
         )];
         assert!(budget.admit(&big));
         assert!(budget.admit(&big));
