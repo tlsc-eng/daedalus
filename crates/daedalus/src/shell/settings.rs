@@ -809,7 +809,7 @@ impl Shell {
         let mut commands: Vec<&str> = gpui::generate_list_of_all_registered_actions()
             .map(|a| a.name)
             .filter(|n| {
-                !["zed::", "text_input::", "context_menu::"]
+                !["zed::", "text_input::", "context_menu::", "data_grid::"]
                     .iter()
                     .any(|p| n.starts_with(p))
             })
