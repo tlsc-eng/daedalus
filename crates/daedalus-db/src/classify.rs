@@ -110,7 +110,7 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                     c == b'\''
                         && i > 0
                         && b[i - 1] | 0x20 == b'e'
-                        && (i == 1 || !is_word_byte(b[i - 2]))
+                        && (i == 1 || !(is_word_byte(b[i - 2]) || b[i - 2] == b'$'))
                 }
                 Engine::Sqlite => false,
             };
@@ -128,6 +128,20 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 } else {
                     i += 1;
                 }
+            }
+            // Backslash-quote splits differently under NO_BACKSLASH_ESCAPES, ANSI_QUOTES and
+            // standard_conforming_strings, so the rest of the script cannot be trusted.
+            let backslashes = match engine {
+                Engine::Mysql => c != b'`',
+                Engine::Postgres => c == b'\'',
+                Engine::Sqlite => false,
+            };
+            if backslashes
+                && b[start + 1..i]
+                    .windows(2)
+                    .any(|w| w[0] == b'\\' && matches!(w[1], b'\'' | b'"' | b'`'))
+            {
+                out.push((Tok::Hazard, start..i));
             }
             out.push((Tok::Literal, start..i));
         } else if c == b'[' && engine == Engine::Sqlite {
@@ -224,7 +238,9 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
     let mut out = Vec::new();
     let mut first = 0;
     let mut body = Body::default();
+    let mut tainted = false;
     for (n, (tok, span)) in toks.iter().enumerate() {
+        tainted |= *tok == Tok::Hazard;
         body.feed(*tok, &sql[span.clone()]);
         let last = n + 1 == toks.len();
         if (*tok != Tok::Semi || body.open()) && !last {
@@ -238,7 +254,7 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
             continue;
         }
         let range = chunk[0].1.start..span.end;
-        let (kind, unguarded) = if in_body {
+        let (kind, unguarded) = if in_body || tainted {
             (Kind::Unknown, false)
         } else {
             classify(sql, chunk, engine, ready.then_some(&mut parser))
@@ -338,6 +354,124 @@ fn pragma_kind(sql: &str, toks: &Toks) -> Kind {
     }
 }
 
+const PG_TXN: &[&str] = &[
+    "work",
+    "transaction",
+    "isolation",
+    "level",
+    "read",
+    "only",
+    "committed",
+    "uncommitted",
+    "repeatable",
+    "serializable",
+    "deferrable",
+];
+
+const MY_START: &[&str] = &["with", "consistent", "snapshot", "read", "only"];
+
+const LITE_BEGIN: &[&str] = &["deferred", "immediate", "exclusive", "transaction"];
+
+/// Transaction only when every word after BEGIN / START TRANSACTION is on the engine's allowlist.
+fn txn_start_kind(toks: &Toks, ws: &[String], engine: Engine) -> Kind {
+    let is_start = ws[0] == "start";
+    let skip = if is_start { 2 } else { 1 };
+    if is_start && (engine == Engine::Sqlite || ws.get(1).is_none_or(|w| w != "transaction")) {
+        return Kind::Unknown;
+    }
+    let commas = engine != Engine::Sqlite;
+    let plain = toks.iter().enumerate().all(|(n, t)| match t.0 {
+        Tok::Word => true,
+        Tok::Punct(b',') => commas,
+        Tok::Semi => n + 1 == toks.len(),
+        _ => false,
+    });
+    if !plain {
+        return Kind::Unknown;
+    }
+    let rest: Vec<&str> = ws.iter().skip(skip).map(String::as_str).collect();
+    let ok = match engine {
+        Engine::Postgres => rest.iter().enumerate().all(|(n, w)| {
+            PG_TXN.contains(w) || (*w == "not" && rest.get(n + 1) == Some(&"deferrable"))
+        }),
+        Engine::Mysql if is_start => rest.iter().all(|w| MY_START.contains(w)),
+        Engine::Mysql => rest.is_empty() || rest == ["work"],
+        Engine::Sqlite => rest.iter().all(|w| LITE_BEGIN.contains(w)),
+    };
+    if ok { Kind::Transaction } else { Kind::Unknown }
+}
+
+const PG_SET: &[&str] = &[
+    "search_path",
+    "timezone",
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "application_name",
+    "client_encoding",
+    "datestyle",
+    "intervalstyle",
+    "extra_float_digits",
+    "work_mem",
+    "client_min_messages",
+    "bytea_output",
+];
+
+const MY_SET: &[&str] = &[
+    "time_zone",
+    "max_execution_time",
+    "sql_select_limit",
+    "lc_time_names",
+    "character_set_client",
+    "character_set_results",
+    "character_set_connection",
+    "collation_connection",
+];
+
+/// Session only for the allowlisted `SET name = value` shapes; everything else is Unknown.
+fn set_kind(sql: &str, toks: &Toks, engine: Engine) -> Kind {
+    let mut rest = &toks[1..];
+    while let Some(((Tok::Semi, _), head)) = rest.split_last() {
+        rest = head;
+    }
+    let names = match engine {
+        Engine::Postgres => PG_SET,
+        Engine::Mysql => MY_SET,
+        Engine::Sqlite => return Kind::Unknown,
+    };
+    let lower = |t: &(Tok, Range<usize>)| word(sql, t).map(str::to_ascii_lowercase);
+    if rest
+        .first()
+        .and_then(lower)
+        .is_some_and(|w| w == "session" || w == "local")
+    {
+        rest = &rest[1..];
+    }
+    let w0 = rest.first().and_then(lower);
+    let w1 = rest.get(1).and_then(lower);
+    let (value, commas) = match (engine, w0.as_deref(), w1.as_deref()) {
+        (Engine::Postgres, Some("time"), Some("zone")) => (&rest[2..], false),
+        (_, Some("names"), _) => (&rest[1..], false),
+        (Engine::Mysql, Some("character"), Some("set")) => (&rest[2..], false),
+        (Engine::Mysql, Some("charset"), _) => (&rest[1..], false),
+        (_, Some(name), _)
+            if names.contains(&name)
+                && (w1.as_deref() == Some("to")
+                    || rest.get(1).is_some_and(|t| t.0 == Tok::Punct(b'='))) =>
+        {
+            (&rest[2..], matches!(name, "search_path" | "datestyle"))
+        }
+        _ => return Kind::Unknown,
+    };
+    let plain = !value.is_empty()
+        && value.iter().all(|t| match t.0 {
+            Tok::Word | Tok::Literal => true,
+            Tok::Punct(c) => matches!(c, b'-' | b'+' | b'.') || (c == b',' && commas),
+            _ => false,
+        });
+    if plain { Kind::Session } else { Kind::Unknown }
+}
+
 fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>) -> (Kind, bool) {
     if toks.iter().any(|t| t.0 == Tok::Hazard) {
         return (Kind::Unknown, false);
@@ -346,7 +480,9 @@ fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>)
     let mut analyzed = false;
     // EXPLAIN ANALYZE runs its statement; plain EXPLAIN only plans it.
     while let Some(w) = toks.first().and_then(|t| word(sql, t)) {
-        if !w.eq_ignore_ascii_case("explain") {
+        let desc = engine == Engine::Mysql
+            && (w.eq_ignore_ascii_case("desc") || w.eq_ignore_ascii_case("describe"));
+        if !(w.eq_ignore_ascii_case("explain") || desc) {
             break;
         }
         match toks.get(1) {
@@ -391,33 +527,17 @@ fn classify_one(
     match head.as_deref() {
         Some("show" | "describe" | "desc") => return (Kind::Read, false),
         Some("pragma") => return (pragma_kind(sql, toks), false),
-        Some("begin" | "commit" | "end" | "rollback" | "savepoint" | "release") => {
+        Some("begin" | "start") => return (txn_start_kind(toks, &ws, engine), false),
+        Some("commit" | "end" | "rollback" | "savepoint" | "release") => {
             return if has_read_write(&ws) {
                 unknown
             } else {
                 (Kind::Transaction, false)
             };
         }
-        Some("start") => {
-            return if ws.get(1).is_some_and(|w| w == "transaction") && !has_read_write(&ws) {
-                (Kind::Transaction, false)
-            } else {
-                unknown
-            };
-        }
         Some("truncate") => return (Kind::Ddl, false),
         Some("reset") => return unknown,
-        Some("set") => {
-            let risky = has_read_write(&ws)
-                || ws.iter().any(|w| w.contains("read_only"))
-                || ws
-                    .iter()
-                    .take(3)
-                    .any(|w| w == "role" || w == "authorization");
-            if risky {
-                return unknown;
-            }
-        }
+        Some("set") => return (set_kind(sql, toks, engine), false),
         _ => {}
     }
     if engine == Engine::Mysql
@@ -561,7 +681,7 @@ mod tests {
         assert_eq!(kind("alter table a add c int"), Kind::Ddl);
         assert_eq!(kind("drop table a"), Kind::Ddl);
         assert_eq!(kind("truncate t"), Kind::Ddl);
-        assert_eq!(kind("set x = 1"), Kind::Session);
+        assert_eq!(kind("set search_path = public"), Kind::Session);
         for s in ["begin", "commit;", "ROLLBACK", "start transaction"] {
             assert_eq!(kind(s), Kind::Transaction, "{s}");
         }
@@ -701,7 +821,7 @@ mod tests {
         assert!(not_read(k[1]));
         let k = kinds("select E'\\'' ; delete from t; select 'a'", PG);
         assert_eq!(k.len(), 3);
-        assert_eq!(k[1], Kind::Write);
+        assert!(not_read(k[1]));
         let k = kinds("select 1 /* /* */ ; delete from t; */ ; drop table u", PG);
         assert_eq!(k.len(), 2);
     }
@@ -792,6 +912,112 @@ mod tests {
         }
         assert_eq!(kind("begin"), Kind::Transaction);
         assert_eq!(kind("start transaction"), Kind::Transaction);
+    }
+
+    fn none_read(sql: &str, engine: Engine) {
+        let k = kinds(sql, engine);
+        assert!(
+            !k.is_empty() && k.iter().all(|k| not_read(*k)),
+            "{sql}: {k:?}"
+        );
+    }
+
+    #[test]
+    fn mysql_desc_behaves_like_explain() {
+        for s in [
+            "desc analyze delete from t",
+            "describe analyze delete t from t join u on 1",
+        ] {
+            assert!(not_read(kind_with(s, MY)), "{s}");
+        }
+        for s in [
+            "describe t",
+            "desc t",
+            "describe t col",
+            "desc analyze select 1",
+        ] {
+            assert_eq!(kind_with(s, MY), Kind::Read, "{s}");
+        }
+    }
+
+    #[test]
+    fn backslash_before_quote_taints_the_script() {
+        for s in [
+            "show tables like 'a\\' ; drop table t; -- '",
+            "explain select 'a\\' ; drop table t; -- '",
+            "select \"a\\\" ; drop table t; -- \"",
+        ] {
+            none_read(s, MY);
+        }
+        none_read("select 'a\\' ; select ' ; delete from t; -- '", PG);
+        none_read("explain select x$e'\\' ; delete from t; -- '", PG);
+        assert_eq!(
+            kinds("select 'a\\'; select 1", LITE),
+            [Kind::Read, Kind::Read]
+        );
+    }
+
+    #[test]
+    fn set_allowlist() {
+        for (s, e) in [
+            ("set \"default_transaction_read_only\" = off", PG),
+            ("set session `transaction_read_only` = 0", MY),
+            ("set local session authorization postgres", PG),
+            ("set session_authorization = 'postgres'", PG),
+            ("set \"role\" = postgres", PG),
+            ("set password = 'x'", MY),
+            ("set standard_conforming_strings = off", PG),
+            ("set sql_mode = 'NO_BACKSLASH_ESCAPES'", MY),
+            ("set @a = 1", MY),
+            ("set time_zone = '+00:00', sql_mode = ''", MY),
+            ("set time_zone = 'a' b = 1", MY),
+            ("set search_path = public", LITE),
+        ] {
+            assert_eq!(kind_with(s, e), Kind::Unknown, "{s}");
+        }
+        for (s, e) in [
+            ("set search_path = public, app", PG),
+            ("set statement_timeout to 5000", PG),
+            ("set time zone 'UTC'", PG),
+            ("set names utf8mb4", MY),
+            ("set names utf8mb4 collate utf8mb4_bin", MY),
+            ("set character set utf8mb4", MY),
+            ("set session time_zone = '+00:00'", MY),
+        ] {
+            assert_eq!(kind_with(s, e), Kind::Session, "{s}");
+        }
+    }
+
+    #[test]
+    fn begin_allowlist() {
+        let k = kinds("begin not atomic delete from t; end", MY);
+        assert_eq!(k[0], Kind::Unknown, "{k:?}");
+        assert_eq!(
+            kind_with("begin isolation level serializable, read only", PG),
+            Kind::Transaction
+        );
+        assert_eq!(kind_with("begin not deferrable", PG), Kind::Transaction);
+        assert_eq!(kind_with("begin immediate", LITE), Kind::Transaction);
+        assert_eq!(kind_with("begin work", MY), Kind::Transaction);
+        assert_eq!(
+            kind_with("start transaction with consistent snapshot", MY),
+            Kind::Transaction
+        );
+        for (s, e) in [
+            ("begin foo", PG),
+            ("begin not", PG),
+            ("begin foo", MY),
+            ("begin immediate", PG),
+            ("begin read write", PG),
+            ("start transaction", LITE),
+        ] {
+            assert_eq!(kind_with(s, e), Kind::Unknown, "{s}");
+        }
+    }
+
+    #[test]
+    fn adjacent_selects_are_unknown() {
+        assert_eq!(kind("select 1 select 2"), Kind::Unknown);
     }
 
     #[test]
