@@ -11,6 +11,6 @@ mod view;
 
 pub use terminal::StyledCell;
 pub use view::{
-    ClaudeState, TerminalEvent, TerminalView, init, is_shell, kill_sessions, open_connection,
-    read_messages,
+    ClaudeState, TerminalEvent, TerminalSettings, TerminalView, init, is_shell, kill_sessions,
+    open_connection, read_messages, set_settings,
 };

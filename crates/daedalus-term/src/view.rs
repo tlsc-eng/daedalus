@@ -70,7 +70,28 @@ const SESSION_LOST: &[u8] = b"\x1b[2m[previous session ended; started a new shel
 /// New output re-runs an open search at most this often; a full scrollback scan takes ~10 ms.
 const SEARCH_RERUN: Duration = Duration::from_millis(150);
 
+/// App-wide terminal preferences from the settings file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSettings {
+    pub copy_on_select: bool,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            copy_on_select: true,
+        }
+    }
+}
+
+impl gpui::Global for TerminalSettings {}
+
+pub fn set_settings(settings: TerminalSettings, cx: &mut App) {
+    cx.set_global(settings);
+}
+
 pub fn init(cx: &mut App) {
+    cx.set_global(TerminalSettings::default());
     let find = Some("TerminalFind");
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some("Terminal")),
@@ -1223,11 +1244,17 @@ impl TerminalView {
         if !std::mem::take(&mut self.selecting) {
             return;
         }
-        if let Some(terminal) = self.terminal.as_mut()
-            && !terminal.has_selection()
-        {
-            terminal.clear_selection();
-            cx.notify();
+        let copy = cx.global::<TerminalSettings>().copy_on_select;
+        if let Some(terminal) = self.terminal.as_mut() {
+            if !terminal.has_selection() {
+                terminal.clear_selection();
+                cx.notify();
+            } else if copy
+                && let Some(text) = terminal.selection_text()
+                && !text.trim().is_empty()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
         }
     }
 

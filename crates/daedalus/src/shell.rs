@@ -338,6 +338,7 @@ impl Shell {
         shell.start_settings(window, cx);
         shell.sync_claude_hooks(cx);
         shell.sync_companion(cx);
+        shell.sync_terminal(cx);
         crate::system_notify::set_badge(shell.unread());
         if splash {
             shell.begin_splash(cx);

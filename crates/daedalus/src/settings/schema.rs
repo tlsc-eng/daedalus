@@ -141,6 +141,7 @@ impl Setting {
             ["window", "zoom_level"] => s.zoom_level.map(Value::from),
             ["eslint", "fixOnSave"] => flag(s.eslint_fix_on_save),
             ["claude", "hooks"] => flag(s.claude_hooks),
+            ["terminal", "copy_on_select"] => flag(s.terminal_copy_on_select),
             ["companion", "enabled"] => flag(s.companion_enabled),
             ["companion", "push_url"] => s.companion_push_url.clone().map(Value::from),
             ["claude", "profiles"] => (!s.claude_profiles.is_empty()).then(|| {
@@ -525,6 +526,17 @@ pub static SETTINGS: &[Setting] = &[
         also: None,
     },
     Setting {
+        keys: &["terminal", "copy_on_select"],
+        aliases: &[],
+        title: "Copy on Select",
+        description: "Selecting text in a terminal copies it to the clipboard when the mouse \
+                      is released.",
+        group: Group::Workbench,
+        kind: TOGGLE_ON,
+        user_only: true,
+        also: None,
+    },
+    Setting {
         keys: &["companion", "enabled"],
         aliases: &[],
         title: "Phone Companion (Daedalus for iPhone)",
@@ -847,6 +859,7 @@ mod tests {
             format!("eslint {}", s.eslint_fix_on_save()),
             format!("hooks {}", s.claude_hooks()),
             format!("companion {}", s.companion_enabled()),
+            format!("copy on select {}", s.terminal_copy_on_select()),
         ]
     }
 
