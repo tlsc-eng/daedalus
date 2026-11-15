@@ -238,9 +238,130 @@ pub fn system_reduce_motion() -> bool {
     }
 }
 
+/// Opacity of content that is stale while its replacement loads.
+pub const STALE_OPACITY: f32 = 0.5;
+
+/// A wait in progress, timed so a fast one shows no indicator and a shown one does not flash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Busy {
+    since: Instant,
+}
+
+impl Busy {
+    pub fn start() -> Self {
+        Self {
+            since: Instant::now(),
+        }
+    }
+
+    pub fn since(&self) -> Instant {
+        self.since
+    }
+
+    /// Whether the wait has outlasted `delay`, so the indicator may appear.
+    pub fn shows(&self, delay: Duration) -> bool {
+        self.shows_at(Instant::now(), delay)
+    }
+
+    fn shows_at(&self, now: Instant, delay: Duration) -> bool {
+        now.saturating_duration_since(self.since) >= delay
+    }
+
+    /// How much longer the indicator stays up if the wait finishes now.
+    pub fn linger(&self, delay: Duration, hold: Duration) -> Duration {
+        self.linger_at(Instant::now(), delay, hold)
+    }
+
+    fn linger_at(&self, now: Instant, delay: Duration, hold: Duration) -> Duration {
+        let elapsed = now.saturating_duration_since(self.since);
+        if elapsed < delay {
+            return Duration::ZERO;
+        }
+        (delay + hold).saturating_sub(elapsed)
+    }
+}
+
+/// The spinner's turn in radians after `elapsed`: one eighth of a revolution per tick.
+pub fn spin_turn(elapsed: Duration) -> f32 {
+    ((elapsed.as_millis() / SPIN_TICK_MS) % SPIN_STEPS) as f32 * std::f32::consts::TAU
+        / SPIN_STEPS as f32
+}
+
+/// The wait to the next tick boundary after `elapsed`, so ticks stay on the grid `spin_turn` reads.
+pub fn until_next_spin(elapsed: Duration) -> Duration {
+    let tick = SPIN_TICK_MS as u64;
+    Duration::from_millis(tick - elapsed.as_millis() as u64 % tick)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DELAY: Duration = Duration::from_millis(250);
+    const HOLD: Duration = Duration::from_millis(400);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn busy_hides_the_indicator_before_the_delay() {
+        let b = Busy::start();
+        assert!(!b.shows_at(b.since() + ms(249), DELAY));
+    }
+
+    #[test]
+    fn busy_shows_the_indicator_from_the_delay() {
+        let b = Busy::start();
+        assert!(b.shows_at(b.since() + ms(250), DELAY));
+    }
+
+    #[test]
+    fn busy_needs_no_linger_when_it_never_showed() {
+        let b = Busy::start();
+        assert_eq!(
+            b.linger_at(b.since() + ms(100), DELAY, HOLD),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn busy_lingers_until_the_hold_ends() {
+        let b = Busy::start();
+        assert_eq!(b.linger_at(b.since() + ms(300), DELAY, HOLD), ms(350));
+    }
+
+    #[test]
+    fn busy_needs_no_linger_after_the_hold() {
+        let b = Busy::start();
+        assert_eq!(
+            b.linger_at(b.since() + ms(900), DELAY, HOLD),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn busy_treats_a_now_before_since_as_no_time() {
+        let later = Busy::start();
+        let now = later.since() - ms(10);
+        assert!(!later.shows_at(now, DELAY));
+        assert_eq!(later.linger_at(now, DELAY, HOLD), Duration::ZERO);
+    }
+
+    #[test]
+    fn spin_turn_steps_an_eighth_per_tick() {
+        assert_eq!(spin_turn(ms(0)), 0.);
+        assert_eq!(spin_turn(ms(124)), 0.);
+        assert!((spin_turn(ms(125)) - std::f32::consts::TAU / 8.).abs() < 1e-6);
+        assert_eq!(spin_turn(ms(1000)), 0.);
+    }
+
+    #[test]
+    fn until_next_spin_waits_for_the_next_boundary() {
+        for (at, wait) in [(0, 125), (1, 124), (124, 1), (125, 125), (130, 120)] {
+            assert_eq!(until_next_spin(ms(at)), ms(wait));
+        }
+    }
 
     #[test]
     fn endpoints_are_fixed() {
