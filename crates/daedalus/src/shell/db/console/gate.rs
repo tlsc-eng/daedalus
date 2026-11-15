@@ -4,6 +4,8 @@ pub(super) struct Target<'a> {
     pub name: &'a str,
     pub read_only: bool,
     pub production: bool,
+    pub manual: bool,
+    pub mysql: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -49,6 +51,12 @@ pub(super) fn gate(sql: &str, statements: &[Statement], target: &Target) -> Gate
             ));
         }
     }
+    if target.manual && target.mysql && statements.iter().any(|s| s.kind == Kind::Ddl) {
+        return Gate::Refuse(
+            "MySQL commits the open transaction before DDL, so it can't run in Manual mode. Switch to Auto to run it."
+                .into(),
+        );
+    }
     let mut reasons = Vec::new();
     if target.production && statements.iter().any(|s| s.kind != Kind::Read) {
         reasons.push(format!("{name} is marked as production."));
@@ -84,6 +92,8 @@ mod tests {
             name: "main",
             read_only,
             production,
+            manual: false,
+            mysql: false,
         }
     }
 
@@ -198,5 +208,38 @@ mod tests {
             check("  ", &target(false, false)),
             Gate::Refuse(String::new())
         );
+    }
+
+    #[test]
+    fn mysql_ddl_is_refused_in_manual_mode() {
+        let sql = "create table t (a int)";
+        let t = Target {
+            manual: true,
+            mysql: true,
+            ..target(false, false)
+        };
+        assert!(matches!(
+            gate(sql, &split(sql, Engine::Mysql), &t),
+            Gate::Refuse(m) if m.contains("Switch to Auto")
+        ));
+    }
+
+    #[test]
+    fn postgres_ddl_runs_in_manual_mode() {
+        let t = Target {
+            manual: true,
+            ..target(false, false)
+        };
+        assert_eq!(check("create table t (a int)", &t), Gate::Run);
+    }
+
+    #[test]
+    fn mysql_ddl_runs_in_auto_mode() {
+        let sql = "create table t (a int)";
+        let t = Target {
+            mysql: true,
+            ..target(false, false)
+        };
+        assert_eq!(gate(sql, &split(sql, Engine::Mysql), &t), Gate::Run);
     }
 }

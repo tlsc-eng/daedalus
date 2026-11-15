@@ -867,6 +867,29 @@ impl Shell {
                 });
             }
         }
+        let open_tx = self
+            .active_root()
+            .and_then(|root| self.items.get(&(root, item)).cloned())
+            .is_some_and(|view| matches!(&view, ItemView::DbConsole(c) if c.read(cx).tx_open()));
+        if let (true, Some(root)) = (open_tx, self.active_root()) {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Roll back the open transaction?",
+                Some("Closing the console ends its session, and changes that aren't committed are lost. Commit from the toolbar first to keep them."),
+                &super::lsp::confirm_buttons("Cancel", "Roll Back and Close"),
+                cx,
+            );
+            return cx
+                .spawn_in(window, async move |this, cx| {
+                    if answer.await.ok() != Some(super::lsp::CONFIRMED) {
+                        return;
+                    }
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.close_after_prompt(&root, pane, item, window, cx);
+                    });
+                })
+                .detach();
+        }
         let dirty = self
             .active_root()
             .and_then(|root| self.items.get(&(root, item)).cloned())

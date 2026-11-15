@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use daedalus_db::classify::{self, Statement};
-use daedalus_db::worker::{Handle, RunMode, SessionId, Update};
+use daedalus_db::worker::{Command, Handle, RunMode, SessionId, TxOp, Update};
 use daedalus_db::{Engine, Listed};
 use daedalus_editor::{EditorEvent, EditorView, Marker, MarkerSeverity};
 use daedalus_ui::motion::{self, Busy};
@@ -89,6 +89,8 @@ pub(in crate::shell) struct DbConsoleView {
     info: Option<Info>,
     phase: ConsolePhase,
     session: Option<SessionId>,
+    manual: bool,
+    tx_open: bool,
     handle: Option<Handle>,
     setup_error: Option<String>,
     editor: Entity<EditorView>,
@@ -166,6 +168,8 @@ impl DbConsoleView {
                 None => ConsolePhase::Idle,
             },
             session: None,
+            manual: false,
+            tx_open: false,
             handle: None,
             setup_error,
             editor,
@@ -206,6 +210,10 @@ impl DbConsoleView {
         }
     }
 
+    pub fn tx_open(&self) -> bool {
+        self.tx_open
+    }
+
     pub fn needs_connect(&self) -> bool {
         matches!(self.phase, ConsolePhase::Idle | ConsolePhase::Failed(_))
     }
@@ -222,6 +230,7 @@ impl DbConsoleView {
         cx: &mut Context<Self>,
     ) {
         self.session = Some(session);
+        self.tx_open = false;
         self.handle = Some(handle);
         self.info = Some(info);
         self.phase = ConsolePhase::Connecting(Busy::start());
@@ -238,12 +247,14 @@ impl DbConsoleView {
     pub fn idle(&mut self, cx: &mut Context<Self>) {
         self.phase = ConsolePhase::Idle;
         self.session = None;
+        self.tx_open = false;
         cx.notify();
     }
 
     pub fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.phase = ConsolePhase::Failed(message.into());
         self.session = None;
+        self.tx_open = false;
         self.batch.reset();
         self.busy = None;
         cx.notify();
@@ -251,8 +262,9 @@ impl DbConsoleView {
 
     /// Hangs up the session; never after a `Failed`, which already ended it.
     fn disconnect(&mut self) {
+        self.tx_open = false;
         if let (Some(session), Some(handle)) = (self.session.take(), &self.handle) {
-            handle.send(daedalus_db::worker::Command::Disconnect { session });
+            handle.send(Command::Disconnect { session });
         }
     }
 
@@ -272,6 +284,7 @@ impl DbConsoleView {
                 }
                 self.phase = ConsolePhase::Failed(error);
                 self.session = None;
+                self.tx_open = false;
                 self.batch.reset();
                 self.busy = None;
                 self.grid.update(cx, |g, cx| g.set_stale(false, cx));
@@ -283,7 +296,15 @@ impl DbConsoleView {
                 let effects = self.batch.on(update);
                 self.apply(effects, cx);
             }
-            Update::Catalog { .. } | Update::TxState { .. } => {}
+            Update::TxState { open, error, .. } => {
+                self.tx_open = open;
+                if let Some(message) = error {
+                    self.error = Some(ErrorBanner { message, at: None });
+                    self.tab = ResultTab::Result;
+                    self.log("The transaction ended unexpectedly.".into(), true);
+                }
+            }
+            Update::Catalog { .. } => {}
         }
         cx.notify();
     }
@@ -335,6 +356,18 @@ impl DbConsoleView {
                         self.editor
                             .update(cx, |e, cx| e.set_markers(vec![marker], cx));
                     }
+                    let failed_tx = self.manual
+                        && self.tx_open
+                        && self
+                            .info
+                            .as_ref()
+                            .is_some_and(|i| i.engine == Engine::Postgres);
+                    let message = match failed_tx {
+                        true => {
+                            format!("{message} The transaction has failed; roll back to continue.")
+                        }
+                        false => message,
+                    };
                     self.error = Some(ErrorBanner { message, at });
                     self.grid.update(cx, |g, cx| g.set_stale(false, cx));
                 }
@@ -431,6 +464,8 @@ impl DbConsoleView {
             name: &info.name,
             read_only: info.read_only,
             production: info.production,
+            manual: self.manual,
+            mysql: info.engine == Engine::Mysql,
         };
         let verdict = gate::gate(&source, &statements, &target);
         let pieces = statements
@@ -489,10 +524,7 @@ impl DbConsoleView {
         self.grid.update(cx, |g, cx| g.set_stale(true, cx));
         self.busy = Some(Busy::start());
         self.start_spin(cx);
-        let mode = match info.read_only {
-            true => RunMode::ReadOnly,
-            false => RunMode::Auto,
-        };
+        let mode = run_mode(info.read_only, self.manual);
         let effects = self.batch.start(session, pieces, mode);
         self.apply(effects, cx);
     }
@@ -524,7 +556,41 @@ impl Render for DbConsoleView {
     }
 }
 
+fn run_mode(read_only: bool, manual: bool) -> RunMode {
+    match (read_only, manual) {
+        (true, _) => RunMode::ReadOnly,
+        (false, true) => RunMode::Transaction,
+        (false, false) => RunMode::Auto,
+    }
+}
+
 impl DbConsoleView {
+    fn set_manual(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.manual == manual {
+            return;
+        }
+        if self.tx_open {
+            self.error = Some(ErrorBanner {
+                message: "Commit or roll back the open transaction first.".into(),
+                at: None,
+            });
+            self.tab = ResultTab::Result;
+        } else {
+            self.manual = manual;
+        }
+        cx.notify();
+    }
+
+    fn end_transaction(&mut self, op: TxOp) {
+        let (Some(session), Some(handle)) = (self.session, &self.handle) else {
+            return;
+        };
+        if self.batch.running() || !self.tx_open {
+            return;
+        }
+        handle.send(Command::Transaction { session, op });
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
         let (delay, reduced) = (t.motion.indicator_delay, t.motion.reduced);
@@ -571,6 +637,44 @@ impl DbConsoleView {
                 cx.listener(|this, _: &ClickEvent, window, cx| this.run(false, window, cx)),
             ),
         };
+        let manual = self.manual;
+        let tx_ready = self.tx_open && !running;
+        let mode = self.info.as_ref().is_some_and(|i| !i.read_only).then(|| {
+            let pick = |id: &'static str, label: &'static str, on: bool| {
+                let kind = match on {
+                    true => ButtonKind::Secondary,
+                    false => ButtonKind::Ghost,
+                };
+                Button::new(id, label, kind).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| this.set_manual(label == "Manual", cx),
+                ))
+            };
+            let end = |id: &'static str, label: &'static str, op: TxOp| match tx_ready {
+                true => Button::new(id, label, ButtonKind::Secondary)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.end_transaction(op);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                false => div()
+                    .text_color(t.color.content_muted)
+                    .child(label)
+                    .into_any_element(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space(Space::Sm))
+                .child(pick("db-console-auto", "Auto", !manual))
+                .child(pick("db-console-manual", "Manual", manual))
+                .when(manual, |el| {
+                    el.child(end("db-console-commit", "Commit", TxOp::Commit))
+                        .child(end("db-console-rollback", "Roll Back", TxOp::Rollback))
+                })
+                .when(manual && self.tx_open, |el| {
+                    el.child(tag("Transaction open", t.color.warning))
+                })
+        });
         let status = match &self.phase {
             ConsolePhase::Connecting(busy) => div()
                 .flex()
@@ -631,6 +735,7 @@ impl DbConsoleView {
                     cx.listener(|this, _: &ClickEvent, window, cx| this.run(true, window, cx)),
                 ),
             )
+            .children(mode)
             .child(div().flex_1())
             .child(status)
             .into_any_element()
@@ -753,5 +858,18 @@ impl DbConsoleView {
             .children(banner)
             .child(body)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_mode_prefers_read_only() {
+        assert_eq!(run_mode(true, true), RunMode::ReadOnly);
+        assert_eq!(run_mode(true, false), RunMode::ReadOnly);
+        assert_eq!(run_mode(false, true), RunMode::Transaction);
+        assert_eq!(run_mode(false, false), RunMode::Auto);
     }
 }
