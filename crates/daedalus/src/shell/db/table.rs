@@ -34,6 +34,7 @@ enum Discard {
     Revert,
     Filter,
     Load(usize),
+    Connect,
 }
 
 struct Preview {
@@ -83,6 +84,7 @@ pub(in crate::shell) struct DbTableView {
     preview: Option<Preview>,
     submitting: Option<Submitting>,
     failed: Option<usize>,
+    stale: bool,
     note: Option<&'static str>,
     menu: Option<(Entity<ContextMenu>, Subscription)>,
     error: Option<String>,
@@ -139,6 +141,7 @@ impl DbTableView {
             preview: None,
             submitting: None,
             failed: None,
+            stale: false,
             note: None,
             menu: None,
             error: None,
@@ -284,6 +287,7 @@ impl DbTableView {
                         Ok(_) => {
                             self.edits.clear();
                             self.failed = None;
+                            self.stale = true;
                             self.sync_marks(cx);
                             self.load(self.offset, cx);
                         }
@@ -329,6 +333,8 @@ impl DbTableView {
         self.edits.clear();
         self.failed = None;
         self.preview = None;
+        self.stale = false;
+        self.note = None;
         self.sync_marks(cx);
         self.sync_editable(cx);
     }
@@ -443,11 +449,13 @@ impl DbTableView {
     }
 
     fn can_edit(&self) -> bool {
-        self.shape_ok().is_some()
-            && matches!(self.phase, TablePhase::Connected)
-            && self.run.is_none()
-            && self.submitting.is_none()
-            && self.preview.is_none()
+        edit_gate(
+            self.shape_ok().is_some(),
+            matches!(self.phase, TablePhase::Connected),
+            self.run.is_none(),
+            self.submitting.is_none() && self.preview.is_none(),
+            self.stale,
+        )
     }
 
     fn sync_editable(&self, cx: &mut Context<Self>) {
@@ -664,6 +672,7 @@ impl DbTableView {
             Discard::Revert => {}
             Discard::Filter => self.apply(cx),
             Discard::Load(offset) => self.load(offset, cx),
+            Discard::Connect => cx.emit(DbTableEvent::Connect),
         }
     }
 
@@ -873,6 +882,11 @@ fn find_table(catalog: &Catalog, schema: &str, table: &str) -> Result<Arc<Table>
     }
 }
 
+/// A page that still shows applied values must be reloaded before it can be edited again.
+fn edit_gate(shape: bool, connected: bool, idle: bool, free: bool, stale: bool) -> bool {
+    shape && connected && idle && free && !stale
+}
+
 fn run_mode(read_only: bool) -> RunMode {
     match read_only {
         true => RunMode::ReadOnly,
@@ -1020,7 +1034,9 @@ impl DbTableView {
                     })
                     .child(
                         Button::new("db-table-connect", "Connect", ButtonKind::Secondary).on_click(
-                            cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(DbTableEvent::Connect)),
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.guard(Discard::Connect, window, cx)
+                            }),
                         ),
                     )
                     .into_any_element()
@@ -1069,7 +1085,9 @@ impl DbTableView {
         };
         let prev = step("db-table-prev", "‹", idle && self.offset > 0, false, cx);
         let next = step("db-table-next", "›", idle && self.has_next, true, cx);
-        let note = self.note.or(match &self.shape {
+        let reload_hint =
+            (self.stale && idle && self.shape_ok().is_some()).then_some("Reload to edit again.");
+        let note = self.note.or(reload_hint).or(match &self.shape {
             Some(Err(reason)) => Some(*reason),
             _ => None,
         });
@@ -1341,6 +1359,14 @@ mod tests {
                 .contains("5,000")
         );
         assert!(find_table(&catalog, "public", "t").is_ok());
+    }
+
+    #[test]
+    fn a_stale_page_cannot_be_edited_until_a_load_finishes() {
+        assert!(edit_gate(true, true, true, true, false));
+        assert!(!edit_gate(true, true, true, true, true));
+        assert!(!edit_gate(true, true, false, true, false));
+        assert!(!edit_gate(false, true, true, true, false));
     }
 
     #[test]
