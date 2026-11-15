@@ -949,18 +949,30 @@ impl Shell {
     ) {
         if !self.db.loaded {
             self.db_ensure_loaded(cx);
+            let view = view.downgrade();
             cx.spawn_in(window, async move |this, cx| {
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(50))
                         .await;
-                    let ready = this.update(cx, |shell, _| shell.db.loaded).ok();
+                    if view.upgrade().is_none() {
+                        return;
+                    }
+                    let ready = this
+                        .update(cx, |shell, cx| {
+                            shell.db_ensure_loaded(cx);
+                            shell.db.loaded
+                        })
+                        .ok();
                     match ready {
                         Some(false) => continue,
                         Some(true) => break,
                         None => return,
                     }
                 }
+                let Some(view) = view.upgrade() else {
+                    return;
+                };
                 this.update_in(cx, |shell, window, cx| {
                     if shell.db.store.is_none() {
                         let message = shell

@@ -189,7 +189,9 @@ impl DbConsoleView {
     /// Writes the console's text to its file; the shell never treats a console as a dirty editor.
     pub fn save_text(&self, cx: &mut gpui::App) {
         self.editor.update(cx, |e, cx| {
-            e.save(cx);
+            if e.is_dirty() {
+                e.save(cx);
+            }
         });
     }
 

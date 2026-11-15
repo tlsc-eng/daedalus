@@ -57,9 +57,6 @@ impl Shell {
     /// A quit that skipped the Save question (Dock, logout, `osascript`) saves what auto save would
     /// and keeps recovery copies of the rest, so nothing unsaved is dropped.
     pub(super) fn flush_unsaved(&mut self, cx: &mut Context<Self>) {
-        if self.quit_settled {
-            return;
-        }
         let consoles: Vec<_> = self
             .items
             .values()
@@ -70,6 +67,9 @@ impl Shell {
             .collect();
         for console in consoles {
             console.update(cx, |c, cx| c.save_text(cx));
+        }
+        if self.quit_settled {
+            return;
         }
         if self.autosave_delay().is_some() {
             for editor in self.dirty_editors(None, cx) {
