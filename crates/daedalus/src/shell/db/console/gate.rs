@@ -155,11 +155,29 @@ mod tests {
             "select 1; -- x\r delete from t",
             "select 1; -- x\r delete from t\nselect 1",
         ] {
-            assert!(matches!(
-                check(sql, &target(false, false)),
-                Gate::Refuse(m) if m.contains("carriage return")
-            ));
+            for t in [
+                target(false, false),
+                target(false, true),
+                Target {
+                    manual: true,
+                    ..target(false, false)
+                },
+            ] {
+                assert!(matches!(
+                    check(sql, &t),
+                    Gate::Refuse(m) if m.contains("carriage return")
+                ));
+            }
         }
+    }
+
+    #[test]
+    fn other_scanner_hazards_still_run_on_a_writable_target() {
+        let t = target(false, false);
+        let my = "select 'it\\'s'";
+        assert_eq!(gate(my, &split(my, Engine::Mysql), &t), Gate::Run);
+        let pg = "select E'it\\'s'";
+        assert_eq!(gate(pg, &split(pg, Engine::Postgres), &t), Gate::Run);
     }
 
     #[test]

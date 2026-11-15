@@ -36,6 +36,8 @@ enum Tok {
     Literal,
     /// A comment the server executes (MySQL `/*! */`), so the chunk cannot be trusted.
     Hazard,
+    /// A line comment holding a bare CR, which the server ends early.
+    HiddenCr,
 }
 
 type Toks = [(Tok, Range<usize>)];
@@ -91,7 +93,7 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
                 .enumerate()
                 .any(|(k, x)| *x == b'\r' && b.get(start + k + 1) != Some(&b'\n'))
             {
-                out.push((Tok::Hazard, start..i));
+                out.push((Tok::HiddenCr, start..i));
             }
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
@@ -260,7 +262,7 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
     let mut body = Body::default();
     let mut tainted = false;
     for (n, (tok, span)) in toks.iter().enumerate() {
-        tainted |= *tok == Tok::Hazard;
+        tainted |= matches!(tok, Tok::Hazard | Tok::HiddenCr);
         body.feed(*tok, &sql[span.clone()]);
         let last = n + 1 == toks.len();
         if (*tok != Tok::Semi || body.open()) && !last {
@@ -279,7 +281,7 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
         } else {
             classify(sql, chunk, engine, ready.then_some(&mut parser))
         };
-        let hidden = chunk.iter().any(|(t, _)| *t == Tok::Hazard);
+        let hidden = chunk.iter().any(|(t, _)| *t == Tok::HiddenCr);
         out.push(Statement {
             range,
             kind,
@@ -495,7 +497,10 @@ fn set_kind(sql: &str, toks: &Toks, engine: Engine) -> Kind {
 }
 
 fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>) -> (Kind, bool) {
-    if toks.iter().any(|t| t.0 == Tok::Hazard) {
+    if toks
+        .iter()
+        .any(|t| matches!(t.0, Tok::Hazard | Tok::HiddenCr))
+    {
         return (Kind::Unknown, false);
     }
     let mut toks = toks;
@@ -981,6 +986,11 @@ mod tests {
         assert!(one(pg).hidden);
         assert_eq!(kind_with(pg, LITE), Kind::Unknown);
         assert_eq!(kind_with(my, MY), Kind::Unknown);
+        assert!(one_with(my, MY).hidden);
+        assert!(one_with(hash, MY).hidden);
+        assert!(one_with(pg, LITE).hidden);
+        assert!(!one_with("select 'it\\'s'", MY).hidden);
+        assert!(!one_with("select /*!40101 1 */", MY).hidden);
         assert_eq!(kind_with(hash, MY), Kind::Unknown);
         assert_eq!(kind_with("#é\r select 1", MY), Kind::Unknown);
         let k = kinds("select 1; -- x\r delete from t", PG);
@@ -1002,10 +1012,14 @@ mod tests {
         assert_eq!(k[1], Kind::Write);
     }
 
-    fn kind_with(sql: &str, engine: Engine) -> Kind {
+    fn one_with(sql: &str, engine: Engine) -> Statement {
         let all = split(sql, engine);
         assert_eq!(all.len(), 1, "{sql}: {all:?}");
-        all[0].kind
+        all.into_iter().next().unwrap()
+    }
+
+    fn kind_with(sql: &str, engine: Engine) -> Kind {
+        one_with(sql, engine).kind
     }
 
     #[test]
