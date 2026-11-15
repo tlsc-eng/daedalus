@@ -68,6 +68,7 @@ pub struct TextInput {
     all_selected: bool,
     marked: Option<Range<usize>>,
     placeholder: SharedString,
+    masked: bool,
     focus: FocusHandle,
     /// Each drawn line with the byte its text starts at.
     layout: Vec<(usize, ShapedLine)>,
@@ -96,6 +97,7 @@ impl TextInput {
             all_selected: false,
             marked: None,
             placeholder: placeholder.into(),
+            masked: false,
             focus: cx.focus_handle(),
             layout: Vec::new(),
             bounds: None,
@@ -110,6 +112,17 @@ impl TextInput {
     pub fn multiline(mut self, max_rows: usize) -> Self {
         self.max_rows = Some(max_rows.max(1));
         self
+    }
+
+    /// Draws one bullet per character and never hands the text to the system, for passwords.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
+    }
+
+    /// Byte length the characters in `text[from..to]` take once drawn.
+    fn shown_len(&self, from: usize, to: usize) -> usize {
+        shown(&self.text[from..to], self.masked).len()
     }
 
     /// Byte ranges of the text's lines, without their line breaks.
@@ -314,6 +327,15 @@ struct InputFrame {
 }
 
 /// Byte ranges of `text`'s lines without their breaks; a single-line box has one line.
+const BULLET: char = '\u{2022}';
+
+fn shown(text: &str, masked: bool) -> std::borrow::Cow<'_, str> {
+    match masked {
+        true => text.chars().map(|_| BULLET).collect::<String>().into(),
+        false => text.into(),
+    }
+}
+
 fn line_ranges(text: &str, multiline: bool) -> Vec<Range<usize>> {
     if !multiline {
         return std::iter::once(0..text.len()).collect();
@@ -418,7 +440,10 @@ impl Element for InputElement {
             let (text, color) = if input.text.is_empty() {
                 (input.placeholder.to_string(), theme.color.content_disabled)
             } else {
-                (input.text[range.clone()].to_string(), theme.color.content)
+                (
+                    shown(&input.text[range.clone()], input.masked).into_owned(),
+                    theme.color.content,
+                )
             };
             let base = TextRun {
                 len: text.len(),
@@ -432,7 +457,9 @@ impl Element for InputElement {
                 .marked
                 .as_ref()
                 .filter(|m| !input.text.is_empty() && m.start >= range.start && m.end <= range.end)
-                .map(|m| m.start - range.start..m.end - range.start);
+                .map(|m| {
+                    input.shown_len(range.start, m.start)..input.shown_len(range.start, m.end)
+                });
             let runs = match marked {
                 Some(m) => {
                     let underline = gpui::UnderlineStyle {
@@ -468,7 +495,7 @@ impl Element for InputElement {
         }
         let cursor_x = |line: &ShapedLine, start: usize| match input.text.is_empty() {
             true => px(0.),
-            false => line.x_for_index(input.cursor - start),
+            false => line.x_for_index(input.shown_len(start, input.cursor)),
         };
         let scroll_x = match lines.get(cursor_line) {
             Some((start, line)) if !input.text.is_empty() => scrolled_x(
@@ -564,7 +591,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range);
         *actual = Some(self.to_utf16(range.start)..self.to_utf16(range.end));
-        Some(self.text[range].to_string())
+        Some(shown(&self.text[range], self.masked).into_owned())
     }
 
     fn selected_text_range(
@@ -638,7 +665,10 @@ impl EntityInputHandler for TextInput {
         let rows = self.layout.len().clamp(1, self.max_rows.unwrap_or(1));
         let lh = bounds.size.height / rows as f32;
         let top = bounds.top() + lh * (row as f32 - self.scroll_row as f32);
-        let x = |b: usize| line.x_for_index(b.saturating_sub(*at).min(line.len()));
+        let x = |b: usize| {
+            let b = b.clamp(*at, self.text.len());
+            line.x_for_index(self.shown_len(*at, b).min(line.len()))
+        };
         Some(Bounds::from_corners(
             point(bounds.left() + x(start) - self.scroll_x, top),
             point(bounds.left() + x(end) - self.scroll_x, top + lh),
@@ -658,6 +688,19 @@ impl EntityInputHandler for TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masked_text_is_bullets_same_length() {
+        assert_eq!(shown("p\u{e9}w", true), "\u{2022}\u{2022}\u{2022}");
+        assert_eq!(shown("", true), "");
+        assert_eq!(shown("abc", false), "abc");
+    }
+
+    #[test]
+    fn copy_is_refused_when_masked() {
+        let exported = shown("hunter2", true);
+        assert!(!exported.contains("hunter2") && !exported.contains('h'));
+    }
 
     #[test]
     fn a_multiline_box_splits_at_breaks_and_scrolls_the_cursor_into_view() {
