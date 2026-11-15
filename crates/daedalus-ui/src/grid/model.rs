@@ -215,6 +215,19 @@ pub(crate) fn visible_columns(lefts: &[f32], scroll_x: f32, width: f32) -> Range
     start..end.max(start)
 }
 
+/// Fully visible (first, last) rows; (1, 0) when none fits, so the range stays empty.
+pub(crate) fn visible_rows(scroll_y: f32, body_h: f32, row_h: f32) -> (usize, usize) {
+    if row_h <= 0. || !row_h.is_finite() || !scroll_y.is_finite() || !body_h.is_finite() {
+        return (0, 0);
+    }
+    let first = (scroll_y / row_h).ceil() as usize;
+    let end = ((scroll_y + body_h) / row_h).floor() as usize;
+    if end == 0 {
+        return (1, 0);
+    }
+    (first, end - 1)
+}
+
 pub(crate) fn scroll_strategy(
     target: usize,
     first_visible: usize,
@@ -439,6 +452,32 @@ mod tests {
         ));
         assert!(matches!(
             scroll_strategy(11, 3, 10),
+            Some(ScrollStrategy::Bottom)
+        ));
+    }
+
+    #[test]
+    fn visible_rows_counts_only_fully_visible_rows() {
+        assert_eq!(visible_rows(0., 100., 20.), (0, 4));
+        assert_eq!(visible_rows(0., 110., 20.), (0, 4));
+        assert_eq!(visible_rows(10., 100., 20.), (1, 4));
+        assert_eq!(visible_rows(40., 100., 20.), (2, 6));
+        assert_eq!(visible_rows(0., 100., 0.), (0, 0));
+        assert_eq!(visible_rows(f32::NAN, 100., 20.), (0, 0));
+    }
+
+    #[test]
+    fn empty_visible_range_always_scrolls() {
+        let (first, last) = visible_rows(0., 0., 20.);
+        assert!(scroll_strategy(0, first, last).is_some());
+        assert!(scroll_strategy(1, first, last).is_some());
+    }
+
+    #[test]
+    fn down_from_last_visible_row_scrolls_to_bottom() {
+        let (first, last) = visible_rows(0., 100., 20.);
+        assert!(matches!(
+            scroll_strategy(5, first, last),
             Some(ScrollStrategy::Bottom)
         ));
     }

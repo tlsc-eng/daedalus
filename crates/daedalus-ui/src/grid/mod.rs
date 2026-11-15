@@ -17,7 +17,7 @@ use crate::{ActiveTheme, Ellipsis, Size, Space, Theme};
 pub use model::GridColumn;
 use model::{
     CellPos, GridModel, column_width, display_text, gutter_chars, reveal_x, scroll_strategy,
-    visible_columns,
+    visible_columns, visible_rows,
 };
 
 actions!(
@@ -191,8 +191,7 @@ impl DataGrid {
         let body_h = f32::from(base.bounds().size.height);
         let scroll_y = -f32::from(offset.y);
         if self.row_h > 0. {
-            let first = (scroll_y / self.row_h).ceil() as usize;
-            let last = ((scroll_y + body_h) / self.row_h).floor() as usize;
+            let (first, last) = visible_rows(scroll_y, body_h, self.row_h);
             if let Some(strategy) = scroll_strategy(pos.row, first, last) {
                 self.scroll.scroll_to_item(pos.row, strategy);
             }
@@ -288,9 +287,10 @@ impl DataGrid {
         );
         self.lefts = lefts.clone();
         self.viewport_w = viewport_w;
-        self.row_h = f32::from(t.size(Size::Row));
+        let row_h = t.size(Size::Row);
+        self.row_h = f32::from(row_h);
         Metrics {
-            row_h: t.size(Size::Row),
+            row_h,
             theme: t,
             pad,
             gutter_w,
