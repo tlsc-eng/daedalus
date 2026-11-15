@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -520,4 +520,79 @@ fn auto_run_after_read_only_can_write() {
             _ => {}
         }
     }
+}
+
+fn first_cell(rig: &Rig, run: u64, sql: &str) -> Option<String> {
+    rig.run(run, sql, 500, None);
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => return rows[0][0].clone(),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+fn wait_done(rig: &Rig) {
+    loop {
+        match rig.next() {
+            Update::Done { .. } => return,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn manual_mode_runs_with_autocommit_off() {
+    let rig = rig(false);
+    rig.handle.send(Command::Transaction {
+        session: S,
+        op: TxOp::Begin,
+    });
+    assert!(matches!(
+        rig.next(),
+        Update::TxState {
+            open: true,
+            error: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        first_cell(&rig, 1, "select @@autocommit").as_deref(),
+        Some("0")
+    );
+    wait_done(&rig);
+    rig.handle.send(Command::Transaction {
+        session: S,
+        op: TxOp::Commit,
+    });
+    assert!(matches!(
+        rig.next(),
+        Update::TxState {
+            open: false,
+            error: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        first_cell(&rig, 2, "select @@autocommit").as_deref(),
+        Some("1")
+    );
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_keeps_a_read_only_connection_read_only() {
+    let writer = rig(false);
+    writer.run(1, "DROP TABLE IF EXISTS ro_conn_probe", 500, None);
+    wait_done(&writer);
+    writer.run(2, "CREATE TABLE ro_conn_probe(x int)", 500, None);
+    wait_done(&writer);
+    let rig = rig(true);
+    rig.run_mode(1, "SELECT 1", 500, None, RunMode::ReadOnly);
+    wait_done(&rig);
+    rig.run(2, "INSERT INTO ro_conn_probe VALUES (1)", 500, None);
+    rig.next_error();
 }

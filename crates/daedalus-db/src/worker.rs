@@ -31,6 +31,7 @@ pub enum TxOp {
 }
 
 /// How a run is wrapped: autocommit, inside the session's manual transaction, or a read-only transaction rolled back after.
+/// ReadOnly is a backstop; callers must only pass `Kind::Read` scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
     Auto,
@@ -332,74 +333,48 @@ async fn session_task(
                     continue;
                 }
                 let mut closing: &[&str] = &[];
+                let mut begun = false;
                 match mode {
                     RunMode::Auto => {}
                     RunMode::Transaction => {
-                        let refusal = if conn.read_only {
-                            Some(READ_ONLY_NO_TX.to_owned())
-                        } else if tx_open {
-                            None
-                        } else {
-                            match exec(
-                                &driver,
-                                tx_sql(conn.engine, TxOp::Begin),
-                                &mut rx,
-                                &mut queued,
-                            )
-                            .await
+                        if conn.read_only {
+                            if !send_run_error(&updates, session, run, READ_ONLY_NO_TX.to_owned())
+                                .await
                             {
-                                Exec::Done => {
-                                    tx_open = true;
-                                    if !send_tx(&updates, session, true, None).await {
-                                        return;
-                                    }
-                                    None
-                                }
-                                Exec::Failed(e) => Some(e),
-                                Exec::Gone => return,
-                            }
-                        };
-                        if let Some(message) = refusal {
-                            if !send_run_error(&updates, session, run, message).await {
                                 return;
                             }
                             continue;
                         }
-                    }
-                    RunMode::ReadOnly => {
-                        let (begin, end) = read_only_sql(conn.engine);
-                        let end: &[&str] = if conn.engine == Engine::Sqlite && conn.read_only {
-                            &[]
-                        } else {
-                            end
-                        };
-                        let mut refusal = None;
-                        if tx_open {
-                            refusal =
-                                Some("Commit or roll back the open transaction first.".to_owned());
-                        } else {
-                            for sql in begin {
-                                match exec(&driver, sql, &mut rx, &mut queued).await {
-                                    Exec::Done => {}
-                                    Exec::Failed(e) => {
-                                        refusal = Some(e);
-                                        break;
-                                    }
-                                    Exec::Gone => return,
-                                }
-                            }
-                            if refusal.is_some() {
-                                // A half-applied begin must not leave the session read-only.
-                                for sql in end {
-                                    if matches!(
-                                        exec(&driver, sql, &mut rx, &mut queued).await,
-                                        Exec::Gone
-                                    ) {
+                        if !tx_open {
+                            match begin_tx(&driver, conn.engine, &mut rx, &mut queued).await {
+                                Ok(()) => {
+                                    tx_open = true;
+                                    begun = true;
+                                    if !send_tx(&updates, session, true, None).await {
                                         return;
                                     }
                                 }
+                                Err(message) => {
+                                    if !send_run_error(&updates, session, run, message).await {
+                                        return;
+                                    }
+                                    continue;
+                                }
                             }
                         }
+                    }
+                    RunMode::ReadOnly => {
+                        let (begin, end) = read_only_sql(conn.engine, conn.read_only);
+                        let refusal = if tx_open {
+                            Some("Commit or roll back the open transaction first.".to_owned())
+                        } else if let Err(e) = exec_all(&driver, begin, &mut rx, &mut queued).await
+                        {
+                            // A half-applied begin must not leave the session read-only.
+                            let _ = exec_all(&driver, end, &mut rx, &mut queued).await;
+                            Some(e)
+                        } else {
+                            None
+                        };
                         if let Some(message) = refusal {
                             if !send_run_error(&updates, session, run, message).await {
                                 return;
@@ -407,6 +382,32 @@ async fn session_task(
                             continue;
                         }
                         closing = end;
+                        begun = true;
+                    }
+                }
+                if begun {
+                    let cancelled = queued
+                        .iter()
+                        .position(|c| matches!(c, Command::Cancel { run: r, .. } if *r == run));
+                    let disconnect = queued
+                        .iter()
+                        .any(|c| matches!(c, Command::Disconnect { .. }));
+                    if cancelled.is_some() || disconnect {
+                        if let Some(i) = cancelled {
+                            queued.remove(i);
+                        }
+                        let closed = exec_all(&driver, closing, &mut rx, &mut queued).await;
+                        if disconnect {
+                            return;
+                        }
+                        if closed.is_err() {
+                            let _ = updates.send(lost_read_only(session)).await;
+                            return;
+                        }
+                        if updates.send(cancelled_done(session, run)).await.is_err() {
+                            return;
+                        }
+                        continue;
                     }
                 }
                 let job = Job {
@@ -419,15 +420,24 @@ async fn session_task(
                 if !run_job(&driver, &mut rx, &mut queued, &updates, job).await {
                     return;
                 }
-                for sql in closing {
-                    match exec(&driver, sql, &mut rx, &mut queued).await {
-                        Exec::Done => {}
-                        Exec::Failed(_) => {
-                            let error = "Lost the read-only transaction; connect again.".to_owned();
-                            let _ = updates.send(Update::Failed { session, error }).await;
-                            return;
-                        }
-                        Exec::Gone => return,
+                if exec_all(&driver, closing, &mut rx, &mut queued)
+                    .await
+                    .is_err()
+                {
+                    let _ = updates.send(lost_read_only(session)).await;
+                    return;
+                }
+                if mode == RunMode::Transaction
+                    && tx_open
+                    && driver.in_transaction().await == Some(false)
+                {
+                    tx_open = false;
+                    let error = Some(
+                        "The database ended the transaction, so changes since it began were rolled back."
+                            .to_owned(),
+                    );
+                    if !send_tx(&updates, session, false, error).await {
+                        return;
                     }
                 }
             }
@@ -435,35 +445,25 @@ async fn session_task(
                 let (open, error) = match op {
                     TxOp::Begin if tx_open => (true, None),
                     TxOp::Begin if conn.read_only => (false, Some(READ_ONLY_NO_TX.to_owned())),
-                    TxOp::Begin => match exec(
-                        &driver,
-                        tx_sql(conn.engine, TxOp::Begin),
-                        &mut rx,
-                        &mut queued,
-                    )
-                    .await
-                    {
-                        Exec::Done => {
-                            tx_open = true;
-                            (true, None)
+                    TxOp::Begin => {
+                        match begin_tx(&driver, conn.engine, &mut rx, &mut queued).await {
+                            Ok(()) => {
+                                tx_open = true;
+                                (true, None)
+                            }
+                            Err(e) => (false, Some(e)),
                         }
-                        Exec::Failed(e) => (false, Some(e)),
-                        Exec::Gone => return,
-                    },
+                    }
                     TxOp::Rollback => {
                         let mut error = None;
                         if tx_open {
-                            match exec(
-                                &driver,
-                                tx_sql(conn.engine, TxOp::Rollback),
-                                &mut rx,
-                                &mut queued,
-                            )
-                            .await
-                            {
-                                Exec::Done => {}
-                                Exec::Failed(e) => error = Some(e),
-                                Exec::Gone => return,
+                            match end_tx(&driver, conn.engine, op, &mut rx, &mut queued).await {
+                                Ended::Done => {}
+                                Ended::Failed(e) => error = Some(e),
+                                Ended::Lost => {
+                                    let _ = updates.send(lost_autocommit(session)).await;
+                                    return;
+                                }
                             }
                         }
                         tx_open = false;
@@ -471,38 +471,23 @@ async fn session_task(
                     }
                     TxOp::Commit if !tx_open => (false, None),
                     TxOp::Commit => {
-                        let mut probe_failed = false;
-                        if conn.engine == Engine::Postgres {
-                            match exec(&driver, "SELECT 1", &mut rx, &mut queued).await {
-                                Exec::Done => {}
-                                Exec::Failed(_) => probe_failed = true,
-                                Exec::Gone => return,
-                            }
-                        }
+                        let postgres = conn.engine == Engine::Postgres;
+                        let probe_failed = postgres
+                            && exec(&driver, "SELECT 1", &mut rx, &mut queued)
+                                .await
+                                .is_err();
                         if probe_failed {
-                            if matches!(
-                                exec(&driver, "ROLLBACK", &mut rx, &mut queued).await,
-                                Exec::Gone
-                            ) {
-                                return;
-                            }
+                            let _ = exec(&driver, "ROLLBACK", &mut rx, &mut queued).await;
                             tx_open = false;
                             let msg = "The transaction had failed, so it was rolled back instead of committed.";
                             (false, Some(msg.to_owned()))
                         } else {
-                            match exec(
-                                &driver,
-                                tx_sql(conn.engine, TxOp::Commit),
-                                &mut rx,
-                                &mut queued,
-                            )
-                            .await
-                            {
-                                Exec::Done => {
+                            match end_tx(&driver, conn.engine, op, &mut rx, &mut queued).await {
+                                Ended::Done => {
                                     tx_open = false;
                                     (false, None)
                                 }
-                                Exec::Failed(e) if conn.engine == Engine::Postgres => {
+                                Ended::Failed(e) if postgres => {
                                     tx_open = false;
                                     (
                                         false,
@@ -511,8 +496,11 @@ async fn session_task(
                                         )),
                                     )
                                 }
-                                Exec::Failed(e) => (true, Some(e)),
-                                Exec::Gone => return,
+                                Ended::Failed(e) => (true, Some(e)),
+                                Ended::Lost => {
+                                    let _ = updates.send(lost_autocommit(session)).await;
+                                    return;
+                                }
                             }
                         }
                     }
@@ -567,34 +555,53 @@ async fn send_run_error(
         .is_ok()
 }
 
-fn tx_sql(engine: Engine, op: TxOp) -> &'static str {
+const MYSQL_AUTOCOMMIT_ON: &str = "SET autocommit = 1";
+
+/// MySQL runs manual transactions with autocommit off so a statement after an engine-side rollback is not committed on its own.
+fn tx_sql(engine: Engine, op: TxOp) -> &'static [&'static str] {
     match (op, engine) {
-        (TxOp::Begin, Engine::Mysql) => "START TRANSACTION",
-        (TxOp::Begin, _) => "BEGIN",
-        (TxOp::Commit, _) => "COMMIT",
-        (TxOp::Rollback, _) => "ROLLBACK",
+        (TxOp::Begin, Engine::Mysql) => &["SET autocommit = 0", "START TRANSACTION"],
+        (TxOp::Begin, _) => &["BEGIN"],
+        (TxOp::Commit, Engine::Mysql) => &["COMMIT", MYSQL_AUTOCOMMIT_ON],
+        (TxOp::Commit, _) => &["COMMIT"],
+        (TxOp::Rollback, Engine::Mysql) => &["ROLLBACK", MYSQL_AUTOCOMMIT_ON],
+        (TxOp::Rollback, _) => &["ROLLBACK"],
     }
 }
 
 /// MySQL also flips the session setting because DDL implicitly commits and would end a read-only transaction.
-fn read_only_sql(engine: Engine) -> (&'static [&'static str], &'static [&'static str]) {
-    match engine {
-        Engine::Postgres => (&["BEGIN READ ONLY"], &["ROLLBACK"]),
-        Engine::Mysql => (
+/// A read-only connection already has its own session setting, which the close must not undo.
+fn read_only_sql(
+    engine: Engine,
+    connection_read_only: bool,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match (engine, connection_read_only) {
+        (Engine::Postgres, _) => (&["BEGIN READ ONLY"], &["ROLLBACK"]),
+        (Engine::Mysql, false) => (
             &[
                 "SET SESSION TRANSACTION READ ONLY",
                 "START TRANSACTION READ ONLY",
             ],
             &["ROLLBACK", "SET SESSION TRANSACTION READ WRITE"],
         ),
-        Engine::Sqlite => (&["PRAGMA query_only = ON"], &["PRAGMA query_only = OFF"]),
+        (Engine::Mysql, true) => (&["START TRANSACTION READ ONLY"], &["ROLLBACK"]),
+        (Engine::Sqlite, false) => (&["PRAGMA query_only = ON"], &["PRAGMA query_only = OFF"]),
+        (Engine::Sqlite, true) => (&[], &[]),
     }
 }
 
-enum Exec {
-    Done,
-    Failed(String),
-    Gone,
+fn lost_read_only(session: SessionId) -> Update {
+    Update::Failed {
+        session,
+        error: "Lost the read-only transaction; connect again.".into(),
+    }
+}
+
+fn lost_autocommit(session: SessionId) -> Update {
+    Update::Failed {
+        session,
+        error: "Could not restore autocommit; connect again.".into(),
+    }
 }
 
 /// Runs a short control statement to the end; commands that arrive meanwhile wait in `queued`.
@@ -603,14 +610,16 @@ async fn exec(
     sql: &str,
     rx: &mut mpsc::UnboundedReceiver<Command>,
     queued: &mut VecDeque<Command>,
-) -> Exec {
+) -> Result<(), String> {
     let mut stream = driver.query(sql.to_owned());
     let mut failed: Option<String> = None;
+    // A closed channel follows a Disconnect; finish this statement and let the main loop end the session.
+    let mut listening = true;
     loop {
         tokio::select! {
             biased;
-            command = rx.recv() => match command {
-                None => return Exec::Gone,
+            command = rx.recv(), if listening => match command {
+                None => listening = false,
                 Some(c) => queued.push_back(c),
             },
             item = stream.next() => match item {
@@ -622,7 +631,62 @@ async fn exec(
             },
         }
     }
-    failed.map_or(Exec::Done, Exec::Failed)
+    failed.map_or(Ok(()), Err)
+}
+
+async fn exec_all(
+    driver: &Driver,
+    sqls: &[&str],
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut VecDeque<Command>,
+) -> Result<(), String> {
+    for sql in sqls {
+        exec(driver, sql, rx, queued).await?;
+    }
+    Ok(())
+}
+
+async fn begin_tx(
+    driver: &Driver,
+    engine: Engine,
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut VecDeque<Command>,
+) -> Result<(), String> {
+    let result = exec_all(driver, tx_sql(engine, TxOp::Begin), rx, queued).await;
+    if result.is_err() && engine == Engine::Mysql {
+        // A half-applied begin must not leave autocommit off.
+        let _ = exec(driver, MYSQL_AUTOCOMMIT_ON, rx, queued).await;
+    }
+    result
+}
+
+enum Ended {
+    Done,
+    Failed(String),
+    Lost,
+}
+
+/// A failed COMMIT keeps the transaction open, so autocommit is only restored after it succeeds; ROLLBACK always restores it.
+async fn end_tx(
+    driver: &Driver,
+    engine: Engine,
+    op: TxOp,
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut VecDeque<Command>,
+) -> Ended {
+    let statements = tx_sql(engine, op);
+    let first = exec(driver, statements[0], rx, queued).await;
+    if op == TxOp::Commit {
+        if let Err(e) = first {
+            return Ended::Failed(e);
+        }
+    }
+    for sql in &statements[1..] {
+        if exec(driver, sql, rx, queued).await.is_err() {
+            return Ended::Lost;
+        }
+    }
+    first.map_or_else(Ended::Failed, |()| Ended::Done)
 }
 
 /// Returns false when the session should end.
@@ -1092,23 +1156,34 @@ mod tests {
 
     #[test]
     fn tx_sql_matches_each_engine() {
-        assert_eq!(tx_sql(Engine::Postgres, TxOp::Begin), "BEGIN");
-        assert_eq!(tx_sql(Engine::Mysql, TxOp::Begin), "START TRANSACTION");
-        assert_eq!(tx_sql(Engine::Sqlite, TxOp::Begin), "BEGIN");
-        for engine in [Engine::Postgres, Engine::Mysql, Engine::Sqlite] {
-            assert_eq!(tx_sql(engine, TxOp::Commit), "COMMIT");
-            assert_eq!(tx_sql(engine, TxOp::Rollback), "ROLLBACK");
+        assert_eq!(tx_sql(Engine::Postgres, TxOp::Begin), &["BEGIN"]);
+        assert_eq!(tx_sql(Engine::Sqlite, TxOp::Begin), &["BEGIN"]);
+        assert_eq!(
+            tx_sql(Engine::Mysql, TxOp::Begin),
+            &["SET autocommit = 0", "START TRANSACTION"]
+        );
+        for engine in [Engine::Postgres, Engine::Sqlite] {
+            assert_eq!(tx_sql(engine, TxOp::Commit), &["COMMIT"]);
+            assert_eq!(tx_sql(engine, TxOp::Rollback), &["ROLLBACK"]);
         }
+        assert_eq!(
+            tx_sql(Engine::Mysql, TxOp::Commit),
+            &["COMMIT", "SET autocommit = 1"]
+        );
+        assert_eq!(
+            tx_sql(Engine::Mysql, TxOp::Rollback),
+            &["ROLLBACK", "SET autocommit = 1"]
+        );
     }
 
     #[test]
     fn read_only_sql_matches_each_engine() {
         assert_eq!(
-            read_only_sql(Engine::Postgres),
+            read_only_sql(Engine::Postgres, false),
             (&["BEGIN READ ONLY"][..], &["ROLLBACK"][..])
         );
         assert_eq!(
-            read_only_sql(Engine::Mysql),
+            read_only_sql(Engine::Mysql, false),
             (
                 &[
                     "SET SESSION TRANSACTION READ ONLY",
@@ -1118,12 +1193,21 @@ mod tests {
             )
         );
         assert_eq!(
-            read_only_sql(Engine::Sqlite),
+            read_only_sql(Engine::Sqlite, false),
             (
                 &["PRAGMA query_only = ON"][..],
                 &["PRAGMA query_only = OFF"][..]
             )
         );
+    }
+
+    #[test]
+    fn read_only_sql_never_undoes_a_read_only_connection() {
+        assert_eq!(
+            read_only_sql(Engine::Mysql, true),
+            (&["START TRANSACTION READ ONLY"][..], &["ROLLBACK"][..])
+        );
+        assert_eq!(read_only_sql(Engine::Sqlite, true), (&[][..], &[][..]));
     }
 
     #[test]

@@ -613,3 +613,46 @@ fn read_only_mode_is_refused_while_a_transaction_is_open() {
     rig.run_mode(1, "select 1", 100, RunMode::ReadOnly);
     assert!(rig.collect(1).is_err());
 }
+
+#[test]
+fn commit_then_disconnect_commits() {
+    for _ in 0..5 {
+        let path = make_db("disc");
+        {
+            let rig = connect(conn(path.to_str().expect("utf8"), false), None);
+            assert!(matches!(rig.next(), Update::Connected { .. }));
+            rig.run(1, "create table t(x)", 100);
+            assert!(rig.collect(1).is_ok());
+            finish_tx_run(&rig, "insert into t values (1)", 2);
+            rig.tx(TxOp::Commit);
+            rig.handle.send(Command::Disconnect { session: S });
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let rig = connect(conn(path.to_str().expect("utf8"), false), None);
+        assert!(matches!(rig.next(), Update::Connected { .. }));
+        assert_eq!(row_count(&rig, 3), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn engine_ended_transaction_is_reported() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x unique)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.run_mode(
+        3,
+        "insert or rollback into t values (1)",
+        100,
+        RunMode::Transaction,
+    );
+    assert!(rig.collect(3).is_err());
+    let (open, error) = next_tx(&rig);
+    assert!(!open);
+    assert!(error.is_some());
+    finish_tx_run(&rig, "insert into t values (2)", 4);
+    rig.tx(TxOp::Rollback);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 5), 0);
+}

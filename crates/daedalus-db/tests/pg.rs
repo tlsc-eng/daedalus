@@ -393,6 +393,12 @@ fn read_only_run_blocks_writes_after_session_set_read_write() {
             break;
         }
     }
+    rig.run(3, "DROP TABLE IF EXISTS ro_probe", 500, None);
+    loop {
+        if let Update::Done { .. } = rig.next() {
+            break;
+        }
+    }
     rig.run_mode(
         2,
         "CREATE TABLE ro_probe(x int)",
@@ -400,7 +406,12 @@ fn read_only_run_blocks_writes_after_session_set_read_write() {
         None,
         RunMode::ReadOnly,
     );
-    rig.next_error();
+    let (message, _) = rig.next_error();
+    let message = message.to_lowercase();
+    assert!(
+        message.contains("read-only") || message.contains("read only"),
+        "{message}"
+    );
 }
 
 #[test]
