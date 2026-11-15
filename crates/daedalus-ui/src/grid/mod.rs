@@ -4,11 +4,12 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, KeyBinding,
-    ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton, MouseDownEvent, Pixels, Point,
-    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
-    actions, div, point, prelude::*, px, uniform_list,
+    Animation, AnyElement, App, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
+    EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla,
+    KeyBinding, ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, point, prelude::*, px,
+    uniform_list,
 };
 
 use crate::components::Tooltip;
@@ -16,8 +17,8 @@ use crate::motion::{self, Busy, Glide, Opening};
 use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
 use model::{
-    CellPos, GridModel, Kind, column_width, display_text, gutter_chars, reveal_x, scroll_strategy,
-    style_for, visible_columns, visible_rows,
+    CellPos, GridModel, Kind, MAX_COL_W, column_lefts, column_width, display_text, drag_width,
+    gutter_chars, reveal_x, scroll_strategy, style_for, visible_columns, visible_rows,
 };
 pub use model::{GridColumn, GridMarks, RowMark};
 
@@ -102,6 +103,9 @@ pub struct DataGrid {
     lefts: Vec<f32>,
     viewport_w: f32,
     row_h: f32,
+    char_w: f32,
+    pad_w: f32,
+    drag: Option<Drag>,
     editable: bool,
     marks: GridMarks,
     editing: Option<Editing>,
@@ -136,6 +140,9 @@ impl DataGrid {
             lefts: Vec::new(),
             viewport_w: 0.,
             row_h: 0.,
+            char_w: 0.,
+            pad_w: 0.,
+            drag: None,
             editable: false,
             marks: GridMarks::default(),
             editing: None,
@@ -473,6 +480,15 @@ impl DataGrid {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Drag {
+    Column {
+        col: usize,
+        start_x: f32,
+        start_w: f32,
+    },
+}
+
 struct Metrics {
     theme: Theme,
     pad: gpui::Pixels,
@@ -506,11 +522,13 @@ impl DataGrid {
             f32::from(pad),
             f32::MAX,
         );
-        let mut lefts = vec![0.];
-        for &chars in &self.model.chars {
-            let w = column_width(chars, char_w, f32::from(pad), cap);
-            lefts.push(lefts.last().copied().unwrap_or(0.) + w);
-        }
+        let lefts = column_lefts(
+            &self.model.chars,
+            &self.model.widths,
+            char_w,
+            f32::from(pad),
+            cap,
+        );
         let base = self.scroll.0.borrow().base_handle.clone();
         let scroll_x = -f32::from(base.offset().x);
         let bounds_w = f32::from(base.bounds().size.width);
@@ -529,6 +547,8 @@ impl DataGrid {
         self.viewport_w = viewport_w;
         let row_h = t.size(Size::Row);
         self.row_h = f32::from(row_h);
+        self.char_w = char_w;
+        self.pad_w = f32::from(pad);
         Metrics {
             row_h,
             theme: t,
@@ -540,7 +560,85 @@ impl DataGrid {
         }
     }
 
-    fn header(&self, m: &Metrics) -> AnyElement {
+    fn start_resize(&mut self, col: usize, x: f32, clicks: usize, cx: &mut Context<Self>) {
+        if clicks >= 2 {
+            let w = column_width(
+                self.model.fit_chars(col),
+                self.char_w,
+                self.pad_w,
+                MAX_COL_W,
+            );
+            self.model.set_width(col, w);
+            self.drag = None;
+            cx.notify();
+            return;
+        }
+        let (Some(left), Some(right)) = (self.lefts.get(col), self.lefts.get(col + 1)) else {
+            return;
+        };
+        self.drag = Some(Drag::Column {
+            col,
+            start_x: x,
+            start_w: right - left,
+        });
+        cx.notify();
+    }
+
+    fn drag_move(&mut self, x: f32, pressed: Option<MouseButton>, cx: &mut Context<Self>) {
+        if pressed != Some(MouseButton::Left) {
+            return self.end_drag(cx);
+        }
+        let Some(Drag::Column {
+            col,
+            start_x,
+            start_w,
+        }) = self.drag
+        else {
+            return;
+        };
+        let min = column_width(1, self.char_w, self.pad_w, MAX_COL_W);
+        let w = drag_width(start_w, start_x, x, min);
+        if self.model.widths.get(col).copied().flatten() != Some(w) {
+            self.model.set_width(col, w);
+            cx.notify();
+        }
+    }
+
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        self.drag = None;
+        cx.notify();
+    }
+
+    /// Mouse listeners are one-frame, so the hook is re-registered on every paint of a drag.
+    fn drag_hook(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        self.drag?;
+        let grid = cx.entity().downgrade();
+        Some(
+            gpui::canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let g = grid.clone();
+                    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            g.update(cx, |this, cx| {
+                                this.drag_move(f32::from(e.position.x), e.pressed_button, cx)
+                            })
+                            .ok();
+                        }
+                    });
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            grid.update(cx, |this, cx| this.end_drag(cx)).ok();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+    }
+
+    fn header(&self, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
         let t = &m.theme;
         let cells = self
             .model
@@ -558,6 +656,7 @@ impl DataGrid {
                 .h_full()
                 .flex()
                 .items_center()
+                .relative()
                 .px(m.pad)
                 .border_r_1()
                 .border_color(t.color.border)
@@ -569,6 +668,22 @@ impl DataGrid {
                         .when(col.numeric, |d| d.text_right())
                         .ellipsis()
                         .child(col.name.clone()),
+                )
+                .child(
+                    div()
+                        .id(("grid-col-resize", c))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(6.))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                this.start_resize(c, f32::from(e.position.x), e.click_count, cx);
+                            }),
+                        ),
                 );
             if !col.type_label.is_empty() {
                 let label = col.type_label.clone();
@@ -795,6 +910,11 @@ impl Render for DataGrid {
             .font_family(t.typography.mono.clone())
             .text_size(t.typography.caption)
             .opacity(self.dim.value())
+            .relative()
+            .when(self.drag.is_some(), |d| {
+                d.cursor(CursorStyle::ResizeLeftRight)
+            })
+            .children(self.drag_hook(cx))
             .on_action(cx.listener(|this, _: &Up, _, cx| this.step(-1, 0, false, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.step(1, 0, false, cx)))
             .on_action(cx.listener(|this, _: &Left, _, cx| this.step(0, -1, false, cx)))
@@ -820,7 +940,7 @@ impl Render for DataGrid {
             return root;
         }
         let fresh = self.opened.is_some_and(|o| o.running(t.motion.fast));
-        let header = self.header(&m);
+        let header = self.header(&m, cx);
         let body = self.body(m, cx);
         root.child(motion::animate_enter(
             t.motion.reduced,

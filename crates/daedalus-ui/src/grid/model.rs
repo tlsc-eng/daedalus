@@ -10,6 +10,8 @@ pub(crate) const DISPLAY_BYTES: usize = 4096;
 pub(crate) const MIN_CHARS: usize = 4;
 /// Long values stop counting here so one huge cell cannot stretch a column past its cap.
 pub(crate) const MEASURE_CHARS: usize = 120;
+/// Stops a stray drag from making a column wider than any screen.
+pub(crate) const MAX_COL_W: f32 = 2000.;
 
 /// One result column: its header text, a hover label for the type, and whether values align right.
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +86,7 @@ pub(crate) struct GridModel {
     pub more: bool,
     pub truncated: bool,
     pub chars: Vec<usize>,
+    pub widths: Vec<Option<f32>>,
     pub anchor: Option<CellPos>,
     pub active: Option<CellPos>,
     fetch_requested: bool,
@@ -99,6 +102,9 @@ impl GridModel {
     pub fn show(&mut self, columns: Vec<GridColumn>, rows: Vec<Vec<Option<String>>>, more: bool) {
         self.rows = shared(rows);
         self.chars = column_chars(&columns, &self.rows);
+        if columns != self.columns {
+            self.widths = vec![None; columns.len()];
+        }
         self.columns = columns;
         self.more = more;
         self.truncated = false;
@@ -111,6 +117,25 @@ impl GridModel {
         self.rows.extend(shared(rows));
         self.more = more;
         self.fetch_requested = false;
+    }
+
+    pub fn set_width(&mut self, col: usize, w: f32) {
+        if let Some(slot) = self.widths.get_mut(col) {
+            *slot = Some(w);
+        }
+    }
+
+    /// Widest value of a column across every loaded row, for autofit.
+    pub fn fit_chars(&self, col: usize) -> usize {
+        let Some(column) = self.columns.get(col) else {
+            return MIN_CHARS;
+        };
+        let count = |s: &str| s.chars().take(MEASURE_CHARS).count();
+        let cells = self.rows.iter().map(|row| match row.get(col) {
+            Some(Some(v)) => count(&display_text(v)),
+            _ => MIN_CHARS,
+        });
+        cells.fold(count(&column.name), usize::max).max(MIN_CHARS)
     }
 
     pub fn has_cell(&self, row: usize, col: usize) -> bool {
@@ -266,6 +291,30 @@ pub(crate) fn column_chars(columns: &[GridColumn], rows: &[Row]) -> Vec<usize> {
 
 pub(crate) fn column_width(chars: usize, char_w: f32, pad: f32, cap: f32) -> f32 {
     (chars as f32 * char_w + 2. * pad).min(cap)
+}
+
+pub(crate) fn column_lefts(
+    chars: &[usize],
+    widths: &[Option<f32>],
+    char_w: f32,
+    pad: f32,
+    cap: f32,
+) -> Vec<f32> {
+    let mut lefts = Vec::with_capacity(chars.len() + 1);
+    lefts.push(0.);
+    for (c, &n) in chars.iter().enumerate() {
+        let w = widths
+            .get(c)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| column_width(n, char_w, pad, cap));
+        lefts.push(lefts.last().copied().unwrap_or(0.) + w);
+    }
+    lefts
+}
+
+pub(crate) fn drag_width(start_w: f32, start_x: f32, x: f32, min: f32) -> f32 {
+    (start_w + x - start_x).clamp(min, MAX_COL_W.max(min))
 }
 
 pub(crate) fn gutter_chars(rows: usize) -> usize {
@@ -452,6 +501,74 @@ mod tests {
     fn column_width_caps() {
         assert_eq!(column_width(200, 7., 6., 400.), 400.);
         assert_eq!(column_width(5, 7., 6., 400.), 47.);
+    }
+
+    #[test]
+    fn column_lefts_mixes_overrides_and_auto() {
+        let lefts = column_lefts(&[5, 200, 3], &[None, Some(50.), None], 7., 6., 400.);
+        assert_eq!(lefts, vec![0., 47., 97., 130.]);
+    }
+
+    #[test]
+    fn column_lefts_ignores_missing_widths() {
+        let auto = column_lefts(&[5, 200, 3], &[None, None, None], 7., 6., 400.);
+        assert_eq!(column_lefts(&[5, 200, 3], &[], 7., 6., 400.), auto);
+    }
+
+    #[test]
+    fn drag_width_clamps() {
+        assert_eq!(drag_width(100., 10., 60., 20.), 150.);
+        assert_eq!(drag_width(100., 10., -500., 20.), 20.);
+        assert_eq!(drag_width(100., 0., 9999., 20.), MAX_COL_W);
+    }
+
+    #[test]
+    fn show_keeps_widths_for_same_columns() {
+        let mut m = GridModel::default();
+        m.show(cols(2), vec![vec![cell("a"), cell("b")]], false);
+        m.set_width(1, 80.);
+        m.show(cols(2), vec![vec![cell("x"), cell("y")]], false);
+        assert_eq!(m.widths, vec![None, Some(80.)]);
+        let mut other = cols(2);
+        other[1].name = "other".into();
+        m.show(other, vec![], false);
+        assert_eq!(m.widths, vec![None, None]);
+    }
+
+    #[test]
+    fn append_keeps_widths() {
+        let mut m = grid(2, 2, true);
+        m.set_width(0, 60.);
+        m.append(vec![vec![cell("a"), cell("b")]], false);
+        assert_eq!(m.widths, vec![Some(60.), None]);
+    }
+
+    #[test]
+    fn fit_chars_spans_all_loaded_rows() {
+        let mut m = GridModel::default();
+        m.show(cols(1), vec![vec![cell("ab")]], true);
+        m.append(
+            vec![vec![Some(std::iter::repeat_n('x', 30).collect())]],
+            false,
+        );
+        assert_eq!(m.fit_chars(0), 30);
+        let mut nulls = GridModel::default();
+        let id = GridColumn {
+            name: "id".into(),
+            type_label: "".into(),
+            numeric: false,
+        };
+        nulls.show(vec![id], vec![vec![None]], false);
+        assert_eq!(nulls.fit_chars(0), MIN_CHARS);
+        assert_eq!(nulls.fit_chars(9), MIN_CHARS);
+    }
+
+    #[test]
+    fn fit_chars_caps_at_measure_chars() {
+        let mut m = GridModel::default();
+        let long: String = std::iter::repeat_n('x', 5000).collect();
+        m.show(cols(1), vec![vec![Some(long)]], false);
+        assert_eq!(m.fit_chars(0), MEASURE_CHARS);
     }
 
     #[test]
