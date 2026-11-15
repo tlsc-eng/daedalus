@@ -681,7 +681,6 @@ impl DataGrid {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
                                 this.start_resize(c, f32::from(e.position.x), e.click_count, cx);
                             }),
                         ),
