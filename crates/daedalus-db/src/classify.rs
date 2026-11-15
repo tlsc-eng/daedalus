@@ -24,6 +24,8 @@ pub struct Statement {
     pub kind: Kind,
     /// An `UPDATE` or `DELETE` with no `WHERE`.
     pub unguarded: bool,
+    /// A line comment ends at a bare CR, so text the gate can't see may run.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -277,10 +279,12 @@ pub fn split(sql: &str, engine: Engine) -> Vec<Statement> {
         } else {
             classify(sql, chunk, engine, ready.then_some(&mut parser))
         };
+        let hidden = chunk.iter().any(|(t, _)| *t == Tok::Hazard);
         out.push(Statement {
             range,
             kind,
             unguarded,
+            hidden,
         });
     }
     out
@@ -974,6 +978,7 @@ mod tests {
         let my = "select 1 where 1=1 -- x\r or sleep(1) > 0";
         let hash = "select 1 where 1=1 # x\r or sleep(1) > 0";
         assert_eq!(kind_with(pg, PG), Kind::Unknown);
+        assert!(one(pg).hidden);
         assert_eq!(kind_with(pg, LITE), Kind::Unknown);
         assert_eq!(kind_with(my, MY), Kind::Unknown);
         assert_eq!(kind_with(hash, MY), Kind::Unknown);
@@ -986,6 +991,7 @@ mod tests {
     fn crlf_line_comment_still_classifies() {
         for e in [PG, MY, LITE] {
             assert_eq!(kind_with("-- note\r\nselect 1", e), Kind::Read);
+            assert!(!split("-- note\r\nselect 1", e)[0].hidden);
         }
     }
 
