@@ -239,9 +239,12 @@ impl DbState {
         self.test_done = Some((result, ms));
     }
 
-    /// The console or table that owns `session`; None means the explorer's logic handles it.
-    fn tab_of(&self, session: SessionId) -> Option<DbTabRef> {
-        self.tabs.get(&session).cloned()
+    /// Pairs an update with the console or table that owns its session; Err hands it back unchanged.
+    fn take_for_tab(&self, update: Update) -> Result<(DbTabRef, Update), Update> {
+        match self.tabs.get(&update.session()) {
+            Some(tab) => Ok((tab.clone(), update)),
+            None => Err(update),
+        }
     }
 
     fn send(&self, command: Command) {
@@ -376,8 +379,9 @@ impl Shell {
     /// Gives a console or table its own session's updates; the rest go on to the explorer's logic.
     fn db_route_tab(&mut self, update: Update, cx: &mut Context<Self>) -> Option<Update> {
         let session = update.session();
-        let Some(weak) = self.db.tab_of(session) else {
-            return Some(update);
+        let (weak, update) = match self.db.take_for_tab(update) {
+            Ok(found) => found,
+            Err(update) => return Some(update),
         };
         let failed = matches!(update, Update::Failed { .. });
         match weak.upgrade() {
@@ -1370,6 +1374,8 @@ fn sheet_motion(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn only_a_tab_session_is_taken_from_the_update_stream() {
         let mut state = DbState::default();
@@ -1377,11 +1383,18 @@ mod tests {
             SessionId(1),
             DbTabRef::Console(gpui::WeakEntity::new_invalid()),
         );
-        assert!(state.tab_of(SessionId(1)).is_some());
-        assert!(state.tab_of(SessionId(2)).is_none());
+        let other = Update::Failed {
+            session: SessionId(2),
+            error: "x".into(),
+        };
+        assert_eq!(state.take_for_tab(other.clone()).err(), Some(other));
+        let mine = Update::Failed {
+            session: SessionId(1),
+            error: "y".into(),
+        };
+        let (_, back) = state.take_for_tab(mine.clone()).ok().unwrap();
+        assert_eq!(back, mine);
     }
-
-    use super::*;
 
     fn state_with(key: &str, session: u64) -> DbState {
         let mut db = DbState::default();
