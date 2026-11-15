@@ -177,6 +177,15 @@ fn zoom_for(font_size: f32) -> i32 {
 }
 
 impl Shell {
+    pub(super) fn sync_terminal(&self, cx: &mut Context<Self>) {
+        daedalus_term::set_settings(
+            daedalus_term::TerminalSettings {
+                copy_on_select: self.settings.file.terminal_copy_on_select(),
+            },
+            cx,
+        );
+    }
+
     /// The changes to settings.json or keymap.json, for the one loop that applies the file.
     pub(super) fn config_changes(&mut self, file: ConfigFile) -> async_channel::Receiver<()> {
         let feeds = self
@@ -297,12 +306,7 @@ impl Shell {
         }
         self.sync_claude_hooks(cx);
         self.sync_companion(cx);
-        daedalus_term::set_settings(
-            daedalus_term::TerminalSettings {
-                copy_on_select: self.settings.file.terminal_copy_on_select(),
-            },
-            cx,
-        );
+        self.sync_terminal(cx);
         let font_size = self.settings.file.editor.font_size;
         if font_size != old.editor.font_size
             && let Some(size) = font_size

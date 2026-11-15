@@ -1249,7 +1249,10 @@ impl TerminalView {
             if !terminal.has_selection() {
                 terminal.clear_selection();
                 cx.notify();
-            } else if copy && let Some(text) = terminal.selection_text() {
+            } else if copy
+                && let Some(text) = terminal.selection_text()
+                && !text.trim().is_empty()
+            {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
         }
