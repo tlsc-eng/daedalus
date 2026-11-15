@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1226,12 +1227,33 @@ pub fn revert_file_bytes(
         ".{}.daedalus-revert",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    std::fs::write(&tmp, contents)?;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        std::fs::set_permissions(&tmp, meta.permissions())?;
+    let meta = std::fs::metadata(&path).ok();
+    let written = (|| {
+        let mut out = fresh_temp(&tmp, meta.as_ref())?;
+        out.write_all(contents)?;
+        if let Some(meta) = &meta {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    Ok(written?)
+}
+
+/// Creates `tmp` anew with the target's mode, so an owner-only file never has a wider temp.
+fn fresh_temp(tmp: &Path, meta: Option<&std::fs::Metadata>) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    if let Some(meta) = meta {
+        opts.mode(meta.permissions().mode() & 0o7777);
+    }
+    opts.open(tmp)
 }
 
 /// A local or remote-tracking branch, newest commit first in `branches`.
@@ -3067,6 +3089,36 @@ mod tests {
         assert!(err.is::<Cancelled>(), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(2));
         stopper.join().unwrap();
+    }
+
+    #[test]
+    fn reverting_owner_only_file_never_creates_wider_temp() {
+        if !available() {
+            return;
+        }
+        let dir = committed_repo("revert-perms", "a\n");
+        let path = dir.join("f.txt");
+        let backup = dir.join("backup");
+        std::fs::write(&path, "b\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let tmp = dir.join(".f.txt.daedalus-revert");
+        let other = dir.join("other");
+        std::fs::write(&other, "old").unwrap();
+        std::fs::hard_link(&other, &tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let created = fresh_temp(&tmp, Some(&meta)).unwrap();
+        assert_eq!(
+            created.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(created);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old");
+        revert_file(&dir, Path::new("f.txt"), "b\n", "a\n", &backup).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old");
     }
 
     #[test]

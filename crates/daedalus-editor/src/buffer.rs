@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -2381,6 +2381,20 @@ fn read_text(path: &Path, forced: Option<FileEncoding>) -> Result<(Decoded, Stam
     Ok((decoded, Stamp::of(&meta)))
 }
 
+/// Creates `tmp` anew with the target's mode, so an owner-only file never has a wider temp.
+fn fresh_temp(tmp: &Path, meta: Option<&fs::Metadata>) -> std::io::Result<fs::File> {
+    match fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    if let Some(meta) = meta {
+        opts.mode(meta.permissions().mode() & 0o7777);
+    }
+    opts.open(tmp)
+}
+
 /// Swaps `target` for a fully written temp file, so a failed save never leaves it half written.
 fn replace_file(target: &Path, bytes: &[u8], meta: Option<&fs::Metadata>) -> Result<()> {
     let tmp = target.with_file_name(format!(
@@ -2391,7 +2405,7 @@ fn replace_file(target: &Path, bytes: &[u8], meta: Option<&fs::Metadata>) -> Res
             .unwrap_or_default()
     ));
     let written = (|| {
-        let mut out = fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+        let mut out = fresh_temp(&tmp, meta).with_context(|| format!("write {}", tmp.display()))?;
         out.write_all(bytes)?;
         out.sync_all()?;
         if let Some(meta) = meta {
@@ -2685,6 +2699,37 @@ mod tests {
         );
         assert_eq!(detect_indent("a\n\tb\n", None), Indent::Tab);
         assert_eq!(detect_indent("", Some(Lang::Go)), Indent::Tab);
+    }
+
+    #[test]
+    fn saving_owner_only_file_never_creates_wider_temp() {
+        let dir = std::env::temp_dir().join(format!("daedalus-buf-perms-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        fs::write(&path, "KEY=1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let tmp = dir.join("..env.daedalus-tmp");
+        let other = dir.join("other");
+        fs::write(&other, "old").unwrap();
+        fs::hard_link(&other, &tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let created = fresh_temp(&tmp, Some(&meta)).unwrap();
+        assert_eq!(
+            created.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(created);
+        assert_eq!(fs::read_to_string(&other).unwrap(), "old");
+        let mut b = Buffer::open(&path).unwrap();
+        b.insert(&mut Cursor::at(b.len_chars()), "x");
+        b.save().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "KEY=1\nx");
+        assert_eq!(fs::read_to_string(&other).unwrap(), "old");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
