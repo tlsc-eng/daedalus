@@ -394,3 +394,31 @@ fn syntax_error_position_is_absolute() {
         }
     }
 }
+
+#[test]
+fn cancel_before_start_does_not_execute() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    let mut completed = 0usize;
+    for i in 0..20u64 {
+        let run = 2 + i * 2;
+        rig.run(run, "insert into t values (1)", 100);
+        rig.cancel(run);
+        loop {
+            match rig.next() {
+                Update::Done {
+                    run: r, truncated, ..
+                } if r == RunId(run) => {
+                    if !truncated {
+                        completed += 1;
+                    }
+                    break;
+                }
+                Update::RunError { run: r, .. } if r == RunId(run) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(row_count(&rig, run + 1), completed);
+    }
+}

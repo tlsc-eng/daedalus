@@ -19,13 +19,25 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Sqlite {
     conn: Arc<Mutex<Db>>,
     interrupt: Arc<InterruptHandle>,
-    cancelled: Arc<AtomicBool>,
+    current: CurrentRun,
 }
 
 #[derive(Clone)]
 pub struct SqliteCanceller {
     interrupt: Arc<InterruptHandle>,
-    cancelled: Arc<AtomicBool>,
+    current: CurrentRun,
+}
+
+// Each query() installs a fresh flag so a late cancel for run N cannot be cleared by run N+1.
+type CurrentRun = Arc<Mutex<Arc<AtomicBool>>>;
+
+enum RunState {
+    NotStarted {
+        conn: Arc<Mutex<Db>>,
+        sql: String,
+        cancelled: Arc<AtomicBool>,
+    },
+    Running(mpsc::Receiver<Result<Item, Failure>>),
 }
 
 fn resolve(database: &str, root: Option<&Path>) -> Result<PathBuf, String> {
@@ -220,7 +232,7 @@ impl Sqlite {
             Sqlite {
                 conn: Arc::new(Mutex::new(db)),
                 interrupt,
-                cancelled: Arc::new(AtomicBool::new(false)),
+                current: Arc::new(Mutex::new(Arc::new(AtomicBool::new(false)))),
             },
             format!("SQLite {}", rusqlite::version()),
         ))
@@ -229,23 +241,38 @@ impl Sqlite {
     pub fn canceller(&self) -> SqliteCanceller {
         SqliteCanceller {
             interrupt: self.interrupt.clone(),
-            cancelled: self.cancelled.clone(),
+            current: self.current.clone(),
         }
     }
 
     pub fn query(&self, sql: String) -> ItemStream {
-        let conn = self.conn.clone();
-        let cancelled = self.cancelled.clone();
-        cancelled.store(false, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel(1);
-        tokio::task::spawn_blocking(move || match conn.lock() {
-            Ok(db) => run_script(&db, &sql, &tx, &cancelled),
-            Err(_) => {
-                send(&tx, Err(lock_failure()));
-            }
-        });
-        futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = cancelled.clone();
+        let start = RunState::NotStarted {
+            conn: self.conn.clone(),
+            sql,
+            cancelled,
+        };
+        // Spawning on first poll means a stream dropped unpolled never runs a statement.
+        futures::stream::unfold(start, |state| async move {
+            let mut rx = match state {
+                RunState::NotStarted {
+                    conn,
+                    sql,
+                    cancelled,
+                } => {
+                    let (tx, rx) = mpsc::channel(1);
+                    tokio::task::spawn_blocking(move || match conn.lock() {
+                        Ok(db) => run_script(&db, &sql, &tx, &cancelled),
+                        Err(_) => {
+                            send(&tx, Err(lock_failure()));
+                        }
+                    });
+                    rx
+                }
+                RunState::Running(rx) => rx,
+            };
+            rx.recv().await.map(|item| (item, RunState::Running(rx)))
         })
         .boxed()
     }
@@ -253,7 +280,10 @@ impl Sqlite {
 
 impl SqliteCanceller {
     pub async fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, Ordering::SeqCst);
         self.interrupt.interrupt();
     }
 }
