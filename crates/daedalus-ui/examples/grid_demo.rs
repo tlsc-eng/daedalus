@@ -50,7 +50,11 @@ fn row(seed: u64, i: usize) -> Vec<Option<String>> {
         note,
         Some(["0123456789"; 30].concat()),
     ];
-    cells.extend((5..COLUMNS).map(|c| Some(format!("v{n}-{c}"))));
+    cells.push(Some(format!(
+        "{{\"id\":{n},\"price\":1.10,\"tags\":[\"a\",\"b\"],\"meta\":{{}}}}"
+    )));
+    cells.push(Some(format!("\\x{:02x}48656c6c6f0aff", n % 256)));
+    cells.extend((7..COLUMNS).map(|c| Some(format!("v{n}-{c}"))));
     cells
 }
 

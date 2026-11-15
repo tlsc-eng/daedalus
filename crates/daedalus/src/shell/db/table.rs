@@ -523,8 +523,12 @@ impl DbTableView {
         let value = self.current(row, col);
         let deleted =
             matches!(locate(row, self.rows.len()), Slot::Page(r) if self.edits.is_deleted(r));
-        if deleted || self.cell_target(col).is_none() || !can_edit_value(value.as_deref()) {
+        let too_big = !can_edit_value(value.as_deref());
+        if deleted || self.cell_target(col).is_none() || too_big {
             self.note = Some("This cell can't be edited here");
+            if too_big && !deleted && self.cell_target(col).is_some() {
+                self.grid.update(cx, |g, cx| g.show_value(cx));
+            }
             cx.notify();
             return;
         }
