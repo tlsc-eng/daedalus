@@ -77,6 +77,9 @@ pub struct Connection {
     pub read_only: bool,
     #[serde(default)]
     pub production: bool,
+    /// A folder colour name (kebab-case) that marks the connection; unknown names show none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Lets Claude list and read-only query this connection over MCP; off by default.
     #[serde(default)]
     pub claude: bool,
@@ -95,11 +98,24 @@ pub struct Store {
 }
 
 impl Store {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Store {
             version: 1,
             connections: vec![],
         }
+    }
+
+    /// Replaces the connection with the same id, else appends it.
+    pub fn upsert(&mut self, conn: Connection) {
+        match self.connections.iter_mut().find(|c| c.id == conn.id) {
+            Some(slot) => *slot = conn,
+            None => self.connections.push(conn),
+        }
+    }
+
+    pub fn remove(&mut self, id: &str) -> Option<Connection> {
+        let i = self.connections.iter().position(|c| c.id == id)?;
+        Some(self.connections.remove(i))
     }
 }
 
@@ -268,6 +284,7 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
         ca_file: None,
         read_only: false,
         production: false,
+        color: None,
         claude: false,
         projects: vec![],
         save_password: false,
@@ -360,10 +377,39 @@ mod tests {
             ca_file: Some("/etc/ca.pem".into()),
             read_only: true,
             production: true,
+            color: None,
             claude: true,
             projects: vec!["/work/a".into()],
             save_password: true,
         }
+    }
+
+    #[test]
+    fn color_round_trips_and_is_omitted_when_none() {
+        let mut c = conn("a", "A");
+        assert!(!serde_json::to_string(&c).unwrap().contains("color"));
+        c.color = Some("sky".into());
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Connection>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn upsert_replaces_by_id_and_appends_new() {
+        let mut store = Store::empty();
+        store.upsert(conn("a", "A"));
+        store.upsert(conn("b", "B"));
+        store.upsert(conn("a", "A2"));
+        assert_eq!(store.connections.len(), 2);
+        assert_eq!(store.connections[0].name, "A2");
+    }
+
+    #[test]
+    fn remove_returns_the_connection() {
+        let mut store = Store::empty();
+        store.upsert(conn("a", "A"));
+        assert_eq!(store.remove("a").unwrap().id, "a");
+        assert!(store.remove("a").is_none());
+        assert!(store.connections.is_empty());
     }
 
     #[test]

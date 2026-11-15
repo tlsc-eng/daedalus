@@ -51,6 +51,7 @@ fn conn(database: &str, read_only: bool) -> Connection {
         ca_file: None,
         read_only,
         production: false,
+        color: None,
         claude: false,
         projects: Vec::new(),
         save_password: false,

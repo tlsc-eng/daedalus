@@ -148,6 +148,7 @@ pub enum SideMode {
     Outline,
     Git,
     Files,
+    Data,
 }
 
 /// Anything but a known mode name, whatever its shape, reads as Files, so a newer build's value

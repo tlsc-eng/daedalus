@@ -475,6 +475,7 @@ mod tests {
             SideMode::Files,
             SideMode::Outline,
             SideMode::Git,
+            SideMode::Data,
         ] {
             let ui = UiState {
                 side_mode: mode,
