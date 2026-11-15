@@ -464,3 +464,60 @@ fn read_only_run_blocks_writes() {
         }
     }
 }
+
+fn table_exists(rig: &Rig, run: u64) -> bool {
+    rig.run(
+        run,
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'ro_ddl_probe'",
+        500,
+        None,
+    );
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => return rows[0][0].as_deref() != Some("0"),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_blocks_ddl() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_ddl_probe", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run_mode(
+        2,
+        "CREATE TABLE ro_ddl_probe(x int)",
+        500,
+        None,
+        RunMode::ReadOnly,
+    );
+    rig.next_error();
+    assert!(!table_exists(&rig, 3));
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn auto_run_after_read_only_can_write() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_after_probe", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run(2, "CREATE TABLE ro_after_probe(x int)", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run_mode(3, "SELECT 1", 500, None, RunMode::ReadOnly);
+    loop {
+        if let Update::Done { .. } = rig.next() {
+            break;
+        }
+    }
+    rig.run(4, "INSERT INTO ro_after_probe VALUES (1)", 500, None);
+    loop {
+        match rig.next() {
+            Update::Done { .. } => break,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}

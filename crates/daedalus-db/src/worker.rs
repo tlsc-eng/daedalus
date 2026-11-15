@@ -331,7 +331,7 @@ async fn session_task(
                     }
                     continue;
                 }
-                let mut closing = None;
+                let mut closing: &[&str] = &[];
                 match mode {
                     RunMode::Auto => {}
                     RunMode::Transaction => {
@@ -368,23 +368,45 @@ async fn session_task(
                     }
                     RunMode::ReadOnly => {
                         let (begin, end) = read_only_sql(conn.engine);
-                        let refusal = if tx_open {
-                            Some("Commit or roll back the open transaction first.".to_owned())
+                        let end: &[&str] = if conn.engine == Engine::Sqlite && conn.read_only {
+                            &[]
                         } else {
-                            match exec(&driver, begin, &mut rx, &mut queued).await {
-                                Exec::Done => None,
-                                Exec::Failed(e) => Some(e),
-                                Exec::Gone => return,
-                            }
+                            end
                         };
+                        let mut refusal = None;
+                        if tx_open {
+                            refusal =
+                                Some("Commit or roll back the open transaction first.".to_owned());
+                        } else {
+                            for sql in begin {
+                                match exec(&driver, sql, &mut rx, &mut queued).await {
+                                    Exec::Done => {}
+                                    Exec::Failed(e) => {
+                                        refusal = Some(e);
+                                        break;
+                                    }
+                                    Exec::Gone => return,
+                                }
+                            }
+                            if refusal.is_some() {
+                                // A half-applied begin must not leave the session read-only.
+                                for sql in end {
+                                    if matches!(
+                                        exec(&driver, sql, &mut rx, &mut queued).await,
+                                        Exec::Gone
+                                    ) {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         if let Some(message) = refusal {
                             if !send_run_error(&updates, session, run, message).await {
                                 return;
                             }
                             continue;
                         }
-                        closing =
-                            end.filter(|_| !(conn.engine == Engine::Sqlite && conn.read_only));
+                        closing = end;
                     }
                 }
                 let job = Job {
@@ -397,8 +419,8 @@ async fn session_task(
                 if !run_job(&driver, &mut rx, &mut queued, &updates, job).await {
                     return;
                 }
-                if let Some(end) = closing {
-                    match exec(&driver, end, &mut rx, &mut queued).await {
+                for sql in closing {
+                    match exec(&driver, sql, &mut rx, &mut queued).await {
                         Exec::Done => {}
                         Exec::Failed(_) => {
                             let error = "Lost the read-only transaction; connect again.".to_owned();
@@ -554,11 +576,18 @@ fn tx_sql(engine: Engine, op: TxOp) -> &'static str {
     }
 }
 
-fn read_only_sql(engine: Engine) -> (&'static str, Option<&'static str>) {
+/// MySQL also flips the session setting because DDL implicitly commits and would end a read-only transaction.
+fn read_only_sql(engine: Engine) -> (&'static [&'static str], &'static [&'static str]) {
     match engine {
-        Engine::Postgres => ("BEGIN READ ONLY", Some("ROLLBACK")),
-        Engine::Mysql => ("START TRANSACTION READ ONLY", Some("ROLLBACK")),
-        Engine::Sqlite => ("PRAGMA query_only = ON", Some("PRAGMA query_only = OFF")),
+        Engine::Postgres => (&["BEGIN READ ONLY"], &["ROLLBACK"]),
+        Engine::Mysql => (
+            &[
+                "SET SESSION TRANSACTION READ ONLY",
+                "START TRANSACTION READ ONLY",
+            ],
+            &["ROLLBACK", "SET SESSION TRANSACTION READ WRITE"],
+        ),
+        Engine::Sqlite => (&["PRAGMA query_only = ON"], &["PRAGMA query_only = OFF"]),
     }
 }
 
@@ -1076,15 +1105,24 @@ mod tests {
     fn read_only_sql_matches_each_engine() {
         assert_eq!(
             read_only_sql(Engine::Postgres),
-            ("BEGIN READ ONLY", Some("ROLLBACK"))
+            (&["BEGIN READ ONLY"][..], &["ROLLBACK"][..])
         );
         assert_eq!(
             read_only_sql(Engine::Mysql),
-            ("START TRANSACTION READ ONLY", Some("ROLLBACK"))
+            (
+                &[
+                    "SET SESSION TRANSACTION READ ONLY",
+                    "START TRANSACTION READ ONLY"
+                ][..],
+                &["ROLLBACK", "SET SESSION TRANSACTION READ WRITE"][..]
+            )
         );
         assert_eq!(
             read_only_sql(Engine::Sqlite),
-            ("PRAGMA query_only = ON", Some("PRAGMA query_only = OFF"))
+            (
+                &["PRAGMA query_only = ON"][..],
+                &["PRAGMA query_only = OFF"][..]
+            )
         );
     }
 
