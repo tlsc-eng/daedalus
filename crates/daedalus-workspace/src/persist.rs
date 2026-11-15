@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +31,18 @@ const KEEP_CORRUPT: usize = 5;
 /// Writes via temp file and rename so a crash never leaves a half-written workspace.
 pub fn save(path: &Path, workspace: &Workspace) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
-    let mut out = fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+    // A stale temp may be world-readable or held open by another process.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", tmp.display())),
+    }
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("write {}", tmp.display()))?;
     out.write_all(&serde_json::to_vec_pretty(workspace)?)
         .with_context(|| format!("write {}", tmp.display()))?;
     // Without this, a power loss after the rename can leave an empty file under the real name.
@@ -130,6 +141,42 @@ mod tests {
 
         fs::write(&path, b"{not json").unwrap();
         assert!(load(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn preexisting_world_readable_temp_file_ends_owner_only() {
+        let dir = std::env::temp_dir().join(format!("daedalus-persist-tmp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workspace.json");
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        save(&path, &Workspace::default()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_temp_file_is_replaced_not_reused() {
+        let dir = {
+            let d =
+                std::env::temp_dir().join(format!("daedalus-persist-stale-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let path = dir.join("workspace.json");
+        let tmp = path.with_extension("json.tmp");
+        let link = dir.join("stale-link");
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&tmp, &link).unwrap();
+        save(&path, &Workspace::default()).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"stale");
         fs::remove_dir_all(&dir).unwrap();
     }
 
