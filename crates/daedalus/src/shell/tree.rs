@@ -16,8 +16,8 @@ use super::dnd::{TabGhost, TreeDrag};
 use super::item::ItemView;
 use super::panes::{DIVIDER_HIT, Drag, clamp_tree_width, resize_handle};
 
-const ROW_HEIGHT: f32 = 24.;
-const INDENT: f32 = 12.;
+pub(super) const ROW_HEIGHT: f32 = 24.;
+pub(super) const INDENT: f32 = 12.;
 
 #[derive(Clone, PartialEq)]
 struct DirEntry {

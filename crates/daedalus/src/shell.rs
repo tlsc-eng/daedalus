@@ -12,6 +12,7 @@ mod companion;
 mod companion_ui;
 mod conflicts;
 mod containers_view;
+mod db;
 mod debug;
 mod debug_view;
 mod dnd;
@@ -134,6 +135,7 @@ pub struct Shell {
     drawer_closing: Option<(drawer::DrawerTab, motion::Closing)>,
     last_drawer_tab: drawer::DrawerTab,
     containers: containers_view::ContainersState,
+    db: db::DbState,
     playwright: playwright_view::PlaywrightState,
     tests: tests_view::TestsState,
     debug: debug::DebugState,
@@ -280,6 +282,7 @@ impl Shell {
             drawer_closing: None,
             last_drawer_tab,
             containers: containers_view::ContainersState::default(),
+            db: db::DbState::default(),
             playwright: playwright_view::PlaywrightState::default(),
             tests: tests_view::TestsState::default(),
             debug,
@@ -840,6 +843,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &crate::actions::ShowGit, w, cx| {
                 this.show_side_mode(SideMode::Git, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ShowData, w, cx| {
+                this.show_side_mode(SideMode::Data, w, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &FindInProject, w, cx| this.find_in_project(None, w, cx)),

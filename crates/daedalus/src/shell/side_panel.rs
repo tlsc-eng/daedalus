@@ -4,11 +4,12 @@ use gpui::{AnyElement, Context, Focusable, FontWeight, Window, div, prelude::*};
 
 use super::Shell;
 
-const MODES: [(SideMode, &str); 4] = [
+const MODES: [(SideMode, &str); 5] = [
     (SideMode::Sessions, "Sessions"),
     (SideMode::Files, "Files"),
     (SideMode::Outline, "Outline"),
     (SideMode::Git, "Git"),
+    (SideMode::Data, "Data"),
 ];
 
 /// Which Git sections are folded; kept off `UiState` because it is not worth restoring.
@@ -100,6 +101,7 @@ impl Shell {
             SideMode::Files => files,
             SideMode::Outline => self.render_outline(cx),
             SideMode::Git => self.render_git_panel(cx),
+            SideMode::Data => self.render_data_explorer(window, cx),
         }
     }
 
@@ -200,7 +202,12 @@ mod tests {
         assert!(hides_git_panel(true, SideMode::Git, false));
         assert!(!hides_git_panel(true, SideMode::Git, true));
         assert!(!hides_git_panel(false, SideMode::Git, false));
-        for mode in [SideMode::Sessions, SideMode::Files, SideMode::Outline] {
+        for mode in [
+            SideMode::Sessions,
+            SideMode::Files,
+            SideMode::Outline,
+            SideMode::Data,
+        ] {
             assert!(!hides_git_panel(true, mode, false));
             assert!(!hides_git_panel(false, mode, false));
         }

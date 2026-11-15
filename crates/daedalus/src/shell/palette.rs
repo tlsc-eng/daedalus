@@ -567,6 +567,7 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Focus outline", Box::new(actions::ShowOutline)),
         ("Show explorer", Box::new(actions::ShowExplorer)),
         ("Show git", Box::new(actions::ShowGit)),
+        ("Show data", Box::new(actions::ShowData)),
         ("Problems", Box::new(actions::ShowProblems)),
         ("Go to next problem", Box::new(actions::NextProblem)),
         ("Go to previous problem", Box::new(actions::PrevProblem)),
@@ -2179,6 +2180,7 @@ mod tests {
             "daedalus::ShowChanges",
             "daedalus::GitOpenTimeline",
             "daedalus::ShowSessions",
+            "daedalus::ShowData",
         ] {
             assert!(names.contains(&action), "{action}");
         }

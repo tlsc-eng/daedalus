@@ -103,7 +103,14 @@ actions!(daedalus, [GitOpenTimeline, GitToggleFileBlame]);
 
 actions!(
     daedalus,
-    [ShowSessions, ShowFiles, ShowOutline, ShowExplorer, ShowGit]
+    [
+        ShowSessions,
+        ShowFiles,
+        ShowOutline,
+        ShowExplorer,
+        ShowGit,
+        ShowData
+    ]
 );
 
 actions!(
@@ -392,6 +399,7 @@ fn menus(recent: &[PathBuf]) -> Vec<Menu> {
                         MenuItem::action("Files", ShowFiles),
                         MenuItem::action("Outline", ShowOutline),
                         MenuItem::action("Git", ShowGit),
+                        MenuItem::action("Data", ShowData),
                     ],
                 }),
                 MenuItem::submenu(Menu {

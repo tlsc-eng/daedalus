@@ -699,6 +699,7 @@ mod tests {
             ca_file: None,
             read_only: false,
             production: false,
+            color: None,
             claude: false,
             projects: Vec::new(),
             save_password: false,
