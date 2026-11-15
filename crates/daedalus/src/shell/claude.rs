@@ -3,7 +3,7 @@ use std::sync::{Mutex, PoisonError};
 
 use daedalus_proto::NoticeKind;
 use daedalus_workspace::{ItemId, ItemKind};
-use gpui::{Context, PromptLevel, Window};
+use gpui::{Context, Entity, PromptLevel, Window};
 
 use super::Shell;
 use super::item::ItemView;
@@ -42,6 +42,17 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<(PathBuf, ItemId)> {
+        let (root, item, view) = self.new_terminal_tab(window, cx)?;
+        view.update(cx, |v, _| v.run_on_start(format!("{command}\r")));
+        Some((root, item))
+    }
+
+    /// Opens a terminal tab in the active project, naming the tab and its view.
+    pub(super) fn new_terminal_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(PathBuf, ItemId, Entity<daedalus_term::TerminalView>)> {
         let i = self.workspace.active?;
         self.new_terminal(window, cx);
         let project = &self.workspace.projects[i];
@@ -56,8 +67,7 @@ impl Shell {
         let Some(ItemView::Terminal(view)) = self.item_view(&root, &item, cx) else {
             return None;
         };
-        view.update(cx, |v, _| v.run_on_start(format!("{command}\r")));
-        Some((root, item.id))
+        Some((root, item.id, view))
     }
 
     /// Puts Daedalus's hooks into every Claude Code config folder, or takes them out, once per

@@ -911,6 +911,7 @@ fn route_companion(command: Command, cx: &mut App) {
             reply,
         } => super::companion_ui::ask_to_pair(device, peer, reply, cx),
         Command::SpawnClaude { root, reply } => spawn_claude_for_phone(&root, reply, cx),
+        Command::SpawnShell { root, reply } => spawn_shell_for_phone(&root, reply, cx),
         Command::ResumeClaude { session, reply } => resume_claude_for_phone(session, reply, cx),
         Command::Act {
             pane,
@@ -1142,12 +1143,7 @@ async fn drive_answer(
     }
 }
 
-/// Opens a `claude` tab in the open project at `root` and answers with its pane once phones can attach it.
-fn spawn_claude_for_phone(
-    root: &Path,
-    reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
-    cx: &mut App,
-) {
+fn project_window(root: &Path, cx: &App) -> Option<(WindowHandle<Shell>, usize)> {
     let handles = handles(cx);
     let roots: Vec<Vec<PathBuf>> = handles
         .iter()
@@ -1163,11 +1159,43 @@ fn spawn_claude_for_phone(
                 .unwrap_or_default()
         })
         .collect();
-    let Some((window, index)) = find_project(&roots, root) else {
+    let (window, index) = find_project(&roots, root)?;
+    Some((handles[window], index))
+}
+
+/// Opens a plain shell tab in the open project at `root` and answers with its pane once phones can attach it.
+fn spawn_shell_for_phone(
+    root: &Path,
+    reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    cx: &mut App,
+) {
+    let Some((handle, index)) = project_window(root, cx) else {
         let _ = reply.send(Err("project not open".into()));
         return;
     };
-    let handle = handles[window];
+    let opened = handle.update(cx, |shell, window, cx| {
+        shell.switch_to(index, cx);
+        shell
+            .new_terminal_tab(window, cx)
+            .map(|(root, item, _)| (root, item))
+    });
+    let Ok(Some((root, item))) = opened else {
+        let _ = reply.send(Err("could not open a terminal".into()));
+        return;
+    };
+    reply_when_started(handle, root, item, "terminal did not start", reply, cx);
+}
+
+/// Opens a `claude` tab in the open project at `root` and answers with its pane once phones can attach it.
+fn spawn_claude_for_phone(
+    root: &Path,
+    reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    cx: &mut App,
+) {
+    let Some((handle, index)) = project_window(root, cx) else {
+        let _ = reply.send(Err("project not open".into()));
+        return;
+    };
     // The command is fixed so nothing the phone sends is ever typed into a shell.
     let opened = handle.update(cx, |shell, window, cx| {
         shell.switch_to(index, cx);
@@ -1177,7 +1205,7 @@ fn spawn_claude_for_phone(
         let _ = reply.send(Err("could not open a terminal".into()));
         return;
     };
-    reply_when_started(handle, root, item, reply, cx);
+    reply_when_started(handle, root, item, "claude did not start", reply, cx);
 }
 
 /// Answers `reply` with the pane of a new tab once phones can attach it.
@@ -1185,6 +1213,7 @@ fn reply_when_started(
     handle: WindowHandle<Shell>,
     root: PathBuf,
     item: ItemId,
+    failure: &'static str,
     reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
     cx: &mut App,
 ) {
@@ -1215,7 +1244,7 @@ fn reply_when_started(
             cx.background_executor().timer(SPAWN_SESSION_POLL).await;
             waited += SPAWN_SESSION_POLL;
         }
-        let _ = reply.send(Err("claude did not start".into()));
+        let _ = reply.send(Err(failure.into()));
     })
     .detach();
 }
@@ -1237,7 +1266,9 @@ fn resume_claude_for_phone(
         shell.resume_for_phone(&session, window, cx)
     });
     match opened {
-        Ok(Ok((root, item))) => reply_when_started(handle, root, item, reply, cx),
+        Ok(Ok((root, item))) => {
+            reply_when_started(handle, root, item, "claude did not start", reply, cx)
+        }
         Ok(Err(message)) => {
             let _ = reply.send(Err(message.into()));
         }

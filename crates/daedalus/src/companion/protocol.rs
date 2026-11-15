@@ -15,6 +15,7 @@ pub const FEATURES: &[&str] = &[
     "suggestion",
     "close",
     "resume",
+    "shell",
 ];
 
 /// Largest payload of one binary frame.
@@ -72,6 +73,10 @@ pub enum ClientMsg {
         id: String,
         project: String,
     },
+    SpawnShell {
+        id: String,
+        project: String,
+    },
     ResumeClaude {
         id: String,
         session: String,
@@ -105,7 +110,7 @@ pub enum ClientMsg {
         id: String,
         pane: u64,
     },
-    /// Closes the tab holding a Claude pane, as closing it on the Mac does.
+    /// Closes the tab holding a terminal pane, as closing it on the Mac does.
     Close {
         id: String,
         pane: u64,
@@ -466,6 +471,9 @@ pub struct Terminal {
     pub suggestion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<u16>,
+    /// The foreground program while the shell is not at its prompt; `Claude` for a Claude pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,6 +816,13 @@ mod tests {
             },
         );
         golden(
+            "spawn_shell",
+            &ClientMsg::SpawnShell {
+                id: "r30".into(),
+                project: "/Users/jason/code/daedalus".into(),
+            },
+        );
+        golden(
             "resume_claude",
             &ClientMsg::ResumeClaude {
                 id: "r12".into(),
@@ -927,6 +942,7 @@ mod tests {
                     dialog: Some(question_dialog()),
                     suggestion: None,
                     background: None,
+                    running: None,
                 }],
                 usage: Vec::new(),
             },
@@ -954,6 +970,7 @@ mod tests {
                     dialog: None,
                     suggestion: Some("run the tests and commit".into()),
                     background: None,
+                    running: None,
                 }],
                 usage: Vec::new(),
             },
@@ -1085,12 +1102,13 @@ mod tests {
                         dialog: Some(bash_dialog()),
                         suggestion: None,
                         background: None,
+                        running: Some("Claude".into()),
                     },
                     Terminal {
                         pane: 124,
                         project: "/Users/jason/code/daedalus".into(),
                         title: "zsh".into(),
-                        program: None,
+                        program: Some("cargo".into()),
                         cwd: None,
                         claude: None,
                         rows: 24,
@@ -1099,6 +1117,7 @@ mod tests {
                         dialog: None,
                         suggestion: None,
                         background: None,
+                        running: Some("cargo".into()),
                     },
                 ],
                 usage: Vec::new(),
@@ -1207,6 +1226,28 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_without_a_running_program_omits_the_field() {
+        let msg = Terminal {
+            pane: 5,
+            project: "/p".into(),
+            title: "zsh".into(),
+            program: None,
+            cwd: None,
+            claude: None,
+            rows: 24,
+            cols: 80,
+            fitted: false,
+            dialog: None,
+            suggestion: None,
+            background: None,
+            running: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("running"));
+        assert_eq!(serde_json::from_str::<Terminal>(&json).unwrap(), msg);
+    }
+
+    #[test]
     fn an_error_without_an_id_omits_the_field() {
         let msg = ServerMsg::Error {
             id: None,
@@ -1269,6 +1310,7 @@ mod tests {
             dialog: None,
             suggestion: None,
             background,
+            running: None,
         };
         let none = serde_json::to_string(&terminal(None)).unwrap();
         assert!(!none.contains("background"));

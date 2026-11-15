@@ -127,6 +127,10 @@ pub enum Command {
         root: PathBuf,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    SpawnShell {
+        root: PathBuf,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
     ResumeClaude {
         session: String,
         reply: oneshot::Sender<Result<u64, String>>,
@@ -824,6 +828,12 @@ async fn connect(mut ws: Ws, mut slot: Slot, shared: &Shared) {
                                 let started = spawn_claude(shared, &current, id, project, busy).await;
                                 queue(&mut pending, &mut acting, None, started)
                             }
+                            ClientMsg::SpawnShell { id, project } => {
+                                let current = Arc::clone(&snapshot.borrow());
+                                let busy = pending.len() >= MAX_IN_FLIGHT;
+                                let started = spawn_shell(shared, &current, id, project, busy).await;
+                                queue(&mut pending, &mut acting, None, started)
+                            }
                             ClientMsg::ResumeClaude { id, session } => {
                                 let current = Arc::clone(&snapshot.borrow());
                                 let busy = pending.len() >= MAX_IN_FLIGHT;
@@ -1074,6 +1084,39 @@ async fn spawn_claude(
                 message,
             },
             _ => failed(id, "could not start claude"),
+        }
+    }))
+}
+
+async fn spawn_shell(
+    shared: &Shared,
+    snapshot: &Snapshot,
+    id: String,
+    project: String,
+    busy: bool,
+) -> Result<Pending, ServerMsg> {
+    if !snapshot.projects.iter().any(|p| p.root == project) {
+        return Err(failed(id, "project is not open in a window"));
+    }
+    if busy {
+        return Err(failed(id, BUSY));
+    }
+    let (reply, answer) = oneshot::channel();
+    let command = Command::SpawnShell {
+        root: PathBuf::from(project),
+        reply,
+    };
+    if shared.commands.send(command).await.is_err() {
+        return Err(failed(id, "could not open a terminal"));
+    }
+    Ok(Box::pin(async move {
+        match timeout(SPAWN_WAIT, answer).await {
+            Ok(Ok(Ok(pane))) => ServerMsg::Spawned { id, pane },
+            Ok(Ok(Err(message))) => ServerMsg::Error {
+                id: Some(id),
+                message,
+            },
+            _ => failed(id, "could not open a terminal"),
         }
     }))
 }
@@ -1502,6 +1545,7 @@ mod tests {
             dialog: None,
             suggestion: None,
             background: None,
+            running: None,
         }
     }
 
@@ -2477,6 +2521,66 @@ mod tests {
                 pane: 456
             }
         );
+    }
+
+    fn shell_request() -> ClientMsg {
+        ClientMsg::SpawnShell {
+            id: "r30".into(),
+            project: "/p".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_shell_for_an_unopened_project_is_refused() {
+        let fx = Fixture::new();
+        let (_, token) = fx.pair_device();
+        let mut ws = fx.welcomed(&token).await;
+        send_json(&mut ws, &shell_request()).await;
+        expect_error(&mut ws, "r30", "project is not open in a window").await;
+        assert!(fx.no_command());
+    }
+
+    #[tokio::test]
+    async fn spawn_shell_is_forwarded_and_answers_spawned() {
+        let fx = Fixture::new();
+        open_project(&fx);
+        let (_, token) = fx.pair_device();
+        let mut ws = fx.welcomed(&token).await;
+        send_json(&mut ws, &shell_request()).await;
+        let Ok(Command::SpawnShell { root, reply }) =
+            timeout(Duration::from_secs(5), fx.next_command())
+                .await
+                .expect("the spawn never reached the app")
+        else {
+            panic!("expected a shell command");
+        };
+        assert_eq!(root, PathBuf::from("/p"));
+        let _ = reply.send(Ok(456));
+        assert_eq!(
+            next_non_snapshot(&mut ws).await,
+            ServerMsg::Spawned {
+                id: "r30".into(),
+                pane: 456
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_shell_refusal_from_the_app_carries_its_text() {
+        let fx = Fixture::new();
+        open_project(&fx);
+        let (_, token) = fx.pair_device();
+        let mut ws = fx.welcomed(&token).await;
+        send_json(&mut ws, &shell_request()).await;
+        let Ok(Command::SpawnShell { reply, .. }) =
+            timeout(Duration::from_secs(5), fx.next_command())
+                .await
+                .expect("the spawn never reached the app")
+        else {
+            panic!("expected a shell command");
+        };
+        let _ = reply.send(Err("project not open".into()));
+        expect_error(&mut ws, "r30", "project not open").await;
     }
 
     #[tokio::test]

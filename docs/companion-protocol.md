@@ -15,10 +15,10 @@ A request with an `Origin` header is refused with 403. The server pings every 20
 
 ## Framing
 
-- Text frames carry one JSON object with a snake_case `"type"`. An unknown `type` from the phone makes the desktop close the socket, and the phone skips a message from the desktop whose `type` it does not know. The phone sends the transcript, act and usage messages only when `welcome.features` lists `transcript`, `usage` and `act`, reads `terminal.dialog` only when it lists `dialog`, reads `terminal.suggestion` only when it lists `suggestion`, and sends `answer` only when it lists `answer`.
+- Text frames carry one JSON object with a snake_case `"type"`. An unknown `type` from the phone makes the desktop close the socket, and the phone skips a message from the desktop whose `type` it does not know. The phone sends the transcript, act and usage messages only when `welcome.features` lists `transcript`, `usage` and `act`, reads `terminal.dialog` only when it lists `dialog`, reads `terminal.suggestion` only when it lists `suggestion`, sends `answer` only when it lists `answer`, and sends `spawn_shell` only when it lists `shell`.
 - Binary frames carry terminal bytes: `[kind u8][pane u64 big-endian][payload]`. Kind `1` is output (desktop to phone), kind `2` is input (phone to desktop). The payload is at most 64 KiB, and a frame with a shorter header, an unknown kind or a larger payload is invalid.
 - Optional fields are omitted when absent.
-- Replies to `spawn_claude`, `resume_claude`, `prompt`, `interrupt`, `answer` and `usage_refresh` come when the desktop has finished, not in request order, and `snapshot` and ping frames keep flowing in between. The phone matches a reply to its request by `id`. The desktop holds at most 8 such requests per connection and answers a ninth at once with `error` `busy`, without acting on it.
+- Replies to `spawn_claude`, `spawn_shell`, `resume_claude`, `prompt`, `interrupt`, `answer` and `usage_refresh` come when the desktop has finished, not in request order, and `snapshot` and ping frames keep flowing in between. The phone matches a reply to its request by `id`. The desktop holds at most 8 such requests per connection and answers a ninth at once with `error` `busy`, without acting on it.
 
 ## Session flow
 
@@ -63,6 +63,12 @@ A request with an `Origin` header is refused with 403. The server pings every 20
 
 ```json
 {"type":"spawn_claude","id":"r1","project":"/Users/jason/code/daedalus"}
+```
+
+`spawn_shell`: start the user's login shell in a new terminal tab of an open project root. `project` must equal a root in the snapshot exactly. Nothing is typed into the shell. `id` is echoed in `spawned` or `error`, and the answer comes once the new pane is in a snapshot. A project folder that no longer exists opens the shell in the home folder. Send it only when `features` lists `shell`.
+
+```json
+{"type":"spawn_shell","id":"r30","project":"/Users/jason/code/daedalus"}
 ```
 
 `resume_claude`: resume a past session in a new terminal tab of its project. `session` must be in the latest snapshot with no pane; a session that is already open, or running in another terminal app, is refused. `id` is echoed in `spawned` or `error`, and the answer comes once the pane is in a snapshot. Claude keeps the session id, so the session reappears with that pane once Claude starts. Send it only when `features` lists `resume`.
@@ -117,7 +123,7 @@ A request with an `Origin` header is refused with 403. The server pings every 20
 {"type":"interrupt","id":"r10","pane":123}
 ```
 
-`close`: close the tab holding a Claude pane, as closing it on the Mac does; Claude is stopped mid-turn. `pane is not open` / `this is not a Claude session`. `id` is echoed in `sent` or `error`.
+`close`: close the tab holding a terminal pane, as closing it on the Mac does; whatever runs in it is stopped. Closing a pane without Claude needs the `shell` feature; an older desktop answers it with `this is not a Claude session`. `pane is not open`. `id` is echoed in `sent` or `error`.
 
 ```json
 {"type":"close","id":"r11","pane":123}
@@ -147,10 +153,10 @@ One `prompt`, `interrupt` or `close` per pane at a time: a second one for a pane
 
 ## Desktop to phone (`/v1/connect`)
 
-`welcome`: answer to `hello`. `server` is the server id: 16 lowercase hex characters, generated once and stored in the Daedalus data directory, so it stays the same across restarts. Phones key their pairing by it. `features` lists the optional message groups the desktop handles (`transcript` for the transcript messages, `usage` for `snapshot.usage` and `usage_refresh`, `act` for `prompt` and `interrupt`, `close` for `close`, `resume` for `resume_claude`, `dialog` for `terminal.dialog`, `answer` for `answer`, `subagents` for `subagents`, `fit` for `fit`, `unfit`, `lease_ended` and `terminal.fitted`, `tool_output` for the output fields on tool items and the `tool_output` request, `suggestion` for `terminal.suggestion`), and is omitted when empty.
+`welcome`: answer to `hello`. `server` is the server id: 16 lowercase hex characters, generated once and stored in the Daedalus data directory, so it stays the same across restarts. Phones key their pairing by it. `features` lists the optional message groups the desktop handles (`transcript` for the transcript messages, `usage` for `snapshot.usage` and `usage_refresh`, `act` for `prompt` and `interrupt`, `close` for `close`, `resume` for `resume_claude`, `shell` for `spawn_shell`, `close` on any terminal and `terminal.running`, `dialog` for `terminal.dialog`, `answer` for `answer`, `subagents` for `subagents`, `fit` for `fit`, `unfit`, `lease_ended` and `terminal.fitted`, `tool_output` for the output fields on tool items and the `tool_output` request, `suggestion` for `terminal.suggestion`), and is omitted when empty.
 
 ```json
-{"type":"welcome","proto":1,"server":"a1b2c3d4e5f60718","name":"Jason's Mac","app":"2.0.1","features":["transcript","usage","act","dialog","answer","subagents","fit","tool_output","suggestion","close","resume"]}
+{"type":"welcome","proto":1,"server":"a1b2c3d4e5f60718","name":"Jason's Mac","app":"2.0.1","features":["transcript","usage","act","dialog","answer","subagents","fit","tool_output","suggestion","close","resume","shell"]}
 ```
 
 `snapshot`: the whole state. `session.unread` is a boolean and `session.files` is the count of changed files. `session.state` and `terminal.claude` are `running`, `needs_input`, `finished` or `idle`. The desktop omits `terminal.claude` when no Claude session runs in the pane, and never sends `idle` there. See `design/protocol/snapshot.json` for a full example with every optional field set.
@@ -173,6 +179,8 @@ One `prompt`, `interrupt` or `close` per pane at a time: a second one for a pane
 ```
 
 `terminal.suggestion` is present only while the pane runs Claude in `finished` and the desktop read Claude Code's grey suggested prompt on the input line, and is omitted otherwise. The phone accepts it by sending the text as a `prompt`, which Claude Code counts as accepting the suggestion; there is no separate message. A suggestion that wraps or is truncated, hint text such as `Press up to edit queued messages`, and anything that Claude Code does not show (setting off, plan mode, cold cache), is omitted. See `design/protocol/snapshot_suggestion.json`.
+
+`terminal.running` is the program in the foreground while the shell is not at its prompt (`Claude` for a Claude pane), omitted at a prompt or after the shell exited. A phone uses it to confirm a close. Present when `features` lists `shell`.
 
 `terminal.background` is the number of background tasks (shells, monitors, agents, workflows) Claude ended its turn waiting on, and is omitted when there are none. The pane's `claude` stays `running` meanwhile; a hold of only shells and monitors is dropped after 60 minutes. The phone may ignore it; no feature flag lists it.
 
@@ -218,7 +226,7 @@ One `prompt`, `interrupt` or `close` per pane at a time: a second one for a pane
 {"type":"dropped","pane":123,"reason":"lagging"}
 ```
 
-`spawned`: answer to `spawn_claude` or `resume_claude`.
+`spawned`: answer to `spawn_claude`, `spawn_shell` or `resume_claude`.
 
 ```json
 {"type":"spawned","id":"r1","pane":456}

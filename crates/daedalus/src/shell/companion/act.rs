@@ -22,13 +22,7 @@ pub(in crate::shell) fn gate(
                 Err("Claude is not running")
             }
         },
-        Action::Close => {
-            if is_claude {
-                Ok(())
-            } else {
-                Err("this is not a Claude session")
-            }
-        }
+        Action::Close => Ok(()),
         Action::Answer { .. } => match (is_claude, state) {
             (false, _) => Err("this is not a Claude session"),
             (true, Some(ClaudeState::NeedsInput)) => Ok(()),
@@ -76,10 +70,11 @@ mod tests {
     }
 
     #[test]
-    fn close_needs_a_claude_pane() {
-        for state in STATES {
-            assert!(gate(false, state, &Action::Close).is_err());
-            assert!(gate(true, state, &Action::Close).is_ok());
+    fn close_takes_any_pane() {
+        for is_claude in [false, true] {
+            for state in STATES {
+                assert!(gate(is_claude, state, &Action::Close).is_ok());
+            }
         }
     }
 

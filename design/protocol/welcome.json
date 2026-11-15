@@ -15,6 +15,7 @@
     "tool_output",
     "suggestion",
     "close",
-    "resume"
+    "resume",
+    "shell"
   ]
 }
