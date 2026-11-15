@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use crate::catalog::{Catalog, Schema, Table, TableKind};
 use crate::classify::{self, Kind};
 use crate::config::{self, Connection, Engine, Listed, Store};
+use crate::value::Cell;
+use crate::worker::Update;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_ROWS: u32 = 100;
@@ -296,11 +298,127 @@ pub fn table_json(catalog: &Catalog, schema: Option<&str>, table: &str) -> Resul
     .unwrap_or_default())
 }
 
+/// What the caller does next after feeding the collector one update.
+pub enum Step {
+    Wait,
+    Cancel,
+    Done(String),
+    Failed(String),
+}
+
+/// Folds one ReadOnly run's updates into a single capped JSON result.
+pub struct Collector {
+    max_rows: usize,
+    columns: Vec<(String, String)>,
+    rows: Vec<Vec<Cell>>,
+    bytes: usize,
+    cells_cut: usize,
+    truncated_by: Option<&'static str>,
+    cancelled: bool,
+}
+
+impl Collector {
+    pub fn new(max_rows: u32) -> Self {
+        Self {
+            max_rows: max_rows as usize,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            bytes: 0,
+            cells_cut: 0,
+            truncated_by: None,
+            cancelled: false,
+        }
+    }
+
+    pub fn feed(&mut self, update: Update) -> Step {
+        match update {
+            Update::Columns { columns, .. } => {
+                self.columns = columns.into_iter().map(|c| (c.name, c.type_name)).collect();
+                Step::Wait
+            }
+            Update::Rows { rows, more, .. } => {
+                if !self.cancelled {
+                    self.append(rows);
+                }
+                if more && !self.cancelled {
+                    self.cancelled = true;
+                    self.truncated_by.get_or_insert("max_rows");
+                    return Step::Cancel;
+                }
+                Step::Wait
+            }
+            Update::Done {
+                elapsed, truncated, ..
+            } => {
+                if truncated {
+                    self.truncated_by.get_or_insert("server");
+                }
+                Step::Done(self.finish(elapsed))
+            }
+            Update::RunError { message, .. } => Step::Failed(message),
+            Update::Failed { error, .. } => Step::Failed(error),
+            _ => Step::Wait,
+        }
+    }
+
+    fn append(&mut self, rows: Vec<Vec<Cell>>) {
+        for row in rows {
+            if self.truncated_by == Some("bytes") {
+                return;
+            }
+            if self.rows.len() >= self.max_rows {
+                self.truncated_by.get_or_insert("max_rows");
+                return;
+            }
+            let row: Vec<Cell> = row
+                .into_iter()
+                .map(|cell| {
+                    cell.map(|text| match text.char_indices().nth(MAX_CELL_CHARS) {
+                        Some((at, _)) => {
+                            self.cells_cut += 1;
+                            text[..at].to_string()
+                        }
+                        None => text,
+                    })
+                })
+                .collect();
+            let size = serde_json::to_string(&row).map_or(0, |s| s.len() + 1);
+            if self.bytes + size > MAX_OUTPUT_BYTES {
+                self.truncated_by = Some("bytes");
+                return;
+            }
+            self.bytes += size;
+            self.rows.push(row);
+        }
+    }
+
+    fn finish(&self, elapsed: Duration) -> String {
+        let columns: Vec<Value> = self
+            .columns
+            .iter()
+            .map(|(name, ty)| json!({ "name": name, "type": ty }))
+            .collect();
+        let row_count = self.rows.len();
+        json!({
+            "note": NOTE,
+            "columns": columns,
+            "rows": self.rows,
+            "row_count": row_count,
+            "truncated": self.truncated_by.is_some(),
+            "truncated_by": self.truncated_by,
+            "cells_cut": self.cells_cut,
+            "elapsed_ms": elapsed.as_millis() as u64,
+        })
+        .to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::CatalogColumn;
     use crate::config::{Origin, Tls};
+    use crate::worker::{RunId, SessionId};
 
     const PG: Engine = Engine::Postgres;
 
@@ -619,5 +737,108 @@ mod tests {
             table_json(&cat, None, "zz"),
             Err("No table zz. Call db_list_tables.".into())
         );
+    }
+
+    fn rows(rows: Vec<Vec<Cell>>, more: bool) -> Update {
+        Update::Rows {
+            session: SessionId(1),
+            run: RunId(1),
+            rows,
+            more,
+        }
+    }
+
+    fn done(truncated: bool) -> Update {
+        Update::Done {
+            session: SessionId(1),
+            run: RunId(1),
+            affected: None,
+            elapsed: Duration::from_millis(5),
+            truncated,
+        }
+    }
+
+    fn finished(step: Step) -> Value {
+        match step {
+            Step::Done(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn collector_cuts_long_cells() {
+        let mut c = Collector::new(10);
+        let long = std::iter::once("é")
+            .cycle()
+            .take(MAX_CELL_CHARS + 5)
+            .collect::<String>();
+        assert!(matches!(
+            c.feed(rows(vec![vec![Some(long), None]], false)),
+            Step::Wait
+        ));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["cells_cut"], 1);
+        assert_eq!(
+            v["rows"][0][0].as_str().unwrap().chars().count(),
+            MAX_CELL_CHARS
+        );
+        assert!(v["rows"][0][1].is_null());
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["note"], NOTE);
+    }
+
+    #[test]
+    fn collector_caps_bytes() {
+        let mut c = Collector::new(u32::MAX);
+        let cell = || {
+            Some(
+                std::iter::once('x')
+                    .cycle()
+                    .take(MAX_CELL_CHARS)
+                    .collect::<String>(),
+            )
+        };
+        let page: Vec<Vec<Cell>> = (0..400).map(|_| vec![cell()]).collect();
+        c.feed(rows(page, false));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["truncated_by"], "bytes");
+        let n = v["row_count"].as_u64().unwrap();
+        assert!(n > 0 && n < 400);
+        assert!(v.to_string().len() <= MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn collector_cancels_once_on_more() {
+        let mut c = Collector::new(2);
+        let row = || vec![Some("a".to_string())];
+        assert!(matches!(
+            c.feed(rows(vec![row(), row()], true)),
+            Step::Cancel
+        ));
+        assert!(matches!(c.feed(rows(vec![row()], true)), Step::Wait));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["row_count"], 2);
+        assert_eq!(v["truncated_by"], "max_rows");
+    }
+
+    #[test]
+    fn collector_reports_server_truncation() {
+        let mut c = Collector::new(10);
+        let v = finished(c.feed(done(true)));
+        assert_eq!(v["truncated_by"], "server");
+        assert_eq!(v["rows"], json!([]));
+        assert_eq!(v["columns"], json!([]));
+    }
+
+    #[test]
+    fn collector_reports_run_error() {
+        let mut c = Collector::new(10);
+        let step = c.feed(Update::RunError {
+            session: SessionId(1),
+            run: RunId(1),
+            message: "no such table".into(),
+            position: None,
+        });
+        assert!(matches!(step, Step::Failed(m) if m == "no such table"));
     }
 }
