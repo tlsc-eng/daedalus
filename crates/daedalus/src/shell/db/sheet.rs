@@ -160,7 +160,6 @@ fn url_fields(current: &Fields, url: &Connection) -> Fields {
     }
 }
 
-/// Whether an open session no longer matches the edited connection.
 /// True when saving turns Claude access on for a production connection that did not have both.
 pub(in crate::shell) fn asks_for_claude_on_production(
     base: Option<&Connection>,
@@ -169,6 +168,7 @@ pub(in crate::shell) fn asks_for_claude_on_production(
     new.production && new.claude && !base.is_some_and(|b| b.production && b.claude)
 }
 
+/// Whether an open session no longer matches the edited connection.
 pub(in crate::shell) fn needs_reconnect(old: &Connection, new: &Connection) -> bool {
     (&old.engine, &old.host, &old.port, &old.database, &old.user)
         != (&new.engine, &new.host, &new.port, &new.database, &new.user)
