@@ -616,7 +616,7 @@ impl Shell {
                     }
                 }
                 Err(e) if shell.db_sheet_is(opened) => shell.db_sheet_error(e, cx),
-                Err(_) => {}
+                Err(e) => shell.transient_notice("Could not save the connection", e, cx),
             })
             .ok();
         })

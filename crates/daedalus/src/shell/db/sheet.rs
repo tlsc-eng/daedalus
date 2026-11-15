@@ -135,6 +135,25 @@ pub(super) fn build(
     })
 }
 
+/// A URL carries the server and the database, not the name, colour, flags or Keychain choice.
+fn url_fields(current: &Fields, url: &Connection) -> Fields {
+    let name = match current.name.trim().is_empty() {
+        true => url.name.clone(),
+        false => current.name.clone(),
+    };
+    Fields {
+        name,
+        engine: url.engine,
+        host: url.host.clone(),
+        port: url.port.map(|p| p.to_string()).unwrap_or_default(),
+        database: url.database.clone(),
+        user: url.user.clone(),
+        tls: url.tls,
+        tls_touched: true,
+        ..current.clone()
+    }
+}
+
 /// Whether an open session no longer matches the edited connection.
 pub(in crate::shell) fn needs_reconnect(old: &Connection, new: &Connection) -> bool {
     (&old.engine, &old.host, &old.port, &old.database, &old.user)
@@ -285,25 +304,19 @@ impl DbSheet {
             .is_some_and(|r| conn.projects.contains(r));
     }
 
-    /// A URL carries the server and the database, not the name, colour, flags or Keychain choice.
     fn fill_from_url(&mut self, conn: &Connection, cx: &mut Context<Self>) {
+        let next = url_fields(&self.fields(cx), conn);
         let set = |input: &Entity<TextInput>, text: &str, cx: &mut Context<Self>| {
             input.update(cx, |i, cx| i.set_text(text, cx));
         };
-        if self.name.read(cx).text().trim().is_empty() {
-            set(&self.name, &conn.name, cx);
-        }
-        set(&self.host, &conn.host, cx);
-        set(
-            &self.port,
-            &conn.port.map(|p| p.to_string()).unwrap_or_default(),
-            cx,
-        );
-        set(&self.database, &conn.database, cx);
-        set(&self.user, &conn.user, cx);
-        self.engine = conn.engine;
-        self.tls = conn.tls;
-        self.tls_touched = true;
+        set(&self.name, &next.name, cx);
+        set(&self.host, &next.host, cx);
+        set(&self.port, &next.port, cx);
+        set(&self.database, &next.database, cx);
+        set(&self.user, &next.user, cx);
+        self.engine = next.engine;
+        self.tls = next.tls;
+        self.tls_touched = next.tls_touched;
     }
 
     fn fields(&self, cx: &App) -> Fields {
@@ -1030,14 +1043,27 @@ mod tests {
 
     #[test]
     fn paste_url_keeps_the_keychain_tick_and_production() {
-        let mut edited = base();
-        edited.production = true;
         let (url_conn, secret) = daedalus_db::from_url("postgres://u:pw@db.example.com/x").unwrap();
-        let mut f = fields();
-        f.production = true;
-        f.host = url_conn.host.clone();
-        f.database = url_conn.database.clone();
-        let built = build(&f, Some(&edited), None).unwrap();
+        let current = Fields {
+            color: Some("red".into()),
+            read_only: true,
+            production: true,
+            only_here: true,
+            ..fields()
+        };
+        let next = url_fields(&current, &url_conn);
+        assert_eq!(next.host, "db.example.com");
+        assert_eq!(next.database, "x");
+        assert!(next.keychain && next.production && next.read_only && next.only_here);
+        assert_eq!(next.color.as_deref(), Some("red"));
+        assert_eq!(next.name, "Local");
+        let blank = Fields {
+            name: " ".into(),
+            ..current
+        };
+        assert_eq!(url_fields(&blank, &url_conn).name, url_conn.name);
+        let edited = base();
+        let built = build(&next, Some(&edited), None).unwrap();
         assert!(built.save_password && built.production);
         let typed = secret.as_ref().map_or("", |s| s.expose());
         assert!(matches!(
