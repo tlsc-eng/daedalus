@@ -19,3 +19,5 @@ tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
+tree-sitter.workspace = true
+tree-sitter-sequel.workspace = true
