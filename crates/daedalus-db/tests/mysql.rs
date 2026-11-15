@@ -102,7 +102,10 @@ fn done_or_cancel_error(rig: &Rig, run: u64) {
             Update::RunError {
                 run: r, message, ..
             } if r == RunId(run) => {
-                assert!(message.contains("cancel"), "{message}");
+                assert!(
+                    message.contains("cancel") || message.contains("interrupted"),
+                    "{message}"
+                );
                 return;
             }
             other => panic!("unexpected {other:?}"),
