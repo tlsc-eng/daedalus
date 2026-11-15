@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
+use daedalus_db::edit::Stmt;
+use daedalus_db::worker::{
+    ApplyError, Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start,
+};
 use daedalus_db::{Connection, Engine, Tls};
 
 const S: SessionId = SessionId(1);
@@ -700,5 +703,185 @@ fn cancel_queued_during_connect_never_executes() {
             }
         ));
         assert_eq!(row_count(&rig, 2), 0);
+    }
+}
+
+fn stmt(sql: &str, params: &[Option<&str>]) -> Stmt {
+    Stmt {
+        sql: sql.into(),
+        params: params.iter().map(|p| p.map(str::to_owned)).collect(),
+    }
+}
+
+fn apply(rig: &Rig, statements: Vec<Stmt>) -> Result<u64, ApplyError> {
+    rig.handle.send(Command::Apply {
+        session: S,
+        statements,
+    });
+    loop {
+        if let Update::Applied { result, .. } = rig.next() {
+            return result;
+        }
+    }
+}
+
+fn scalar(rig: &Rig, run: u64, sql: &str) -> Vec<Option<String>> {
+    rig.run(run, sql, 100);
+    rig.collect(run).expect("query").remove(0)
+}
+
+fn table_with_rows(rig: &Rig, sql: &str) {
+    rig.run(1, sql, 100);
+    assert!(rig.collect(1).is_ok());
+}
+
+#[test]
+fn apply_commits_every_statement() {
+    let rig = rig(false);
+    table_with_rows(
+        &rig,
+        "create table t(id integer primary key, x text); insert into t values (1,'a'),(2,'b')",
+    );
+    let result = apply(
+        &rig,
+        vec![
+            stmt("update t set x = ? where id = ?", &[Some("A"), Some("1")]),
+            stmt("delete from t where id = ?", &[Some("2")]),
+            stmt(
+                "insert into t (id, x) values (?, ?)",
+                &[Some("3"), Some("c")],
+            ),
+        ],
+    );
+    assert_eq!(result, Ok(3));
+    rig.run(2, "select id, x from t order by id", 100);
+    assert_eq!(
+        rig.collect(2),
+        Ok(vec![
+            vec![Some("1".into()), Some("A".into())],
+            vec![Some("3".into()), Some("c".into())],
+        ])
+    );
+}
+
+#[test]
+fn rowcount_mismatch_rolls_back() {
+    let rig = rig(false);
+    table_with_rows(
+        &rig,
+        "create table t(id integer primary key, x text); insert into t values (1,'a')",
+    );
+    let result = apply(
+        &rig,
+        vec![
+            stmt("update t set x = ? where id = ?", &[Some("A"), Some("1")]),
+            stmt("update t set x = ? where id = ?", &[Some("B"), Some("9")]),
+        ],
+    );
+    let err = result.expect_err("mismatch");
+    assert_eq!(err.index, Some(1));
+    assert_eq!(scalar(&rig, 2, "select x from t"), vec![Some("a".into())]);
+}
+
+#[test]
+fn apply_rolls_back_when_two_rows_match() {
+    let rig = rig(false);
+    table_with_rows(
+        &rig,
+        "create table t(id integer primary key, g text); insert into t values (1,'k'),(2,'k')",
+    );
+    let err =
+        apply(&rig, vec![stmt("delete from t where g = ?", &[Some("k")])]).expect_err("two rows");
+    assert_eq!(err.index, Some(0));
+    assert_eq!(
+        scalar(&rig, 2, "select count(*) from t"),
+        vec![Some("2".into())]
+    );
+}
+
+#[test]
+fn null_and_empty_string_differ() {
+    let rig = rig(false);
+    table_with_rows(&rig, "create table t(id integer, x text)");
+    let result = apply(
+        &rig,
+        vec![
+            stmt("insert into t values (?, ?)", &[Some("1"), None]),
+            stmt("insert into t values (?, ?)", &[Some("2"), Some("")]),
+        ],
+    );
+    assert_eq!(result, Ok(2));
+    rig.run(2, "select x is null, length(x) from t order by id", 100);
+    assert_eq!(
+        rig.collect(2),
+        Ok(vec![
+            vec![Some("1".into()), None],
+            vec![Some("0".into()), Some("0".into())],
+        ])
+    );
+}
+
+#[test]
+fn text_params_fill_integer_columns() {
+    let rig = rig(false);
+    table_with_rows(&rig, "create table t(n integer)");
+    assert_eq!(
+        apply(&rig, vec![stmt("insert into t values (?)", &[Some("5")])]),
+        Ok(1)
+    );
+    assert_eq!(
+        scalar(&rig, 2, "select typeof(n) from t"),
+        vec![Some("integer".into())]
+    );
+}
+
+#[test]
+fn apply_is_refused_on_a_read_only_connection() {
+    let rig = rig(true);
+    let err = apply(&rig, vec![stmt("select 1", &[])]).expect_err("read-only");
+    assert_eq!(err.index, None);
+    assert!(err.message.contains("read-only"));
+}
+
+#[test]
+fn apply_is_refused_while_a_manual_transaction_is_open() {
+    let rig = rig(false);
+    table_with_rows(&rig, "create table t(x)");
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    let err = apply(&rig, vec![stmt("insert into t values (?)", &[Some("2")])])
+        .expect_err("open transaction");
+    assert_eq!(err.index, None);
+    rig.tx(TxOp::Rollback);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 3), 0);
+}
+
+#[test]
+fn apply_after_disconnect_reports_not_connected() {
+    let rig = rig(false);
+    rig.handle.send(Command::Disconnect { session: S });
+    let err = apply(&rig, vec![stmt("select 1", &[])]).expect_err("gone");
+    assert_eq!(err.message, "not connected");
+}
+
+#[test]
+fn apply_queued_behind_a_run_runs_after_it() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    rig.handle.send(Command::Apply {
+        session: S,
+        statements: vec![stmt("insert into t values (?)", &[Some("1")])],
+    });
+    let mut done = false;
+    loop {
+        match rig.next() {
+            Update::Done { .. } => done = true,
+            Update::Applied { result, .. } => {
+                assert!(done, "applied before the run finished");
+                assert_eq!(result, Ok(1));
+                break;
+            }
+            _ => {}
+        }
     }
 }

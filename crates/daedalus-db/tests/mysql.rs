@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
+use daedalus_db::edit::Stmt;
+use daedalus_db::worker::{
+    ApplyError, Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start,
+};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -591,4 +594,121 @@ fn read_only_run_keeps_a_read_only_connection_read_only() {
     wait_done(&rig);
     rig.run(2, "INSERT INTO ro_conn_probe VALUES (1)", 500, None);
     rig.next_error();
+}
+
+fn stmt(sql: &str, params: &[Option<&str>]) -> Stmt {
+    Stmt {
+        sql: sql.into(),
+        params: params.iter().map(|p| p.map(str::to_owned)).collect(),
+    }
+}
+
+fn apply(rig: &Rig, statements: Vec<Stmt>) -> Result<u64, ApplyError> {
+    rig.handle.send(Command::Apply {
+        session: S,
+        statements,
+    });
+    loop {
+        if let Update::Applied { result, .. } = rig.next() {
+            return result;
+        }
+    }
+}
+
+fn exec(rig: &Rig, run: u64, sql: &str) {
+    rig.run(run, sql, 100, None);
+    scalar(rig, run);
+}
+
+fn row(rig: &Rig, run: u64, sql: &str) -> Vec<Option<String>> {
+    rig.run(run, sql, 100, None);
+    loop {
+        match rig.next() {
+            Update::Rows { mut rows, .. } if !rows.is_empty() => {
+                let first = rows.remove(0);
+                scalar(rig, run);
+                return first;
+            }
+            Update::Done { run: r, .. } if r == RunId(run) => panic!("no row"),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs MySQL at DAEDALUS_TEST_MYSQL"]
+fn mysql_noop_update_counts_one_row() {
+    let rig = rig(false);
+    exec(
+        &rig,
+        1,
+        "create temporary table t(id int primary key, x varchar(10))",
+    );
+    exec(&rig, 2, "insert into t values (1, 'a')");
+    let result = apply(
+        &rig,
+        vec![stmt(
+            "update t set x = ? where id = ?",
+            &[Some("a"), Some("1")],
+        )],
+    );
+    assert_eq!(result, Ok(1));
+}
+
+#[test]
+#[ignore = "needs MySQL at DAEDALUS_TEST_MYSQL"]
+fn mysql_warning_rolls_back() {
+    let rig = rig(false);
+    exec(&rig, 1, "create temporary table t(n int)");
+    exec(&rig, 2, "set session sql_mode=''");
+    let err =
+        apply(&rig, vec![stmt("insert into t values (?)", &[Some("abc")])]).expect_err("warning");
+    assert_eq!(err.index, Some(0));
+    assert_eq!(
+        row(&rig, 3, "select count(*) from t"),
+        vec![Some("0".into())]
+    );
+}
+
+#[test]
+#[ignore = "needs MySQL at DAEDALUS_TEST_MYSQL"]
+fn mysql_rowcount_mismatch_rolls_back() {
+    let rig = rig(false);
+    exec(
+        &rig,
+        1,
+        "create temporary table t(id int primary key, x varchar(10))",
+    );
+    exec(&rig, 2, "insert into t values (1, 'a')");
+    let err = apply(
+        &rig,
+        vec![
+            stmt("update t set x = ? where id = ?", &[Some("A"), Some("1")]),
+            stmt("update t set x = ? where id = ?", &[Some("B"), Some("9")]),
+        ],
+    )
+    .expect_err("mismatch");
+    assert_eq!(err.index, Some(1));
+    assert_eq!(row(&rig, 3, "select x from t"), vec![Some("a".into())]);
+}
+
+#[test]
+#[ignore = "needs MySQL at DAEDALUS_TEST_MYSQL"]
+fn mysql_quotes_backticks() {
+    let rig = rig(false);
+    let table = daedalus_db::edit::quote_ident(daedalus_db::Engine::Mysql, "we`ird");
+    exec(&rig, 1, &format!("create temporary table {table}(id int)"));
+    let result = apply(
+        &rig,
+        vec![stmt(
+            &format!("insert into {table} values (?)"),
+            &[Some("1")],
+        )],
+    );
+    assert_eq!(result, Ok(1));
+    assert_eq!(
+        row(&rig, 2, &format!("select count(*) from {table}")),
+        vec![Some("1".into())]
+    );
 }

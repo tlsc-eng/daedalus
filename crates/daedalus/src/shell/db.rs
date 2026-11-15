@@ -333,7 +333,8 @@ impl DbState {
             | Update::Rows { .. }
             | Update::Done { .. }
             | Update::RunError { .. }
-            | Update::TxState { .. } => None,
+            | Update::TxState { .. }
+            | Update::Applied { .. } => None,
         }
     }
 }

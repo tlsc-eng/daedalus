@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
+use daedalus_db::edit::Stmt;
+use daedalus_db::worker::{
+    ApplyError, Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start,
+};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -438,4 +441,147 @@ fn commit_of_a_failed_transaction_rolls_back() {
         }
         other => panic!("expected a transaction state, got {other:?}"),
     }
+}
+
+fn stmt(sql: &str, params: &[Option<&str>]) -> Stmt {
+    Stmt {
+        sql: sql.into(),
+        params: params.iter().map(|p| p.map(str::to_owned)).collect(),
+    }
+}
+
+fn apply(rig: &Rig, statements: Vec<Stmt>) -> Result<u64, ApplyError> {
+    rig.handle.send(Command::Apply {
+        session: S,
+        statements,
+    });
+    loop {
+        if let Update::Applied { result, .. } = rig.next() {
+            return result;
+        }
+    }
+}
+
+fn exec(rig: &Rig, run: u64, sql: &str) {
+    rig.run(run, sql, 100, None);
+    scalar(rig, run);
+}
+
+fn row(rig: &Rig, run: u64, sql: &str) -> Vec<Option<String>> {
+    rig.run(run, sql, 100, None);
+    loop {
+        match rig.next() {
+            Update::Rows { mut rows, .. } if !rows.is_empty() => {
+                let first = rows.remove(0);
+                scalar(rig, run);
+                return first;
+            }
+            Update::Done { run: r, .. } if r == RunId(run) => panic!("no row"),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn pg_text_params_fill_typed_columns() {
+    let rig = rig(false);
+    exec(
+        &rig,
+        1,
+        "create temp table t(i int, n numeric, b bool, ts timestamptz, j jsonb, a int[], u uuid)",
+    );
+    let result = apply(
+        &rig,
+        vec![stmt(
+            "insert into t values ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                Some("5"),
+                Some("1.50"),
+                Some("t"),
+                Some("2024-01-02 03:04:05+00"),
+                Some("{\"a\":1}"),
+                Some("{1,2}"),
+                Some("123e4567-e89b-12d3-a456-426614174000"),
+            ],
+        )],
+    );
+    assert_eq!(result, Ok(1));
+    let got = row(
+        &rig,
+        2,
+        "select i::text, n::text, b::text, (ts = '2024-01-02 03:04:05+00'::timestamptz)::text, j::text, a::text, u::text from t",
+    );
+    let want = [
+        "5",
+        "1.50",
+        "true",
+        "true",
+        "{\"a\": 1}",
+        "{1,2}",
+        "123e4567-e89b-12d3-a456-426614174000",
+    ];
+    assert_eq!(got, want.map(|w| Some(w.to_owned())));
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn pg_varchar_overflow_fails_and_rolls_back() {
+    let rig = rig(false);
+    exec(&rig, 1, "create temp table t(id int, v varchar(3))");
+    let err = apply(
+        &rig,
+        vec![
+            stmt("insert into t values ($1, $2)", &[Some("1"), Some("abc")]),
+            stmt("insert into t values ($1, $2)", &[Some("2"), Some("abcd")]),
+        ],
+    )
+    .expect_err("overflow");
+    assert_eq!(err.index, Some(1));
+    assert_eq!(
+        row(&rig, 2, "select count(*)::text from t"),
+        vec![Some("0".into())]
+    );
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn pg_rowcount_mismatch_rolls_back() {
+    let rig = rig(false);
+    exec(&rig, 1, "create temp table t(id int primary key, x text)");
+    exec(&rig, 2, "insert into t values (1, 'a')");
+    let err = apply(
+        &rig,
+        vec![
+            stmt("update t set x = $1 where id = $2", &[Some("A"), Some("1")]),
+            stmt("update t set x = $1 where id = $2", &[Some("B"), Some("9")]),
+        ],
+    )
+    .expect_err("mismatch");
+    assert_eq!(err.index, Some(1));
+    assert_eq!(row(&rig, 3, "select x from t"), vec![Some("a".into())]);
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn pg_null_and_empty_string_differ() {
+    let rig = rig(false);
+    exec(&rig, 1, "create temp table t(id int, x text)");
+    let result = apply(
+        &rig,
+        vec![
+            stmt("insert into t values ($1, $2)", &[Some("1"), None]),
+            stmt("insert into t values ($1, $2)", &[Some("2"), Some("")]),
+        ],
+    );
+    assert_eq!(result, Ok(2));
+    assert_eq!(
+        row(&rig, 2, "select (x is null)::text from t where id = 1"),
+        vec![Some("true".into())]
+    );
+    assert_eq!(
+        row(&rig, 3, "select (x = '')::text from t where id = 2"),
+        vec![Some("true".into())]
+    );
 }

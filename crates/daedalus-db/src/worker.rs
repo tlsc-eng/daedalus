@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -8,12 +10,15 @@ use tokio::time::Instant;
 
 use crate::catalog::{self, Catalog};
 use crate::config::{Connection, Engine};
+use crate::edit;
+pub use crate::engine::ApplyError;
 use crate::engine::{Driver, Item};
 use crate::secret::Secret;
 use crate::value::{Budget, Cell, Column};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTROSPECT_TIMEOUT: Duration = Duration::from_secs(30);
+const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_RESEND: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +65,10 @@ pub enum Command {
     Transaction {
         session: SessionId,
         op: TxOp,
+    },
+    Apply {
+        session: SessionId,
+        statements: Vec<edit::Stmt>,
     },
     FetchMore {
         session: SessionId,
@@ -119,6 +128,10 @@ pub enum Update {
         open: bool,
         error: Option<String>,
     },
+    Applied {
+        session: SessionId,
+        result: Result<u64, ApplyError>,
+    },
 }
 
 impl Update {
@@ -132,7 +145,8 @@ impl Update {
             | Update::Done { session, .. }
             | Update::RunError { session, .. }
             | Update::Catalog { session, .. }
-            | Update::TxState { session, .. } => *session,
+            | Update::TxState { session, .. }
+            | Update::Applied { session, .. } => *session,
         }
     }
 }
@@ -178,6 +192,7 @@ impl Command {
             | Command::Disconnect { session }
             | Command::Run { session, .. }
             | Command::Transaction { session, .. }
+            | Command::Apply { session, .. }
             | Command::FetchMore { session, .. }
             | Command::Cancel { session, .. }
             | Command::Introspect { session } => *session,
@@ -221,6 +236,7 @@ async fn dispatch(
             };
             let introspect = matches!(command, Command::Introspect { .. });
             let transaction = matches!(command, Command::Transaction { .. });
+            let apply = matches!(command, Command::Apply { .. });
             let delivered = sessions
                 .get(&session)
                 .is_some_and(|tx| tx.send(command).is_ok());
@@ -245,6 +261,13 @@ async fn dispatch(
                             error,
                         })
                         .await;
+                }
+                if apply {
+                    let result = Err(ApplyError {
+                        index: None,
+                        message: "not connected".into(),
+                    });
+                    let _ = updates.send(Update::Applied { session, result }).await;
                 }
                 if introspect {
                     let catalog = Err("not connected".into());
@@ -275,7 +298,7 @@ async fn session_task(
                 biased;
                 command = rx.recv() => match command {
                     None | Some(Command::Disconnect { .. }) => return,
-                    Some(c @ (Command::Run { .. } | Command::Transaction { .. } | Command::Cancel { .. } | Command::Introspect { .. })) => queued.push_back(c),
+                    Some(c @ (Command::Run { .. } | Command::Transaction { .. } | Command::Apply { .. } | Command::Cancel { .. } | Command::Introspect { .. })) => queued.push_back(c),
                     Some(_) => {}
                 },
                 result = &mut connect => break result,
@@ -519,6 +542,31 @@ async fn session_task(
             }
             Command::Introspect { .. } => {
                 if !introspect(&driver, &mut rx, &mut queued, &updates, session).await {
+                    return;
+                }
+            }
+            Command::Apply { statements, .. } => {
+                let refusal = if conn.read_only {
+                    Some("This connection is read-only.")
+                } else if tx_open {
+                    Some("Finish the open transaction first.")
+                } else {
+                    None
+                };
+                if let Some(message) = refusal {
+                    let result = Err(ApplyError {
+                        index: None,
+                        message: message.into(),
+                    });
+                    if updates
+                        .send(Update::Applied { session, result })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if !apply(&driver, statements, &mut rx, &mut queued, &updates, session).await
+                {
                     return;
                 }
             }
@@ -775,6 +823,57 @@ async fn introspect(
         .is_ok()
 }
 
+/// Returns false when the session should end.
+async fn apply(
+    driver: &Driver,
+    statements: Vec<edit::Stmt>,
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut VecDeque<Command>,
+    updates: &async_channel::Sender<Update>,
+    session: SessionId,
+) -> bool {
+    let canceller = driver.canceller();
+    let stop = Arc::new(AtomicBool::new(false));
+    let work = driver.apply(statements, stop.clone());
+    tokio::pin!(work);
+    let deadline = Instant::now() + APPLY_TIMEOUT;
+    let mut timed_out = false;
+    let result = loop {
+        let sleep = async {
+            if timed_out {
+                std::future::pending().await
+            } else {
+                tokio::time::sleep_until(deadline).await
+            }
+        };
+        tokio::select! {
+            biased;
+            command = rx.recv() => match command {
+                None | Some(Command::Disconnect { .. }) => {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = tokio::time::timeout(
+                        CONNECT_TIMEOUT,
+                        futures::future::join(canceller.cancel(), &mut work),
+                    )
+                    .await;
+                    return false;
+                }
+                Some(c) => queued.push_back(c),
+            },
+            () = sleep => {
+                timed_out = true;
+                stop.store(true, Ordering::SeqCst);
+                let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
+            }
+            result = &mut work => break result,
+        }
+    };
+    updates
+        .send(Update::Applied { session, result })
+        .await
+        .is_ok()
+}
+
 struct Job {
     session: SessionId,
     run: RunId,
@@ -826,7 +925,10 @@ fn route(command: Command, run: RunId, queued: &mut VecDeque<Command>) -> Route 
             }
         }
         Command::Disconnect { .. } => Route::Disconnect,
-        c @ (Command::Run { .. } | Command::Transaction { .. } | Command::Introspect { .. }) => {
+        c @ (Command::Run { .. }
+        | Command::Transaction { .. }
+        | Command::Apply { .. }
+        | Command::Introspect { .. }) => {
             queued.push_back(c);
             Route::Nothing
         }
