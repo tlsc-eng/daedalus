@@ -171,7 +171,11 @@ impl DbConsoleView {
             _ => {}
         });
         let grid = cx.new(DataGrid::new);
-        let fetch = cx.subscribe(&grid, |this, _, _: &GridEvent, cx| this.fetch_more(cx));
+        let fetch = cx.subscribe(&grid, |this, _, e: &GridEvent, cx| {
+            if matches!(e, GridEvent::FetchMore) {
+                this.fetch_more(cx);
+            }
+        });
         Self {
             key,
             info: None,

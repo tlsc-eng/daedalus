@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use gpui::{ScrollStrategy, SharedString};
@@ -25,6 +26,56 @@ pub(crate) struct CellPos {
 }
 
 type Row = Vec<Option<SharedString>>;
+
+/// How a pending edit changes a whole row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    Inserted,
+    Deleted,
+}
+
+/// Pending-edit marks the grid paints; the caller owns what they mean.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct GridMarks {
+    pub modified: HashSet<(usize, usize)>,
+    pub rows: HashMap<usize, RowMark>,
+    pub failed: Option<usize>,
+}
+
+impl GridMarks {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.modified.is_empty() && self.rows.is_empty() && self.failed.is_none()
+    }
+
+    pub(crate) fn row_modified(&self, row: usize) -> bool {
+        self.modified.iter().any(|&(r, _)| r == row)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Selected,
+    Failed,
+    Deleted,
+    Inserted,
+    Modified,
+    Plain,
+}
+
+pub(crate) fn style_for(marks: &GridMarks, selected: bool, row: usize, col: usize) -> Kind {
+    if selected {
+        Kind::Selected
+    } else if marks.failed == Some(row) {
+        Kind::Failed
+    } else {
+        match marks.rows.get(&row) {
+            Some(RowMark::Deleted) => Kind::Deleted,
+            Some(RowMark::Inserted) => Kind::Inserted,
+            None if marks.modified.contains(&(row, col)) => Kind::Modified,
+            None => Kind::Plain,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct GridModel {
@@ -60,6 +111,31 @@ impl GridModel {
         self.rows.extend(shared(rows));
         self.more = more;
         self.fetch_requested = false;
+    }
+
+    pub fn set_cell(&mut self, row: usize, col: usize, value: Option<String>) {
+        let Some(slot) = self.rows.get_mut(row).and_then(|r| r.get_mut(col)) else {
+            return;
+        };
+        *slot = value.map(SharedString::from);
+        if let (Some(v), Some(chars)) = (&*slot, self.chars.get_mut(col)) {
+            *chars = (*chars).max(display_text(v).chars().take(MEASURE_CHARS).count());
+        }
+    }
+
+    pub fn replace_tail(&mut self, base: usize, rows: Vec<Vec<Option<String>>>) {
+        self.rows.truncate(base);
+        self.rows.extend(shared(rows));
+        self.chars = column_chars(&self.columns, &self.rows);
+        let last = self.rows.len().checked_sub(1);
+        let clamp = |p: CellPos| {
+            last.map(|l| CellPos {
+                row: p.row.min(l),
+                col: p.col,
+            })
+        };
+        self.anchor = self.anchor.and_then(clamp);
+        self.active = self.active.and_then(clamp);
     }
 
     pub fn finish(&mut self, truncated: bool) {
@@ -281,6 +357,70 @@ mod tests {
 
     fn pos(row: usize, col: usize) -> CellPos {
         CellPos { row, col }
+    }
+
+    #[test]
+    fn set_cell_replaces_display_value() {
+        let mut m = grid(2, 2, false);
+        m.set_cell(1, 0, cell("edited"));
+        m.set_cell(0, 1, None);
+        m.set_cell(9, 9, cell("ignored"));
+        assert_eq!(m.rows[1][0].as_ref().map(|v| v.as_ref()), Some("edited"));
+        assert_eq!(m.rows[0][1], None);
+        assert_eq!(m.rows.len(), 2);
+    }
+
+    #[test]
+    fn replace_tail_truncates_and_clamps_selection() {
+        let mut m = grid(5, 2, false);
+        m.select(pos(4, 1), false);
+        m.select(pos(4, 1), true);
+        m.replace_tail(2, vec![vec![cell("n0"), cell("n1")]]);
+        assert_eq!(m.rows.len(), 3);
+        assert_eq!(m.rows[2][0].as_ref().map(|v| v.as_ref()), Some("n0"));
+        assert_eq!(m.active, Some(pos(2, 1)));
+        assert_eq!(m.anchor, Some(pos(2, 1)));
+        m.replace_tail(0, vec![]);
+        assert_eq!((m.anchor, m.active), (None, None));
+    }
+
+    #[test]
+    fn replace_tail_with_base_beyond_len_appends() {
+        let mut m = grid(2, 2, false);
+        m.replace_tail(10, vec![vec![cell("a"), cell("b")]]);
+        assert_eq!(m.rows.len(), 3);
+        assert_eq!(m.rows[2][1].as_ref().map(|v| v.as_ref()), Some("b"));
+    }
+
+    #[test]
+    fn selection_wins_over_marks() {
+        let mut marks = GridMarks::default();
+        marks.modified.insert((0, 0));
+        marks.rows.insert(0, RowMark::Deleted);
+        marks.failed = Some(0);
+        assert_eq!(style_for(&marks, true, 0, 0), Kind::Selected);
+        assert_eq!(style_for(&marks, false, 1, 0), Kind::Plain);
+    }
+
+    #[test]
+    fn failed_wins_over_modified() {
+        let mut marks = GridMarks::default();
+        marks.modified.insert((0, 0));
+        marks.failed = Some(0);
+        assert_eq!(style_for(&marks, false, 0, 0), Kind::Failed);
+        marks.failed = None;
+        assert_eq!(style_for(&marks, false, 0, 0), Kind::Modified);
+        assert_eq!(style_for(&marks, false, 0, 1), Kind::Plain);
+    }
+
+    #[test]
+    fn deleted_strikes() {
+        let mut marks = GridMarks::default();
+        marks.rows.insert(3, RowMark::Deleted);
+        marks.rows.insert(4, RowMark::Inserted);
+        marks.modified.insert((3, 0));
+        assert_eq!(style_for(&marks, false, 3, 0), Kind::Deleted);
+        assert_eq!(style_for(&marks, false, 4, 0), Kind::Inserted);
     }
 
     #[test]
