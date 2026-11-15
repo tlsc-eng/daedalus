@@ -74,6 +74,15 @@ impl Driver {
         }
     }
 
+    /// Streams the catalog rows in the 7-column contract of `catalog::from_rows`.
+    pub fn catalog(&self) -> ItemStream {
+        match self {
+            Driver::Postgres(pg) => pg.query(pg::CATALOG_SQL.to_owned()),
+            Driver::Sqlite(db) => db.catalog(),
+            Driver::Mysql(m) => m.query(mysql::CATALOG_SQL.to_owned()),
+        }
+    }
+
     pub fn canceller(&self) -> Canceller {
         match self {
             Driver::Postgres(pg) => Canceller::Postgres(pg.canceller()),

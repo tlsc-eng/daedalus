@@ -325,3 +325,50 @@ fn bad_statement_in_transaction_reports_real_error() {
     assert!(message.contains("nope_table"), "{message}");
     assert!(!message.contains("aborted"), "{message}");
 }
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn catalog_lists_tables_views_and_pk() {
+    use daedalus_db::catalog::TableKind;
+    let rig = rig(false);
+    let schema = format!("dcat_{}", std::process::id());
+    let setup = [
+        format!("create schema {schema}"),
+        format!("create table {schema}.t(id int primary key, note text)"),
+        format!("create view {schema}.v as select id from {schema}.t"),
+        format!("create table {schema}.empty()"),
+    ];
+    for (i, sql) in setup.iter().enumerate() {
+        rig.run(i as u64 + 1, sql, 10, None);
+        scalar(&rig, i as u64 + 1);
+    }
+    rig.handle.send(Command::Introspect { session: S });
+    let catalog = loop {
+        if let Update::Catalog { catalog, .. } = rig.next() {
+            break catalog;
+        }
+    };
+    rig.run(9, &format!("drop schema {schema} cascade"), 10, None);
+    scalar(&rig, 9);
+    let catalog = catalog.expect("catalog");
+    let found = catalog
+        .schemas
+        .iter()
+        .find(|s| s.name == schema)
+        .expect("schema listed");
+    let names: Vec<_> = found.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["empty", "t", "v"]);
+    assert!(found.tables[0].columns.is_empty());
+    let t = &found.tables[1];
+    assert_eq!(t.kind, TableKind::Table);
+    assert_eq!(t.columns[0].type_name, "integer");
+    assert!(t.columns[0].pk && !t.columns[0].nullable);
+    assert!(!t.columns[1].pk && t.columns[1].nullable);
+    assert_eq!(found.tables[2].kind, TableKind::View);
+    assert!(
+        !catalog
+            .schemas
+            .iter()
+            .any(|s| s.name == "pg_catalog" || s.name == "information_schema")
+    );
+}

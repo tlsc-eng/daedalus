@@ -378,3 +378,43 @@ fn wrong_password_error_has_no_secret() {
     assert!(!error.contains(secret), "{error}");
     assert!(!error.contains("Opts"), "{error}");
 }
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn catalog_lists_tables_views_and_pk() {
+    use daedalus_db::catalog::TableKind;
+    let rig = rig(false);
+    let db = format!("dcat_{}", std::process::id());
+    let setup = [
+        format!("create database {db}"),
+        format!("create table {db}.t(id int primary key, note varchar(20))"),
+        format!("create view {db}.v as select id from {db}.t"),
+    ];
+    for (i, sql) in setup.iter().enumerate() {
+        rig.run(i as u64 + 1, sql, 10, None);
+        scalar(&rig, i as u64 + 1);
+    }
+    rig.handle.send(Command::Introspect { session: S });
+    let catalog = loop {
+        if let Update::Catalog { catalog, .. } = rig.next() {
+            break catalog;
+        }
+    };
+    rig.run(9, &format!("drop database {db}"), 10, None);
+    scalar(&rig, 9);
+    let catalog = catalog.expect("catalog");
+    let found = catalog
+        .schemas
+        .iter()
+        .find(|s| s.name == db)
+        .expect("database listed");
+    let names: Vec<_> = found.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["t", "v"]);
+    let t = &found.tables[0];
+    assert_eq!(t.kind, TableKind::Table);
+    assert!(t.columns[0].type_name.starts_with("int"));
+    assert!(t.columns[0].pk && !t.columns[0].nullable);
+    assert_eq!(t.columns[1].type_name, "varchar(20)");
+    assert!(!t.columns[1].pk && t.columns[1].nullable);
+    assert_eq!(found.tables[1].kind, TableKind::View);
+}

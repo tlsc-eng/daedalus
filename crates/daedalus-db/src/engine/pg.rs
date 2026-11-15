@@ -12,6 +12,20 @@ use tokio_postgres::error::DbError;
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+/// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
+pub const CATALOG_SQL: &str = "SELECT t.nspname::text, t.relname::text, \
+CASE WHEN t.relkind IN ('v','m') THEN 'view' ELSE 'table' END, \
+a.attname::text, format_type(a.atttypid, a.atttypmod), \
+CASE WHEN a.attnum IS NULL THEN NULL WHEN a.attnotnull THEN '0' ELSE '1' END, \
+CASE WHEN a.attnum IS NULL THEN NULL \
+WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = t.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) THEN '1' ELSE '0' END \
+FROM (SELECT c.oid, n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+WHERE c.relkind IN ('r','p','v','m','f') AND NOT c.relispartition AND n.nspname NOT IN ('pg_catalog','information_schema') \
+AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp_%' \
+ORDER BY n.nspname, c.relname LIMIT 5001) t \
+LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped \
+ORDER BY t.nspname, t.relname, a.attnum";
+
 use super::{Failure, Item, ItemStream};
 use crate::config::{Connection, Tls};
 use crate::secret::Secret;

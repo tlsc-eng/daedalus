@@ -1,5 +1,6 @@
 //! Database connections for the Database tool: config, secrets and (later) drivers.
 
+pub mod catalog;
 pub mod classify;
 pub mod config;
 pub mod engine;
