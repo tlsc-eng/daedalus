@@ -223,6 +223,16 @@ impl ClaudeDb {
     }
 }
 
+fn is_db_tool(msg: &AppMsg) -> bool {
+    matches!(
+        msg,
+        AppMsg::DbConnections
+            | AppMsg::DbTables { .. }
+            | AppMsg::DbDescribe { .. }
+            | AppMsg::DbQuery { .. }
+    )
+}
+
 fn run_of(update: &Update) -> Option<RunId> {
     match update {
         Update::Columns { run, .. }
@@ -241,13 +251,7 @@ impl Shell {
         reply: &SyncSender<AppReply>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !matches!(
-            msg,
-            AppMsg::DbConnections
-                | AppMsg::DbTables { .. }
-                | AppMsg::DbDescribe { .. }
-                | AppMsg::DbQuery { .. }
-        ) {
+        if !is_db_tool(msg) {
             return false;
         }
         let Some(pane) = caller else {
@@ -505,6 +509,28 @@ mod tests {
             run,
             columns,
         }
+    }
+
+    #[test]
+    fn only_the_four_db_messages_are_db_tools() {
+        let tables = AppMsg::DbTables {
+            connection: "c".into(),
+            schema: None,
+        };
+        let describe = AppMsg::DbDescribe {
+            connection: "c".into(),
+            schema: None,
+            table: "t".into(),
+        };
+        let query = AppMsg::DbQuery {
+            connection: "c".into(),
+            sql: Private("select 1".into()),
+            max_rows: 1,
+        };
+        for msg in [AppMsg::DbConnections, tables, describe, query] {
+            assert!(is_db_tool(&msg), "{msg:?}");
+        }
+        assert!(!is_db_tool(&AppMsg::TestResults));
     }
 
     #[test]
