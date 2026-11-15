@@ -1,25 +1,52 @@
+mod pending;
+
 use std::sync::Arc;
 
 use daedalus_db::Engine;
 use daedalus_db::catalog::{Catalog, Table};
-use daedalus_db::edit::{self, PAGE_ROWS, Shape};
+use daedalus_db::edit::{self, PAGE_ROWS, Plan, Shape};
 use daedalus_db::value::{Cell, Column};
 use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, Update};
 use daedalus_ui::motion::{self, Busy};
 use daedalus_ui::{
-    ActiveTheme, Button, ButtonKind, DataGrid, DotState, InputEvent, Space, StatusDot, TextInput,
+    ActiveTheme, Button, ButtonKind, ContextMenu, DataGrid, DotState, GridEvent, InputEvent,
+    MenuItem, Space, StatusDot, TextInput,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Render, Subscription, Task, Window, div, prelude::*,
+    AnyElement, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, Pixels, Point, PromptLevel, Render, SharedString,
+    Subscription, Task, Window, div, prelude::*,
 };
+use pending::{Pending, Slot, can_edit_value, locate};
 
 use super::console::{Info, grid_columns};
 use super::explorer::{data_color, dot_shape, engine_label, tag};
+use crate::shell::lsp::{CONFIRMED, confirm_buttons};
 use crate::shell::sidebar::folder_color;
 
 pub(in crate::shell) enum DbTableEvent {
     Connect,
+}
+
+/// What to do once the user agrees to drop the pending edits.
+#[derive(Clone, Copy)]
+enum Discard {
+    Revert,
+    Filter,
+    Load(usize),
+    Connect,
+}
+
+struct Preview {
+    plan: Plan,
+    rows_of: Vec<usize>,
+    lines: Vec<SharedString>,
+}
+
+struct Submitting {
+    busy: Busy,
+    count: usize,
+    rows_of: Vec<usize>,
 }
 
 enum TablePhase {
@@ -50,11 +77,16 @@ pub(in crate::shell) struct DbTableView {
     next_run: u64,
     pending: Vec<Column>,
     buffer: Vec<Vec<Cell>>,
-    #[allow(dead_code)]
     columns: Vec<Column>,
     rows: Vec<Vec<Cell>>,
-    #[allow(dead_code)]
     map: Vec<Option<usize>>,
+    edits: Pending,
+    preview: Option<Preview>,
+    submitting: Option<Submitting>,
+    failed: Option<usize>,
+    stale: bool,
+    note: Option<&'static str>,
+    menu: Option<(Entity<ContextMenu>, Subscription)>,
     error: Option<String>,
     busy: Option<Busy>,
     spin: Option<Task<()>>,
@@ -81,16 +113,6 @@ impl DbTableView {
         let filter = cx.new(|cx| TextInput::new("WHERE", cx));
         let order = cx.new(|cx| TextInput::new("ORDER BY", cx));
         let grid = cx.new(DataGrid::new);
-        let subs = [&filter, &order]
-            .into_iter()
-            .map(|input| {
-                cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
-                    InputEvent::Submit => this.apply(cx),
-                    InputEvent::Cancel => this.stop(cx),
-                    _ => {}
-                })
-            })
-            .collect();
         Self {
             key,
             schema,
@@ -115,11 +137,18 @@ impl DbTableView {
             columns: Vec::new(),
             rows: Vec::new(),
             map: Vec::new(),
+            edits: Pending::default(),
+            preview: None,
+            submitting: None,
+            failed: None,
+            stale: false,
+            note: None,
+            menu: None,
             error: None,
             busy: None,
             spin: None,
             _release: cx.on_release(|this, _| this.disconnect()),
-            _subs: subs,
+            _subs: Vec::new(),
         }
     }
 
@@ -181,7 +210,10 @@ impl DbTableView {
         self.phase = TablePhase::Failed(message.into());
         self.run = None;
         self.busy = None;
+        self.submitting = None;
+        self.preview = None;
         self.grid.update(cx, |g, cx| g.set_stale(false, cx));
+        self.sync_editable(cx);
         cx.notify();
     }
 
@@ -213,7 +245,10 @@ impl DbTableView {
                 self.session = None;
                 self.run = None;
                 self.busy = None;
+                self.submitting = None;
+                self.preview = None;
                 self.grid.update(cx, |g, cx| g.set_stale(false, cx));
+                self.sync_editable(cx);
             }
             Update::Catalog { catalog, .. } => {
                 if self.spec.is_some() {
@@ -244,6 +279,26 @@ impl DbTableView {
                 self.busy = None;
                 self.error = Some(message);
                 self.grid.update(cx, |g, cx| g.set_stale(false, cx));
+                self.sync_editable(cx);
+            }
+            Update::Applied { result, .. } => {
+                if let Some(sent) = self.submitting.take() {
+                    match result {
+                        Ok(_) => {
+                            self.edits.clear();
+                            self.failed = None;
+                            self.stale = true;
+                            self.sync_marks(cx);
+                            self.load(self.offset, cx);
+                        }
+                        Err(e) => {
+                            self.error = Some(e.message);
+                            self.failed = e.index.and_then(|i| sent.rows_of.get(i).copied());
+                            self.sync_marks(cx);
+                        }
+                    }
+                    self.sync_editable(cx);
+                }
             }
             _ => {}
         }
@@ -275,6 +330,13 @@ impl DbTableView {
         });
         self.columns = columns;
         self.rows = rows;
+        self.edits.clear();
+        self.failed = None;
+        self.preview = None;
+        self.stale = false;
+        self.note = None;
+        self.sync_marks(cx);
+        self.sync_editable(cx);
     }
 
     /// Takes the typed WHERE and ORDER BY as the query that paging and Reload keep running.
@@ -335,6 +397,7 @@ impl DbTableView {
         self.busy = Some(Busy::start());
         self.start_spin(cx);
         self.grid.update(cx, |g, cx| g.set_stale(true, cx));
+        self.sync_editable(cx);
         cx.notify();
     }
 
@@ -348,7 +411,433 @@ impl DbTableView {
         handle.send(Command::Cancel { session, run });
         self.busy = None;
         self.grid.update(cx, |g, cx| g.set_stale(false, cx));
+        self.sync_editable(cx);
         cx.notify();
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.edits.count()
+    }
+
+    fn ensure_subs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self._subs.is_empty() {
+            return;
+        }
+        let mut subs: Vec<Subscription> =
+            [&self.filter, &self.order]
+                .into_iter()
+                .map(|input| {
+                    cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                        match event {
+                            InputEvent::Submit => this.guard(Discard::Filter, window, cx),
+                            InputEvent::Cancel => this.stop(cx),
+                            _ => {}
+                        }
+                    })
+                })
+                .collect();
+        subs.push(cx.subscribe_in(
+            &self.grid,
+            window,
+            |this, _, event: &GridEvent, window, cx| this.on_grid(event, window, cx),
+        ));
+        self._subs = subs;
+    }
+
+    fn shape_ok(&self) -> Option<&Shape> {
+        self.shape.as_ref()?.as_ref().ok()
+    }
+
+    fn can_edit(&self) -> bool {
+        edit_gate(
+            self.shape_ok().is_some(),
+            matches!(self.phase, TablePhase::Connected),
+            self.run.is_none(),
+            self.submitting.is_none() && self.preview.is_none(),
+            self.stale,
+        )
+    }
+
+    fn sync_editable(&self, cx: &mut Context<Self>) {
+        let on = self.can_edit();
+        self.grid.update(cx, |g, cx| g.set_editable(on, cx));
+    }
+
+    fn sync_marks(&self, cx: &mut Context<Self>) {
+        let mut marks = self.edits.marks(self.rows.len());
+        marks.failed = self.failed;
+        self.grid.update(cx, |g, cx| g.set_marks(marks, cx));
+        cx.notify();
+    }
+
+    fn refresh_marks(&mut self, cx: &mut Context<Self>) {
+        self.failed = None;
+        self.sync_marks(cx);
+    }
+
+    /// The catalog column behind a result column, when this table lets it be edited.
+    fn cell_target(&self, col: usize) -> Option<usize> {
+        let c = (*self.map.get(col)?)?;
+        let editable = self.shape_ok()?.editable.get(c).copied().unwrap_or(false);
+        editable.then_some(c)
+    }
+
+    fn original(&self, row: usize, col: usize) -> Cell {
+        self.rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .flatten()
+    }
+
+    fn current(&self, row: usize, col: usize) -> Cell {
+        match locate(row, self.rows.len()) {
+            Slot::Page(r) => match self.edits.display(r, col) {
+                Some(value) => value.clone(),
+                None => self.original(r, col),
+            },
+            Slot::Inserted(i) => self.edits.inserted_value(i, col),
+        }
+    }
+
+    fn on_grid(&mut self, event: &GridEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            GridEvent::EditRequested { row, col } => self.request_edit(*row, *col, window, cx),
+            GridEvent::Edited { row, col, text } => {
+                self.set_value(*row, *col, Some(text.clone()), cx)
+            }
+            GridEvent::ContextMenu { row, col, position } => {
+                self.open_menu(*row, *col, *position, window, cx)
+            }
+            GridEvent::FetchMore => {}
+        }
+    }
+
+    fn request_edit(
+        &mut self,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = self.current(row, col);
+        let deleted =
+            matches!(locate(row, self.rows.len()), Slot::Page(r) if self.edits.is_deleted(r));
+        if deleted || self.cell_target(col).is_none() || !can_edit_value(value.as_deref()) {
+            self.note = Some("This cell can't be edited here");
+            cx.notify();
+            return;
+        }
+        self.note = None;
+        let null = value.is_none();
+        let initial = value.unwrap_or_default();
+        self.grid.update(cx, |g, cx| {
+            g.begin_edit(row, col, initial, null, window, cx)
+        });
+        cx.notify();
+    }
+
+    fn set_value(&mut self, row: usize, col: usize, value: Cell, cx: &mut Context<Self>) {
+        let shown = match locate(row, self.rows.len()) {
+            Slot::Page(r) => {
+                let original = self.original(r, col);
+                self.edits.set(r, col, value, &original);
+                self.edits.display(r, col).cloned().unwrap_or(original)
+            }
+            Slot::Inserted(i) => {
+                self.edits.set_inserted(i, col, value.clone());
+                value
+            }
+        };
+        self.grid
+            .update(cx, |g, cx| g.set_cell(row, col, shown, cx));
+        self.refresh_marks(cx);
+    }
+
+    fn restore_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        for col in 0..self.columns.len() {
+            let original = self.original(row, col);
+            self.grid
+                .update(cx, |g, cx| g.set_cell(row, col, original, cx));
+        }
+    }
+
+    fn rebuild_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.rows.len();
+        let rows = self.edits.inserted_rows(self.columns.len());
+        self.grid
+            .update(cx, |g, cx| g.replace_tail(base, rows, window, cx));
+        self.refresh_marks(cx);
+    }
+
+    fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit() {
+            return;
+        }
+        self.edits.add_row();
+        self.rebuild_tail(window, cx);
+    }
+
+    fn toggle_delete(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit() {
+            return;
+        }
+        match locate(row, self.rows.len()) {
+            Slot::Page(r) => {
+                match self.edits.is_deleted(r) {
+                    true => self.edits.revert_row(r),
+                    false => {
+                        self.edits.delete_row(r);
+                        self.restore_row(r, cx);
+                    }
+                }
+                self.refresh_marks(cx);
+            }
+            Slot::Inserted(i) => {
+                self.edits.delete_inserted(i);
+                self.rebuild_tail(window, cx);
+            }
+        }
+    }
+
+    fn revert_cell(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        match locate(row, self.rows.len()) {
+            Slot::Page(r) => {
+                self.edits.revert_cell(r, col);
+                let original = self.original(r, col);
+                self.grid
+                    .update(cx, |g, cx| g.set_cell(row, col, original, cx));
+                self.refresh_marks(cx);
+            }
+            Slot::Inserted(_) => self.set_value(row, col, None, cx),
+        }
+    }
+
+    fn revert_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match locate(row, self.rows.len()) {
+            Slot::Page(r) => {
+                self.edits.revert_row(r);
+                self.restore_row(r, cx);
+                self.refresh_marks(cx);
+            }
+            Slot::Inserted(i) => {
+                self.edits.delete_inserted(i);
+                self.rebuild_tail(window, cx);
+            }
+        }
+    }
+
+    fn drop_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (row, col) in self.edits.edited_cells() {
+            let original = self.original(row, col);
+            self.grid
+                .update(cx, |g, cx| g.set_cell(row, col, original, cx));
+        }
+        self.edits.clear();
+        self.rebuild_tail(window, cx);
+    }
+
+    /// Runs `then` now, or after the user agrees to drop the pending edits.
+    fn guard(&mut self, then: Discard, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submitting.is_some() || self.preview.is_some() {
+            return;
+        }
+        self.grid.update(cx, |g, cx| g.cancel_edit(window, cx));
+        let n = self.edits.count();
+        if n == 0 {
+            return self.run_discarded(then, cx);
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Discard {n} pending changes?"),
+            Some("Edits that were not submitted are lost."),
+            &confirm_buttons("Cancel", "Discard"),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(CONFIRMED) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.drop_edits(window, cx);
+                this.run_discarded(then, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_discarded(&mut self, then: Discard, cx: &mut Context<Self>) {
+        match then {
+            Discard::Revert => {}
+            Discard::Filter => self.apply(cx),
+            Discard::Load(offset) => self.load(offset, cx),
+            Discard::Connect => cx.emit(DbTableEvent::Connect),
+        }
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.edits.is_empty() || !self.can_edit() {
+            return;
+        }
+        let built = match (&self.info, &self.spec, &self.shape) {
+            (Some(info), Some(spec), Some(Ok(shape))) => {
+                let (changes, rows_of) = self.edits.changes(&self.rows, &self.map, shape);
+                let plan = edit::plan(info.engine, &self.schema, spec, shape, &changes);
+                Some((plan, rows_of))
+            }
+            _ => None,
+        };
+        let Some((plan, rows_of)) = built else {
+            return;
+        };
+        let lines = plan
+            .preview
+            .lines()
+            .map(|l| SharedString::from(l.to_owned()))
+            .collect();
+        self.preview = Some(Preview {
+            plan,
+            rows_of,
+            lines,
+        });
+        self.sync_editable(cx);
+        cx.notify();
+    }
+
+    fn cancel_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview = None;
+        self.sync_editable(cx);
+        cx.notify();
+    }
+
+    fn apply_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(count) = self.preview.as_ref().map(|p| p.rows_of.len()) else {
+            return;
+        };
+        let production = self
+            .info
+            .as_ref()
+            .filter(|i| i.production)
+            .map(|i| i.name.clone());
+        let Some(name) = production else {
+            return self.send_apply(cx);
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Apply {count} changes to {name}?"),
+            Some("This is a production connection."),
+            &confirm_buttons("Cancel", "Apply"),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(CONFIRMED) {
+                this.update(cx, |this, cx| this.send_apply(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn send_apply(&mut self, cx: &mut Context<Self>) {
+        let (Some(session), Some(handle)) = (self.session, self.handle.clone()) else {
+            return;
+        };
+        let Some(Preview { plan, rows_of, .. }) = self.preview.take() else {
+            return;
+        };
+        self.error = None;
+        self.failed = None;
+        self.submitting = Some(Submitting {
+            busy: Busy::start(),
+            count: rows_of.len(),
+            rows_of,
+        });
+        handle.send(Command::Apply {
+            session,
+            statements: plan.statements,
+        });
+        self.start_spin(cx);
+        self.sync_editable(cx);
+        self.sync_marks(cx);
+    }
+
+    fn open_menu(
+        &mut self,
+        row: usize,
+        col: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let items = self.menu_items(row, col, cx);
+        if items.is_empty() {
+            return;
+        }
+        let menu = ContextMenu::build(position, items, window, cx);
+        let sub = cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, _, cx| {
+            if this.menu.as_ref().is_some_and(|(m, _)| m == menu) {
+                this.menu = None;
+                cx.notify();
+            }
+        });
+        self.menu = Some((menu, sub));
+        cx.notify();
+    }
+
+    fn menu_items(&self, row: usize, col: usize, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        match &self.shape {
+            Some(Err(reason)) => return vec![MenuItem::new(*reason, |_, _| {}).disabled(true)],
+            Some(Ok(_)) if self.can_edit() => {}
+            _ => return Vec::new(),
+        }
+        let this = cx.weak_entity();
+        let item =
+            |label: &'static str,
+             enabled: bool,
+             run: fn(&mut Self, usize, usize, &mut Window, &mut Context<Self>)| {
+                let this = this.clone();
+                MenuItem::new(label, move |window, cx| {
+                    this.update(cx, |t, cx| run(t, row, col, window, cx)).ok();
+                })
+                .disabled(!enabled)
+            };
+        let slot = locate(row, self.rows.len());
+        let target = self.cell_target(col);
+        let deleted = matches!(slot, Slot::Page(r) if self.edits.is_deleted(r));
+        let nullable = target
+            .and_then(|c| self.spec.as_ref()?.columns.get(c))
+            .is_some_and(|c| c.nullable);
+        let can_set = target.is_some() && !deleted;
+        let (cell_pending, row_pending) = match slot {
+            Slot::Page(r) => (
+                self.edits.is_cell_pending(r, col),
+                self.edits.is_row_pending(r),
+            ),
+            Slot::Inserted(i) => (self.edits.inserted_value(i, col).is_some(), true),
+        };
+        let delete_label = match deleted {
+            true => "Restore Row",
+            false => "Delete Row",
+        };
+        vec![
+            item("Set NULL", can_set && nullable, |t, r, c, _, cx| {
+                t.set_value(r, c, None, cx)
+            }),
+            item("Set Empty String", can_set, |t, r, c, _, cx| {
+                t.set_value(r, c, Some(String::new()), cx)
+            }),
+            item("Revert Cell", cell_pending, |t, r, c, _, cx| {
+                t.revert_cell(r, c, cx)
+            }),
+            item("Revert Row", row_pending, |t, r, _, w, cx| {
+                t.revert_row(r, w, cx)
+            }),
+            MenuItem::separator(),
+            item("Add Row", true, |t, _, _, w, cx| t.add_row(w, cx)),
+            item(delete_label, true, |t, r, _, w, cx| {
+                t.toggle_delete(r, w, cx)
+            }),
+        ]
     }
 
     fn start_spin(&mut self, cx: &mut Context<Self>) {
@@ -361,8 +850,9 @@ impl DbTableView {
                 let wait = motion::until_next_spin(start.elapsed());
                 cx.background_executor().timer(wait).await;
                 let kept = this.update(cx, |this, cx| {
-                    let kept =
-                        this.busy.is_some() || matches!(this.phase, TablePhase::Connecting(_));
+                    let kept = this.busy.is_some()
+                        || this.submitting.is_some()
+                        || matches!(this.phase, TablePhase::Connecting(_));
                     match kept {
                         true => cx.notify(),
                         false => this.spin = None,
@@ -390,6 +880,11 @@ fn find_table(catalog: &Catalog, schema: &str, table: &str) -> Result<Arc<Table>
         }
         (None, false) => Err("This table no longer exists."),
     }
+}
+
+/// A page that still shows applied values must be reloaded before it can be edited again.
+fn edit_gate(shape: bool, connected: bool, idle: bool, free: bool, stale: bool) -> bool {
+    shape && connected && idle && free && !stale
 }
 
 fn run_mode(read_only: bool) -> RunMode {
@@ -430,8 +925,10 @@ fn page_label(offset: usize, shown: usize) -> String {
 }
 
 impl Render for DbTableView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_subs(window, cx);
         let t = cx.theme().clone();
+        let overlay = self.render_preview(cx);
         let toolbar = self.render_toolbar(cx);
         let footer = self.render_footer(cx);
         let banner = self.error.as_ref().map(|message| {
@@ -446,6 +943,7 @@ impl Render for DbTableView {
         });
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(t.color.surface)
@@ -454,6 +952,8 @@ impl Render for DbTableView {
             .children(banner)
             .child(div().flex_1().min_h_0().child(self.grid.clone()))
             .child(footer)
+            .children(overlay)
+            .children(self.menu.as_ref().map(|(menu, _)| menu.clone()))
     }
 }
 
@@ -506,9 +1006,9 @@ impl DbTableView {
             TablePhase::Connected => {
                 let ready = self.run.is_none();
                 Button::new("db-table-reload", "Reload", ButtonKind::Secondary)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         if ready {
-                            this.load(this.offset, cx)
+                            this.guard(Discard::Load(this.offset), window, cx)
                         }
                     }))
                     .into_any_element()
@@ -534,7 +1034,9 @@ impl DbTableView {
                     })
                     .child(
                         Button::new("db-table-connect", "Connect", ButtonKind::Secondary).on_click(
-                            cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(DbTableEvent::Connect)),
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.guard(Discard::Connect, window, cx)
+                            }),
                         ),
                     )
                     .into_any_element()
@@ -567,12 +1069,12 @@ impl DbTableView {
                     forward: bool,
                     cx: &mut Context<Self>| match on {
             true => Button::new(id, label, ButtonKind::Ghost)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     let to = match forward {
                         true => this.offset + PAGE_ROWS,
                         false => this.offset.saturating_sub(PAGE_ROWS),
                     };
-                    this.load(to, cx)
+                    this.guard(Discard::Load(to), window, cx)
                 }))
                 .into_any_element(),
             false => div()
@@ -583,10 +1085,28 @@ impl DbTableView {
         };
         let prev = step("db-table-prev", "‹", idle && self.offset > 0, false, cx);
         let next = step("db-table-next", "›", idle && self.has_next, true, cx);
-        let note = match &self.shape {
+        let reload_hint =
+            (self.stale && idle && self.shape_ok().is_some()).then_some("Reload to edit again.");
+        let note = self.note.or(reload_hint).or(match &self.shape {
             Some(Err(reason)) => Some(*reason),
             _ => None,
-        };
+        });
+        let editing = self.render_edit_controls(cx);
+        let submitting = self.submitting.as_ref().map(|sent| {
+            let (delay, reduced) = (t.motion.indicator_delay, t.motion.reduced);
+            let angle = match reduced {
+                true => 0.,
+                false => motion::spin_turn(sent.busy.since().elapsed()),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space(Space::Sm))
+                .when(sent.busy.shows(delay), |el| {
+                    el.child(StatusDot::new(DotState::Running).rotation(angle))
+                })
+                .child(format!("Submitting {} changes", sent.count))
+        });
         let stop = self.run.is_some().then(|| {
             Button::new("db-table-stop", "Stop", ButtonKind::Danger)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
@@ -607,8 +1127,171 @@ impl DbTableView {
             .child(next)
             .child(div().flex_1())
             .children(note)
+            .children(submitting)
+            .children(editing)
             .children(stop)
             .into_any_element()
+    }
+
+    fn render_edit_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.shape_ok()?;
+        let t = cx.theme().clone();
+        let n = self.edits.count();
+        let can = self.can_edit();
+        let action = |id: &'static str,
+                      label: &'static str,
+                      on: bool,
+                      run: fn(&mut Self, &mut Window, &mut Context<Self>),
+                      cx: &mut Context<Self>| match on {
+            true => Button::new(id, label, ButtonKind::Ghost)
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| run(this, window, cx)),
+                )
+                .into_any_element(),
+            false => div()
+                .px(t.ui(12.))
+                .text_color(t.color.content_muted)
+                .child(label)
+                .into_any_element(),
+        };
+        let add = action(
+            "db-table-add-row",
+            "＋ Row",
+            can,
+            |this, window, cx| {
+                this.grid.update(cx, |g, cx| g.commit_edit(window, cx));
+                cx.defer_in(window, |this, window, cx| this.add_row(window, cx));
+            },
+            cx,
+        );
+        let remove = action(
+            "db-table-delete-row",
+            "− Row",
+            can && self.grid.read(cx).active_cell().is_some(),
+            |this, window, cx| {
+                this.grid.update(cx, |g, cx| g.commit_edit(window, cx));
+                cx.defer_in(window, |this, window, cx| {
+                    if let Some((row, _)) = this.grid.read(cx).active_cell() {
+                        this.toggle_delete(row, window, cx);
+                    }
+                });
+            },
+            cx,
+        );
+        let revert = action(
+            "db-table-revert-all",
+            "Revert All",
+            can && n > 0,
+            |this, window, cx| this.guard(Discard::Revert, window, cx),
+            cx,
+        );
+        let submit = action(
+            "db-table-submit",
+            "Submit…",
+            can && n > 0,
+            |this, window, cx| {
+                this.grid.update(cx, |g, cx| g.commit_edit(window, cx));
+                cx.defer_in(window, |this, _, cx| this.submit(cx));
+            },
+            cx,
+        );
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space(Space::Sm))
+                .child(add)
+                .child(remove)
+                .child(format!("{n} pending"))
+                .child(revert)
+                .child(submit)
+                .into_any_element(),
+        )
+    }
+
+    fn render_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.preview.as_ref()?;
+        let t = cx.theme().clone();
+        let production = self.info.as_ref().is_some_and(|i| i.production);
+        let text = preview.plan.preview.clone();
+        let card = div()
+            .w(t.ui(640.))
+            .max_w_full()
+            .max_h(t.ui(480.))
+            .p(t.space(Space::Lg))
+            .flex()
+            .flex_col()
+            .gap(t.space(Space::Md))
+            .bg(t.color.surface)
+            .border_1()
+            .border_color(t.color.border)
+            .rounded(t.shape.radius_panel)
+            .shadow(vec![t.popover_shadow()])
+            .text_size(t.typography.caption)
+            .text_color(t.color.content_secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space(Space::Sm))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.color.content)
+                            .child("Review changes"),
+                    )
+                    .when(production, |el| {
+                        el.child(tag("production", t.color.warning))
+                    }),
+            )
+            .child(
+                div()
+                    .id("db-table-preview-sql")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(t.space(Space::Sm))
+                    .bg(t.color.surface_sunken)
+                    .rounded(t.shape.radius_control)
+                    .font_family(t.typography.mono.clone())
+                    .children(preview.lines.iter().cloned().map(|l| div().child(l))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(t.space(Space::Sm))
+                    .child(
+                        Button::new("db-table-preview-copy", "Copy", ButtonKind::Secondary)
+                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                            })),
+                    )
+                    .child(
+                        Button::new("db-table-preview-cancel", "Cancel", ButtonKind::Secondary)
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_preview(cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("db-table-preview-apply", "Apply", ButtonKind::Primary)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.apply_edits(window, cx)
+                            })),
+                    ),
+            );
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(t.color.overlay)
+                .child(card)
+                .into_any_element(),
+        )
     }
 }
 
@@ -676,6 +1359,14 @@ mod tests {
                 .contains("5,000")
         );
         assert!(find_table(&catalog, "public", "t").is_ok());
+    }
+
+    #[test]
+    fn a_stale_page_cannot_be_edited_until_a_load_finishes() {
+        assert!(edit_gate(true, true, true, true, false));
+        assert!(!edit_gate(true, true, true, true, true));
+        assert!(!edit_gate(true, true, false, true, false));
+        assert!(!edit_gate(false, true, true, true, false));
     }
 
     #[test]

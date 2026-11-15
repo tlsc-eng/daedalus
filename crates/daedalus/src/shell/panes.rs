@@ -896,6 +896,33 @@ impl Shell {
                 })
                 .detach();
         }
+        let pending = self
+            .active_root()
+            .and_then(|root| self.items.get(&(root, item)).cloned())
+            .and_then(|view| match view {
+                ItemView::DbTable(t) => Some(t.read(cx).pending_count()),
+                _ => None,
+            })
+            .filter(|n| *n > 0);
+        if let (Some(n), Some(root)) = (pending, self.active_root()) {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                &format!("Discard {n} pending changes?"),
+                Some("Closing the table drops edits that were not submitted."),
+                &super::lsp::confirm_buttons("Cancel", "Discard and Close"),
+                cx,
+            );
+            return cx
+                .spawn_in(window, async move |this, cx| {
+                    if answer.await.ok() != Some(super::lsp::CONFIRMED) {
+                        return;
+                    }
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.close_after_prompt(&root, pane, item, window, cx);
+                    });
+                })
+                .detach();
+        }
         let dirty = self
             .active_root()
             .and_then(|root| self.items.get(&(root, item)).cloned())
