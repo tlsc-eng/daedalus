@@ -104,6 +104,13 @@ impl Rig {
                     session: S,
                     run: RunId(run),
                 }),
+                Step::Reject(message) => {
+                    self.handle.send(Command::Cancel {
+                        session: S,
+                        run: RunId(run),
+                    });
+                    return Step::Failed(message);
+                }
                 end => return end,
             }
         }
