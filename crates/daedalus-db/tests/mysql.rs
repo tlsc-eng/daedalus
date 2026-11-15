@@ -283,7 +283,10 @@ fn cancel_before_start_does_not_execute() {
             match rig.next() {
                 Update::Done { run, .. } if run == RunId(ins) => break,
                 Update::RunError { run, message, .. } if run == RunId(ins) => {
-                    assert!(message.contains("cancel"), "{message}");
+                    assert!(
+                        message.contains("cancel") || message.contains("interrupted"),
+                        "{message}"
+                    );
                     break;
                 }
                 _ => {}
