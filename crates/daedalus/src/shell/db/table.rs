@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use daedalus_db::Engine;
-use daedalus_db::catalog::Table;
+use daedalus_db::catalog::{Catalog, Table};
 use daedalus_db::edit::{self, PAGE_ROWS, Shape};
 use daedalus_db::value::{Cell, Column};
 use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, Update};
@@ -44,6 +44,7 @@ pub(in crate::shell) struct DbTableView {
     grid: Entity<DataGrid>,
     offset: usize,
     want: usize,
+    applied: (String, String),
     has_next: bool,
     run: Option<RunId>,
     next_run: u64,
@@ -84,7 +85,7 @@ impl DbTableView {
             .into_iter()
             .map(|input| {
                 cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
-                    InputEvent::Submit => this.load(0, cx),
+                    InputEvent::Submit => this.apply(cx),
                     InputEvent::Cancel => this.stop(cx),
                     _ => {}
                 })
@@ -105,6 +106,7 @@ impl DbTableView {
             grid,
             offset: 0,
             want: 0,
+            applied: Default::default(),
             has_next: false,
             run: None,
             next_run: 0,
@@ -135,6 +137,10 @@ impl DbTableView {
 
     pub fn needs_connect(&self) -> bool {
         matches!(self.phase, TablePhase::Idle | TablePhase::Failed(_))
+    }
+
+    pub fn ended(&self) -> bool {
+        self.session.is_none()
     }
 
     pub fn setup_error(&self) -> Option<String> {
@@ -171,8 +177,8 @@ impl DbTableView {
     }
 
     pub fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.disconnect();
         self.phase = TablePhase::Failed(message.into());
-        self.session = None;
         self.run = None;
         self.busy = None;
         self.grid.update(cx, |g, cx| g.set_stale(false, cx));
@@ -191,7 +197,7 @@ impl DbTableView {
             Update::Connected { .. } => {
                 self.phase = TablePhase::Connected;
                 match self.spec {
-                    Some(_) => self.load(0, cx),
+                    Some(_) => self.apply(cx),
                     None => {
                         if let (Some(session), Some(handle)) = (self.session, &self.handle) {
                             handle.send(Command::Introspect { session });
@@ -214,20 +220,13 @@ impl DbTableView {
                     return;
                 }
                 match catalog {
-                    Ok(c) => {
-                        let found = c
-                            .schemas
-                            .iter()
-                            .find(|s| s.name == self.schema)
-                            .and_then(|s| s.tables.iter().find(|t| t.name == self.table));
-                        match found {
-                            Some(t) => {
-                                self.spec = Some(Arc::new(t.clone()));
-                                self.load(0, cx);
-                            }
-                            None => self.fail("This table no longer exists.", cx),
+                    Ok(c) => match find_table(&c, &self.schema, &self.table) {
+                        Ok(t) => {
+                            self.spec = Some(t);
+                            self.apply(cx);
                         }
-                    }
+                        Err(message) => self.fail(message, cx),
+                    },
                     Err(e) => self.fail(e, cx),
                 }
             }
@@ -278,6 +277,15 @@ impl DbTableView {
         self.rows = rows;
     }
 
+    /// Takes the typed WHERE and ORDER BY as the query that paging and Reload keep running.
+    fn apply(&mut self, cx: &mut Context<Self>) {
+        self.applied = (
+            self.filter.read(cx).text().to_owned(),
+            self.order.read(cx).text().to_owned(),
+        );
+        self.load(0, cx);
+    }
+
     fn load(&mut self, offset: usize, cx: &mut Context<Self>) {
         let (Some(session), Some(handle), Some(info), Some(spec)) = (
             self.session,
@@ -294,8 +302,8 @@ impl DbTableView {
             info.engine,
             &self.schema,
             &spec,
-            self.filter.read(cx).text(),
-            self.order.read(cx).text(),
+            &self.applied.0,
+            &self.applied.1,
             offset,
         );
         let sql = match sql {
@@ -366,6 +374,21 @@ impl DbTableView {
                 }
             }
         }));
+    }
+}
+
+fn find_table(catalog: &Catalog, schema: &str, table: &str) -> Result<Arc<Table>, &'static str> {
+    let found = catalog
+        .schemas
+        .iter()
+        .find(|s| s.name == schema)
+        .and_then(|s| s.tables.iter().find(|t| t.name == table));
+    match (found, catalog.truncated) {
+        (Some(t), _) => Ok(Arc::new(t.clone())),
+        (None, true) => {
+            Err("Daedalus couldn't find this table in the first 5,000 tables of the catalog.")
+        }
+        (None, false) => Err("This table no longer exists."),
     }
 }
 
@@ -630,6 +653,29 @@ mod tests {
             editability(Engine::Postgres, false, &spec, &map),
             Err("Refresh the Data panel: the table changed.")
         );
+    }
+
+    #[test]
+    fn a_missing_table_is_told_apart_from_a_capped_catalog() {
+        let mut catalog = Catalog {
+            schemas: vec![daedalus_db::catalog::Schema {
+                name: "public".into(),
+                tables: vec![spec()],
+            }],
+            truncated: false,
+        };
+        assert!(find_table(&catalog, "public", "t").is_ok());
+        assert_eq!(
+            find_table(&catalog, "public", "x").err(),
+            Some("This table no longer exists.")
+        );
+        catalog.truncated = true;
+        assert!(
+            find_table(&catalog, "public", "x")
+                .unwrap_err()
+                .contains("5,000")
+        );
+        assert!(find_table(&catalog, "public", "t").is_ok());
     }
 
     #[test]

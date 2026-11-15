@@ -75,6 +75,14 @@ impl DbTab {
         }
     }
 
+    /// True when the tab hung up its own session, so the registry entry is dead.
+    pub fn ended(&self, cx: &App) -> bool {
+        match self {
+            Self::Console(_) => false,
+            Self::Table(v) => v.read(cx).ended(),
+        }
+    }
+
     pub fn downgrade(&self) -> DbTabRef {
         match self {
             Self::Console(v) => DbTabRef::Console(v.downgrade()),

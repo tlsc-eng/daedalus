@@ -371,7 +371,7 @@ impl Shell {
         match weak.upgrade() {
             Some(tab) => {
                 tab.on_update(update, cx);
-                if failed {
+                if failed || tab.ended(cx) {
                     self.db.tabs.remove(&session);
                 }
             }
