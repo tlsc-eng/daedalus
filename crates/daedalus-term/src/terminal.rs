@@ -559,8 +559,15 @@ impl Terminal {
         flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
     }
 
-    fn is_blank(cell: &term::cell::Cell) -> bool {
-        cell.c == ' ' && !Self::is_spacer(cell.flags)
+    /// A wide character is one stop: its own cell is the left half and its spacer the right.
+    fn wide_aware(flags: Flags, point: Point, side: Side) -> (Point, Side) {
+        if flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
+            (Point::new(point.line, point.column - 1), Side::Right)
+        } else if flags.contains(Flags::WIDE_CHAR) {
+            (point, Side::Left)
+        } else {
+            (point, side)
+        }
     }
 
     /// Characters between the start of row `first` and `to`, counting a wide one once.
@@ -626,11 +633,8 @@ impl Terminal {
         }
         let first = *lines.start();
         let grid = self.term.grid();
-        let mut point = point;
-        if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
-            point.column -= 1;
-        }
-        let right_of_cell = side == Side::Right && !Self::is_blank(&grid[point]);
+        let (point, side) = Self::wide_aware(grid[point].flags, point, side);
+        let right_of_cell = side == Side::Right;
         let caret = self.caret(first);
         let target = (self.chars_before(first, point) + right_of_cell as usize)
             .min(self.input_end(&lines, caret));
@@ -647,7 +651,12 @@ impl Terminal {
         }
         let first = *lines.start();
         let caret = self.caret(first);
-        let start = self.chars_before(first, range.start);
+        let grid = self.term.grid();
+        let start_cell = grid[range.start].flags;
+        let start = self.chars_before(
+            first,
+            Self::wide_aware(start_cell, range.start, Side::Left).0,
+        );
         let last_is_spacer = Self::is_spacer(self.term.grid()[range.end].flags);
         let end = (self.chars_before(first, range.end) + !last_is_spacer as usize)
             .min(self.input_end(&lines, caret));
@@ -1180,7 +1189,69 @@ mod tests {
     fn wide_characters_take_one_arrow() {
         let (mut t, _) = terminal();
         prompt_with(&mut t, "% a日b");
-        assert_eq!(click(&t, 4.2, 0.), Some(LEFT.repeat(2)));
+        assert_eq!(click(&t, 3.2, 0.), Some(LEFT.repeat(2)));
+        assert_eq!(click(&t, 3.7, 0.), Some(LEFT.repeat(2)));
+        assert_eq!(click(&t, 4.2, 0.), Some(LEFT.repeat(1)));
+    }
+
+    #[test]
+    fn a_click_on_the_right_half_of_a_space_lands_after_it() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        assert_eq!(click(&t, 1.7, 0.), Some(LEFT.repeat(16)));
+    }
+
+    #[test]
+    fn a_selection_starting_on_a_wide_spacer_includes_the_wide_character() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% a日b");
+        select(&mut t, 4.2, 5.9);
+        assert_eq!(deletion(&t), Some("\x7f".repeat(2)));
+    }
+
+    #[test]
+    fn a_selection_from_the_output_row_above_deletes_nothing() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"output\r\n");
+        prompt_with(&mut t, "% ls");
+        let (start, side) = t.point_at(2., 0.);
+        t.start_selection(1, start, side);
+        let (end, side) = t.point_at(3.9, 1.);
+        t.update_selection(end, side);
+        assert_eq!(deletion(&t), None);
+    }
+
+    #[test]
+    fn a_selection_across_soft_wrapped_rows_counts_both() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, &format!("% {}", "x".repeat(50)));
+        let (start, side) = t.point_at(38., 0.);
+        t.start_selection(1, start, side);
+        let (end, side) = t.point_at(3.9, 1.);
+        t.update_selection(end, side);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", LEFT.repeat(8), "\x7f".repeat(6)))
+        );
+    }
+
+    #[test]
+    fn a_full_row_puts_the_caret_one_further_right() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, &format!("% {}", "x".repeat(38)));
+        assert_eq!(click(&t, 10.2, 0.), Some(LEFT.repeat(30)));
+    }
+
+    #[test]
+    fn a_caret_inside_the_selection_moves_right_to_its_end() {
+        let (mut t, _) = terminal();
+        prompt_with(&mut t, "% echo hello world");
+        feed(&mut t, b"\x1b[9D");
+        select(&mut t, 7., 11.9);
+        assert_eq!(
+            deletion(&t),
+            Some(format!("{}{}", RIGHT.repeat(3), "\x7f".repeat(5)))
+        );
     }
 
     #[test]
