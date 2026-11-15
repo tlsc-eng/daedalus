@@ -891,7 +891,7 @@ that Claude should `open_file` it first. Every answer is capped to fit one 1 MiB
 | `db_list_tables`, `db_describe_table` | Tables and views of a shared connection, and a table's columns, types, nullability and primary key. |
 | `db_query` | Runs one read-only statement on a shared connection; at most 200 rows (100 by default), long cells cut. |
 
-**Databases.** A connection is visible to Claude only when you opt it in for Claude,
+**Databases.** A connection is visible to Claude only when you tick "Claude can read" in the connection's settings,
 and only while you have it connected in the Data panel; Claude never connects one itself or asks
 for a password. Each query is checked to be a single read, runs in a read-only transaction and is
 capped by rows, size and time (10 seconds). The connection's "claude" tag lights up while Claude
