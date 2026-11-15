@@ -495,6 +495,18 @@ mod tests {
     }
 
     #[test]
+    fn stop_on_a_paused_batch_cancels_the_current_run() {
+        let mut b = started(vec![piece("select 1", 0)]);
+        b.on(columns(0));
+        b.on(rows(0, 1, true));
+        assert!(b.paused());
+        assert!(matches!(
+            sent(&b.stop())[..],
+            [Command::Cancel { run: RunId(0), .. }]
+        ));
+    }
+
+    #[test]
     fn a_paused_batch_is_not_idle() {
         let mut b = started(vec![piece("select 1", 0)]);
         assert!(!b.idle());

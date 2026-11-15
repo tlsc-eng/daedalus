@@ -597,6 +597,14 @@ impl DbConsoleView {
         if self.batch.running() || !self.tx_open {
             return;
         }
+        if self.batch.paused() && op == TxOp::Commit {
+            self.error = Some(ErrorBanner {
+                message: "Load the rest of the result or stop it before committing.".into(),
+                at: None,
+            });
+            self.tab = ResultTab::Result;
+            return;
+        }
         if self.batch.paused() {
             let effects = self.batch.stop();
             self.apply(effects, cx);
@@ -651,7 +659,8 @@ impl DbConsoleView {
             ),
         };
         let manual = self.manual;
-        let tx_ready = self.tx_open && !running;
+        let rollback_ready = self.tx_open && !running;
+        let commit_ready = self.tx_open && self.batch.idle();
         let mode = self.info.as_ref().is_some_and(|i| !i.read_only).then(|| {
             let pick = |id: &'static str, label: &'static str, on: bool| {
                 let kind = match on {
@@ -662,7 +671,7 @@ impl DbConsoleView {
                     move |this, _: &ClickEvent, _, cx| this.set_manual(label == "Manual", cx),
                 ))
             };
-            let end = |id: &'static str, label: &'static str, op: TxOp| match tx_ready {
+            let end = |id: &'static str, label: &'static str, op: TxOp, ready: bool| match ready {
                 true => Button::new(id, label, ButtonKind::Secondary)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.end_transaction(op, cx);
@@ -681,8 +690,18 @@ impl DbConsoleView {
                 .child(pick("db-console-auto", "Auto", !manual))
                 .child(pick("db-console-manual", "Manual", manual))
                 .when(manual || self.tx_open, |el| {
-                    el.child(end("db-console-commit", "Commit", TxOp::Commit))
-                        .child(end("db-console-rollback", "Roll Back", TxOp::Rollback))
+                    el.child(end(
+                        "db-console-commit",
+                        "Commit",
+                        TxOp::Commit,
+                        commit_ready,
+                    ))
+                    .child(end(
+                        "db-console-rollback",
+                        "Roll Back",
+                        TxOp::Rollback,
+                        rollback_ready,
+                    ))
                 })
                 .when(self.tx_open, |el| {
                     el.child(tag("Transaction open", t.color.warning))
