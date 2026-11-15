@@ -48,6 +48,8 @@ pub struct Settings {
     pub eslint_fix_on_save: Option<bool>,
     /// `claude.hooks`: Daedalus's hooks in every Claude Code config folder; on unless turned off.
     pub claude_hooks: Option<bool>,
+    /// `terminal.copy_on_select`: copies a terminal selection to the clipboard on mouse-up; on unless turned off.
+    pub terminal_copy_on_select: Option<bool>,
     /// `companion.enabled`: lets a paired iPhone reach this Mac over Tailscale; off unless turned on.
     pub companion_enabled: Option<bool>,
     /// `companion.push_url`: the ntfy topic URL that gets a push when Claude needs input; unset sends nothing.
@@ -236,6 +238,10 @@ fn code_actions_on_save(value: &Value) -> Result<(bool, bool), String> {
 impl Settings {
     pub fn claude_hooks(&self) -> bool {
         self.claude_hooks.unwrap_or(true)
+    }
+
+    pub fn terminal_copy_on_select(&self) -> bool {
+        self.terminal_copy_on_select.unwrap_or(true)
     }
 
     pub fn companion_enabled(&self) -> bool {
@@ -533,6 +539,10 @@ pub fn parse_project(text: &str) -> Result<(Settings, Vec<String>), String> {
         ("window.zoom_level", s.zoom_level.take().is_some()),
         ("editor.font_size", s.editor.font_size.take().is_some()),
         ("claude.hooks", s.claude_hooks.take().is_some()),
+        (
+            "terminal.copy_on_select",
+            s.terminal_copy_on_select.take().is_some(),
+        ),
         ("companion.enabled", s.companion_enabled.take().is_some()),
         ("companion.push_url", s.companion_push_url.take().is_some()),
         (
@@ -783,6 +793,17 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                           \"profiles\": {folder: profile}, \"usage_order\": [profile]}"
                     .into()),
             },
+            "terminal" => match value.as_object() {
+                Some(block) if !block.is_empty() => {
+                    block
+                        .iter()
+                        .try_for_each(|(name, value)| match name.as_str() {
+                            "copy_on_select" => terminal_copy_on_select(&mut settings, value),
+                            _ => Err(format!("has no setting \"{name}\"")),
+                        })
+                }
+                _ => Err("must be {\"copy_on_select\": true or false}".into()),
+            },
             "companion" => match value.as_object() {
                 Some(block) if !block.is_empty() => {
                     block
@@ -841,6 +862,9 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 Some(("claude", "hooks")) => claude_hooks(&mut settings, value),
                 Some(("claude", "profiles")) => claude_profiles(&mut settings, value),
                 Some(("claude", "usage_order")) => usage_order(&mut settings, value),
+                Some(("terminal", "copy_on_select")) => {
+                    terminal_copy_on_select(&mut settings, value)
+                }
                 Some(("companion", "enabled")) => companion_enabled(&mut settings, value),
                 Some(("companion", "push_url")) => companion_push_url(&mut settings, value),
                 _ => Err("is not a setting".into()),
@@ -857,6 +881,13 @@ fn claude_hooks(settings: &mut Settings, value: &Value) -> Result<(), String> {
     value
         .as_bool()
         .map(|on| settings.claude_hooks = Some(on))
+        .ok_or_else(|| "must be true or false".to_string())
+}
+
+fn terminal_copy_on_select(settings: &mut Settings, value: &Value) -> Result<(), String> {
+    value
+        .as_bool()
+        .map(|on| settings.terminal_copy_on_select = Some(on))
         .ok_or_else(|| "must be true or false".to_string())
 }
 
@@ -1689,6 +1720,28 @@ pub(crate) mod tests {
         ] {
             let (_, problems) = parse(bad).unwrap();
             assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn copy_on_select_is_on_unless_turned_off_in_either_spelling() {
+        assert!(Settings::default().terminal_copy_on_select());
+        for off in [
+            r#"{"terminal": {"copy_on_select": false}}"#,
+            r#"{"terminal.copy_on_select": false}"#,
+        ] {
+            let (s, problems) = parse(off).unwrap();
+            assert!(problems.is_empty(), "{off}: {problems:?}");
+            assert!(!s.terminal_copy_on_select(), "{off}");
+        }
+        for bad in [
+            r#"{"terminal": {"copy_on_select": "no"}}"#,
+            r#"{"terminal": {"x": 1}}"#,
+            r#"{"terminal.copy_on_select": 1}"#,
+        ] {
+            let (s, problems) = parse(bad).unwrap();
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(s.terminal_copy_on_select(), "{bad}");
         }
     }
 
@@ -2597,10 +2650,12 @@ pub(crate) mod tests {
                 "lsp": {"gopls": {"hints": {"assignVariableTypes": true}}},
                 "theme": "dark", "window.zoom_level": 2,
                 "claude": {"hooks": false}, "companion.enabled": true,
-                "companion.push_url": "https://x"}"#,
+                "companion.push_url": "https://x",
+                "terminal": {"copy_on_select": false}}"#,
         )
         .unwrap();
-        assert_eq!(problems.len(), 5, "{problems:?}");
+        assert_eq!(problems.len(), 6, "{problems:?}");
+        assert_eq!(project.terminal_copy_on_select, None);
         assert_eq!(project.companion_enabled, None);
         assert_eq!(project.companion_push_url, None);
         assert_eq!(project.theme, None);

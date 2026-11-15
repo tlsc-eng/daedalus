@@ -297,6 +297,12 @@ impl Shell {
         }
         self.sync_claude_hooks(cx);
         self.sync_companion(cx);
+        daedalus_term::set_settings(
+            daedalus_term::TerminalSettings {
+                copy_on_select: self.settings.file.terminal_copy_on_select(),
+            },
+            cx,
+        );
         let font_size = self.settings.file.editor.font_size;
         if font_size != old.editor.font_size
             && let Some(size) = font_size
