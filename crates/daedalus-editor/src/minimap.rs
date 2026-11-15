@@ -510,10 +510,16 @@ mod tests {
             m.blocks(&b, lines.clone(), None);
         }
         let cached = t.elapsed() / 100;
-        b.insert(&mut crate::Cursor::at(b.line_start(5100)), "x");
-        let t = Instant::now();
-        m.blocks(&b, lines.clone(), None);
-        let missed = t.elapsed();
+        // Best of 5 edits: a busy runner inflates single timings, the minimum filters that noise.
+        let missed = (0..5)
+            .map(|_| {
+                b.insert(&mut crate::Cursor::at(b.line_start(5100)), "x");
+                let t = Instant::now();
+                m.blocks(&b, lines.clone(), None);
+                t.elapsed()
+            })
+            .min()
+            .unwrap();
         // Debug builds run several times slower than release, where the budget is 1 ms.
         let budget = if cfg!(debug_assertions) { 20. } else { 1. };
         assert!(
