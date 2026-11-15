@@ -16,7 +16,7 @@ pub use components::{
     Badge, Button, ButtonKind, DotState, IconButton, ListRow, SegmentedControl, StatusDot, Tab,
     TabBar, Tooltip, empty_state,
 };
-pub use grid::{DataGrid, GridColumn, GridEvent};
+pub use grid::{DataGrid, GridColumn, GridEvent, GridMarks, RowMark};
 pub use icons::{FileIcon, ICON_SIZE, file_icon, icon_for};
 pub use input::{InputEvent, TextInput};
 pub use logo::{Glyph, Lockup};

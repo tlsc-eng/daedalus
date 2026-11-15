@@ -4,21 +4,22 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnyElement, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, Font,
-    FontFeatures, FontStyle, FontWeight, Hsla, KeyBinding, ListHorizontalSizingBehavior,
-    ListSizingBehavior, MouseButton, MouseDownEvent, Render, ScrollStrategy, SharedString, Task,
-    UniformListScrollHandle, Window, actions, div, point, prelude::*, px, uniform_list,
+    Animation, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, KeyBinding,
+    ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton, MouseDownEvent, Pixels, Point,
+    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
+    actions, div, point, prelude::*, px, uniform_list,
 };
 
 use crate::components::Tooltip;
 use crate::motion::{self, Busy, Glide, Opening};
-use crate::{ActiveTheme, Ellipsis, Size, Space, Theme};
+use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
-pub use model::GridColumn;
 use model::{
-    CellPos, GridModel, column_width, display_text, gutter_chars, reveal_x, scroll_strategy,
-    visible_columns, visible_rows,
+    CellPos, GridModel, Kind, column_width, display_text, gutter_chars, reveal_x, scroll_strategy,
+    style_for, visible_columns, visible_rows,
 };
+pub use model::{GridColumn, GridMarks, RowMark};
 
 actions!(
     data_grid,
@@ -32,7 +33,8 @@ actions!(
         SelectLeft,
         SelectRight,
         SelectAll,
-        Copy
+        Copy,
+        Edit
     ]
 );
 
@@ -49,13 +51,42 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("cmd-c", Copy, ctx),
+        KeyBinding::new("enter", Edit, ctx),
     ]);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GridEvent {
     /// The viewport is near the last loaded row and more rows exist.
     FetchMore,
+    /// The user asked to edit a cell; only emitted while the grid is editable.
+    EditRequested { row: usize, col: usize },
+    /// The in-cell editor closed with text that differs from where it started.
+    Edited {
+        row: usize,
+        col: usize,
+        text: String,
+    },
+    /// Right mouse down on a cell, emitted even when the grid is not editable.
+    ContextMenu {
+        row: usize,
+        col: usize,
+        position: Point<Pixels>,
+    },
+}
+
+struct Editing {
+    row: usize,
+    col: usize,
+    initial: String,
+    input: Entity<TextInput>,
+    _subs: Vec<Subscription>,
+}
+
+struct CellStyle {
+    bg: Option<Hsla>,
+    fg: Hsla,
+    strike: bool,
 }
 
 /// A read-only, virtualized table of query results with a sticky header and a pinned row-number gutter.
@@ -71,6 +102,11 @@ pub struct DataGrid {
     lefts: Vec<f32>,
     viewport_w: f32,
     row_h: f32,
+    editable: bool,
+    marks: GridMarks,
+    editing: Option<Editing>,
+    // show() has no window, so render restores grid focus if the dropped editor still held it.
+    refocus_pending: Option<FocusHandle>,
 }
 
 impl EventEmitter<GridEvent> for DataGrid {}
@@ -100,6 +136,10 @@ impl DataGrid {
             lefts: Vec::new(),
             viewport_w: 0.,
             row_h: 0.,
+            editable: false,
+            marks: GridMarks::default(),
+            editing: None,
+            refocus_pending: None,
         }
     }
 
@@ -112,6 +152,9 @@ impl DataGrid {
         cx: &mut Context<Self>,
     ) {
         self.model.show(columns, rows, more);
+        if let Some(editing) = self.editing.take() {
+            self.refocus_pending = Some(editing.input.focus_handle(cx));
+        }
         self.clear_stale(cx);
         self.generation += 1;
         self.opened = Some(Opening::now());
@@ -124,6 +167,151 @@ impl DataGrid {
     /// Appends the next page; keeps scroll, selection and column widths.
     pub fn append(&mut self, rows: Vec<Vec<Option<String>>>, more: bool, cx: &mut Context<Self>) {
         self.model.append(rows, more);
+        cx.notify();
+    }
+
+    /// Allows `EditRequested` to be emitted; off by default.
+    pub fn set_editable(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.editable = on;
+        cx.notify();
+    }
+
+    /// Replaces the displayed value of one cell; out-of-range positions are ignored.
+    pub fn set_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.model.set_cell(row, col, value);
+        cx.notify();
+    }
+
+    /// Drops every row from `base` on and appends `rows`, keeping the selection inside the result.
+    pub fn replace_tail(
+        &mut self,
+        base: usize,
+        rows: Vec<Vec<Option<String>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.as_ref().is_some_and(|e| e.row >= base) {
+            self.cancel_edit(window, cx);
+        }
+        self.model.replace_tail(base, rows);
+        cx.notify();
+    }
+
+    pub fn set_marks(&mut self, marks: GridMarks, cx: &mut Context<Self>) {
+        self.marks = marks;
+        cx.notify();
+    }
+
+    pub fn active_cell(&self) -> Option<(usize, usize)> {
+        self.model.active.map(|p| (p.row, p.col))
+    }
+
+    /// Opens the in-cell editor; `null` shows a NULL placeholder over empty text.
+    pub fn begin_edit(
+        &mut self,
+        row: usize,
+        col: usize,
+        initial: String,
+        null: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model.has_cell(row, col) {
+            return;
+        }
+        self.commit_edit(window, cx);
+        self.reveal(CellPos { row, col });
+        let input = cx.new(|cx| TextInput::new(if null { "NULL" } else { "" }, cx));
+        input.update(cx, |i, cx| {
+            i.set_text(initial.clone(), cx);
+            i.select_all(cx);
+        });
+        let handle = input.focus_handle(cx);
+        let subs = vec![
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, e: &InputEvent, window, cx| match e {
+                    InputEvent::Submit => this.commit_edit(window, cx),
+                    InputEvent::Cancel => this.cancel_edit(window, cx),
+                    _ => {}
+                },
+            ),
+            cx.on_blur(&handle, window, |this, window, cx| {
+                this.commit_edit(window, cx)
+            }),
+        ];
+        self.editing = Some(Editing {
+            row,
+            col,
+            initial,
+            input,
+            _subs: subs,
+        });
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Closes the editor and emits `Edited` if the text changed.
+    pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let text = editing.input.read(cx).text().to_string();
+        if text != editing.initial {
+            cx.emit(GridEvent::Edited {
+                row: editing.row,
+                col: editing.col,
+                text,
+            });
+        }
+        if editing.input.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus);
+        }
+        cx.notify();
+    }
+
+    /// Closes the editor without an event.
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editing) = self.editing.take() {
+            if editing.input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.focus);
+            }
+            cx.notify();
+        }
+    }
+
+    fn request_edit(&mut self, pos: CellPos, cx: &mut Context<Self>) {
+        if self.editable && self.editing.is_none() {
+            cx.emit(GridEvent::EditRequested {
+                row: pos.row,
+                col: pos.col,
+            });
+        }
+    }
+
+    fn right_click(
+        &mut self,
+        pos: CellPos,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        if !self.in_selection(pos.row, pos.col) {
+            self.model.select(pos, false);
+        }
+        cx.emit(GridEvent::ContextMenu {
+            row: pos.row,
+            col: pos.col,
+            position,
+        });
         cx.notify();
     }
 
@@ -199,20 +387,36 @@ impl DataGrid {
     }
 
     fn step(&mut self, d_row: isize, d_col: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return cx.propagate();
+        }
         if let Some(pos) = self.model.step(d_row, d_col, extend) {
             self.reveal(pos);
         }
         cx.notify();
     }
 
-    fn click(&mut self, pos: CellPos, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn click(
+        &mut self,
+        pos: CellPos,
+        extend: bool,
+        clicks: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus);
         self.model.select(pos, extend);
         self.reveal(pos);
+        if clicks >= 2 {
+            self.request_edit(pos, cx);
+        }
         cx.notify();
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return cx.propagate();
+        }
         if let Some(text) = self.model.copy_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -224,12 +428,48 @@ impl DataGrid {
             .is_some_and(|(rows, cols)| rows.contains(&row) && cols.contains(&col))
     }
 
-    /// The single seam for cell tints, so editing can add pending states later.
-    fn cell_colors(&self, row: usize, col: usize, t: &Theme) -> (Option<Hsla>, Hsla) {
-        let bg = self
-            .in_selection(row, col)
-            .then_some(t.color.surface_accent);
-        (bg, t.color.content)
+    fn cell_colors(&self, row: usize, col: usize, t: &Theme) -> CellStyle {
+        let c = &t.color;
+        let plain = CellStyle {
+            bg: None,
+            fg: c.content,
+            strike: false,
+        };
+        match style_for(&self.marks, self.in_selection(row, col), row, col) {
+            Kind::Selected => CellStyle {
+                bg: Some(c.surface_accent),
+                ..plain
+            },
+            Kind::Failed => CellStyle {
+                bg: Some(c.danger_surface),
+                ..plain
+            },
+            Kind::Deleted => CellStyle {
+                fg: c.content_disabled,
+                strike: true,
+                ..plain
+            },
+            Kind::Inserted => CellStyle {
+                bg: Some(c.success.opacity(0.12)),
+                ..plain
+            },
+            Kind::Modified => CellStyle {
+                bg: Some(c.warning.opacity(0.16)),
+                ..plain
+            },
+            Kind::Plain => plain,
+        }
+    }
+}
+
+impl DataGrid {
+    fn gutter_mark(&self, row: usize, t: &Theme) -> Option<(&'static str, Hsla)> {
+        match self.marks.rows.get(&row) {
+            Some(RowMark::Inserted) => Some(("+", t.color.success)),
+            Some(RowMark::Deleted) => Some(("\u{2212}", t.color.content_disabled)),
+            None if self.marks.row_modified(row) => Some(("\u{2022}", t.color.warning)),
+            None => None,
+        }
     }
 }
 
@@ -261,7 +501,7 @@ impl DataGrid {
         let pad = t.space(Space::Sm);
         let cap = f32::from(t.ui(400.));
         let gutter_w = column_width(
-            gutter_chars(self.model.rows.len()),
+            gutter_chars(self.model.rows.len()) + usize::from(!self.marks.is_empty()),
             char_w,
             f32::from(pad),
             f32::MAX,
@@ -416,7 +656,7 @@ impl DataGrid {
         let cells = m.vis.clone().map(|c| {
             let width = m.lefts[c + 1] - m.lefts[c];
             let numeric = self.model.columns.get(c).is_some_and(|col| col.numeric);
-            let (bg, fg) = self.cell_colors(row, c, t);
+            let CellStyle { bg, fg, strike } = self.cell_colors(row, c, t);
             let value = self
                 .model
                 .rows
@@ -424,7 +664,10 @@ impl DataGrid {
                 .and_then(|r| r.get(c))
                 .and_then(|v| v.as_ref());
             let text = match value {
-                Some(v) => div().child(display_text(v)).text_color(fg),
+                Some(v) => div()
+                    .child(display_text(v))
+                    .text_color(fg)
+                    .when(strike, |d| d.line_through()),
                 None => div()
                     .child(SharedString::from("NULL"))
                     .text_color(t.color.content_muted)
@@ -443,7 +686,23 @@ impl DataGrid {
                 .border_r_1()
                 .border_color(t.color.border)
                 .when_some(bg, |d, bg| d.bg(bg))
-                .child(text.w_full().when(numeric, |d| d.text_right()).ellipsis())
+                .child(
+                    match self.editing.as_ref().filter(|e| e.row == row && e.col == c) {
+                        Some(e) => div()
+                            .w_full()
+                            .h_full()
+                            .border_1()
+                            .border_color(t.color.accent)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(e.input.clone())
+                            .into_any_element(),
+                        None => text
+                            .w_full()
+                            .when(numeric, |d| d.text_right())
+                            .ellipsis()
+                            .into_any_element(),
+                    },
+                )
                 .when(active, |d| {
                     d.child(
                         div()
@@ -456,7 +715,14 @@ impl DataGrid {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                        this.click(CellPos { row, col: c }, e.modifiers.shift, window, cx)
+                        let pos = CellPos { row, col: c };
+                        this.click(pos, e.modifiers.shift, e.click_count, window, cx)
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                        this.right_click(CellPos { row, col: c }, e.position, window, cx)
                     }),
                 )
         });
@@ -488,6 +754,9 @@ impl DataGrid {
                     cx.notify();
                 }),
             )
+            .when_some(self.gutter_mark(row, t), |d, (glyph, color)| {
+                d.child(div().flex_none().mr(px(4.)).text_color(color).child(glyph))
+            })
             .child((row + 1).to_string());
         div()
             .relative()
@@ -504,6 +773,11 @@ impl DataGrid {
 
 impl Render for DataGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(editor) = self.refocus_pending.take()
+            && editor.is_focused(window)
+        {
+            window.focus(&self.focus);
+        }
         let m = self.metrics(window, cx);
         let t = m.theme.clone();
         if self.dim.running() {
@@ -530,10 +804,18 @@ impl Render for DataGrid {
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.step(0, -1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.step(0, 1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                if this.editing.is_some() {
+                    return cx.propagate();
+                }
                 this.model.select_all();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)));
+            .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &Edit, _, cx| {
+                if let Some(pos) = this.model.active {
+                    this.request_edit(pos, cx);
+                }
+            }));
         if self.model.columns.is_empty() {
             return root;
         }
