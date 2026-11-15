@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -53,12 +53,17 @@ impl Rig {
     }
 
     fn run(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>) {
+        self.run_mode(run, sql, page, timeout, RunMode::Auto);
+    }
+
+    fn run_mode(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>, mode: RunMode) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
             sql: sql.into(),
             page,
             timeout,
+            mode,
         });
     }
 }
@@ -371,4 +376,66 @@ fn catalog_lists_tables_views_and_pk() {
             .iter()
             .any(|s| s.name == "pg_catalog" || s.name == "information_schema")
     );
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn read_only_run_blocks_writes_after_session_set_read_write() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        500,
+        None,
+    );
+    loop {
+        if let Update::Done { .. } = rig.next() {
+            break;
+        }
+    }
+    rig.run(3, "DROP TABLE IF EXISTS ro_probe", 500, None);
+    loop {
+        if let Update::Done { .. } = rig.next() {
+            break;
+        }
+    }
+    rig.run_mode(
+        2,
+        "CREATE TABLE ro_probe(x int)",
+        500,
+        None,
+        RunMode::ReadOnly,
+    );
+    let (message, _) = rig.next_error();
+    let message = message.to_lowercase();
+    assert!(
+        message.contains("read-only") || message.contains("read only"),
+        "{message}"
+    );
+}
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn commit_of_a_failed_transaction_rolls_back() {
+    let rig = rig(false);
+    rig.run_mode(1, "SELECT 1/0", 500, None, RunMode::Transaction);
+    loop {
+        match rig.next() {
+            Update::RunError { .. } => break,
+            Update::TxState { .. } | Update::Columns { .. } => {}
+            other => panic!("expected a run error, got {other:?}"),
+        }
+    }
+    rig.handle.send(Command::Transaction {
+        session: S,
+        op: TxOp::Commit,
+    });
+    match rig.next() {
+        Update::TxState { open, error, .. } => {
+            assert!(!open);
+            let message = error.expect("a rollback message");
+            assert!(message.contains("rolled back"), "{message}");
+        }
+        other => panic!("expected a transaction state, got {other:?}"),
+    }
 }

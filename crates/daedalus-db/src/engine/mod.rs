@@ -83,6 +83,14 @@ impl Driver {
         }
     }
 
+    /// Whether the connection has an open transaction, for engines that can say; others return None.
+    pub async fn in_transaction(&self) -> Option<bool> {
+        match self {
+            Driver::Sqlite(db) => db.in_transaction().await,
+            Driver::Postgres(_) | Driver::Mysql(_) => None,
+        }
+    }
+
     pub fn canceller(&self) -> Canceller {
         match self {
             Driver::Postgres(pg) => Canceller::Postgres(pg.canceller()),

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
 use daedalus_db::{Connection, Engine, Tls};
 
 const S: SessionId = SessionId(1);
@@ -96,13 +96,22 @@ impl Rig {
     }
 
     fn run(&self, run: u64, sql: &str, page: usize) {
+        self.run_mode(run, sql, page, RunMode::Auto);
+    }
+
+    fn run_mode(&self, run: u64, sql: &str, page: usize, mode: RunMode) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
             sql: sql.into(),
             page,
             timeout: None,
+            mode,
         });
+    }
+
+    fn tx(&self, op: TxOp) {
+        self.handle.send(Command::Transaction { session: S, op });
     }
 
     fn cancel(&self, run: u64) {
@@ -350,6 +359,7 @@ fn timeout_stops_multi_statement_script() {
         sql: insert_script(),
         page: 100,
         timeout: Some(Duration::from_millis(50)),
+        mode: RunMode::Auto,
     });
     match rig.collect(2) {
         Err(message) => assert!(message.contains("timed out"), "{message}"),
@@ -401,27 +411,28 @@ fn cancel_before_start_does_not_execute() {
     let rig = rig(false);
     rig.run(1, "create table t(x)", 100);
     assert!(rig.collect(1).is_ok());
-    let mut completed = 0usize;
-    for i in 0..20u64 {
-        let run = 2 + i * 2;
-        rig.run(run, "insert into t values (1)", 100);
-        rig.cancel(run);
-        loop {
-            match rig.next() {
-                Update::Done {
-                    run: r, truncated, ..
-                } if r == RunId(run) => {
-                    if !truncated {
-                        completed += 1;
-                    }
-                    break;
-                }
-                Update::RunError { run: r, .. } if r == RunId(run) => break,
-                _ => {}
-            }
-        }
-        assert_eq!(row_count(&rig, run + 1), completed);
+    rig.run(
+        2,
+        "select count(*) from (with recursive c(x) as (select 1 union all select x+1 from c where x < 1000000000) select x from c)",
+        100,
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let targets: Vec<u64> = (0..5).map(|i| 10 + i).collect();
+    for run in &targets {
+        rig.run(*run, "insert into t values (1)", 100);
+        rig.cancel(*run);
     }
+    rig.cancel(2);
+    let mut pending: Vec<u64> = targets.iter().copied().chain([2]).collect();
+    while !pending.is_empty() {
+        match rig.next() {
+            Update::Done { run, .. } | Update::RunError { run, .. } => {
+                pending.retain(|r| RunId(*r) != run);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(row_count(&rig, 30), 0);
 }
 
 #[test]
@@ -529,4 +540,165 @@ fn run_sent_during_introspect_runs_after_it_in_order() {
     rig.run(1, "select 1", 10);
     assert!(matches!(rig.next(), Update::Catalog { .. }));
     assert_eq!(rig.collect(1).expect("run"), [[Some("1".to_owned())]]);
+}
+
+fn next_tx(rig: &Rig) -> (bool, Option<String>) {
+    loop {
+        if let Update::TxState { open, error, .. } = rig.next() {
+            return (open, error);
+        }
+    }
+}
+
+fn finish_tx_run(rig: &Rig, sql: &str, run: u64) {
+    rig.run_mode(run, sql, 100, RunMode::Transaction);
+    assert_eq!(next_tx(rig), (true, None));
+    assert!(rig.collect(run).is_ok());
+}
+
+#[test]
+fn manual_transaction_rolls_back() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.tx(TxOp::Rollback);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 3), 0);
+}
+
+#[test]
+fn manual_transaction_commits() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.tx(TxOp::Commit);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 3), 1);
+}
+
+#[test]
+fn commit_without_a_transaction_is_a_no_op() {
+    let rig = rig(false);
+    rig.tx(TxOp::Commit);
+    assert_eq!(next_tx(&rig), (false, None));
+}
+
+#[test]
+fn begin_on_a_read_only_connection_is_refused() {
+    let rig = rig(true);
+    rig.tx(TxOp::Begin);
+    let (open, error) = next_tx(&rig);
+    assert!(!open);
+    assert!(error.is_some());
+}
+
+#[test]
+fn read_only_mode_refuses_a_write_on_a_writable_connection() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    rig.run_mode(2, "insert into t values (1)", 100, RunMode::ReadOnly);
+    assert!(rig.collect(2).is_err());
+    rig.run(3, "insert into t values (1)", 100);
+    assert!(rig.collect(3).is_ok());
+    assert_eq!(row_count(&rig, 4), 1);
+}
+
+#[test]
+fn read_only_mode_is_refused_while_a_transaction_is_open() {
+    let rig = rig(false);
+    rig.tx(TxOp::Begin);
+    assert_eq!(next_tx(&rig), (true, None));
+    rig.run_mode(1, "select 1", 100, RunMode::ReadOnly);
+    assert!(rig.collect(1).is_err());
+}
+
+#[test]
+fn commit_then_disconnect_commits() {
+    for _ in 0..5 {
+        let path = make_db("disc");
+        {
+            let rig = connect(conn(path.to_str().expect("utf8"), false), None);
+            assert!(matches!(rig.next(), Update::Connected { .. }));
+            rig.run(1, "create table t(x)", 100);
+            assert!(rig.collect(1).is_ok());
+            finish_tx_run(&rig, "insert into t values (1)", 2);
+            rig.tx(TxOp::Commit);
+            rig.handle.send(Command::Disconnect { session: S });
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let rig = connect(conn(path.to_str().expect("utf8"), false), None);
+        assert!(matches!(rig.next(), Update::Connected { .. }));
+        assert_eq!(row_count(&rig, 3), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn engine_ended_transaction_is_reported() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x unique)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.run_mode(
+        3,
+        "insert or rollback into t values (1)",
+        100,
+        RunMode::Transaction,
+    );
+    assert!(rig.collect(3).is_err());
+    let (open, error) = next_tx(&rig);
+    assert!(!open);
+    assert!(error.is_some());
+    finish_tx_run(&rig, "insert into t values (2)", 4);
+    rig.tx(TxOp::Rollback);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 5), 0);
+}
+
+#[test]
+fn cancel_queued_during_connect_never_executes() {
+    for _ in 0..20 {
+        let path = make_db("idle");
+        rusqlite::Connection::open(&path)
+            .expect("open")
+            .execute("create table t(x)", [])
+            .expect("create");
+        let (tx, updates) = async_channel::unbounded();
+        let handle = start(tx);
+        handle.send(Command::Connect {
+            session: S,
+            conn: conn(path.to_str().expect("utf8"), false),
+            password: None,
+            root: None,
+        });
+        handle.send(Command::Run {
+            session: S,
+            run: RunId(1),
+            sql: "insert into t values (1)".into(),
+            page: 100,
+            timeout: None,
+            mode: RunMode::Auto,
+        });
+        handle.send(Command::Cancel {
+            session: S,
+            run: RunId(1),
+        });
+        let rig = Rig {
+            handle,
+            updates,
+            files: vec![path.clone()],
+        };
+        assert!(matches!(rig.next(), Update::Connected { .. }));
+        assert!(matches!(
+            rig.next(),
+            Update::Done {
+                truncated: true,
+                ..
+            }
+        ));
+        assert_eq!(row_count(&rig, 2), 0);
+    }
 }

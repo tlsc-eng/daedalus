@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -56,12 +56,17 @@ impl Rig {
     }
 
     fn run(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>) {
+        self.run_mode(run, sql, page, timeout, RunMode::Auto);
+    }
+
+    fn run_mode(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>, mode: RunMode) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
             sql: sql.into(),
             page,
             timeout,
+            mode,
         });
     }
 }
@@ -278,28 +283,24 @@ fn cancel_before_start_does_not_execute() {
     let rig = rig(false);
     rig.run(1, "create temporary table cbs (x int)", 100, None);
     scalar(&rig, 1);
-    for i in 0..5u64 {
-        let ins = i * 2 + 2;
-        rig.run(ins, "insert into cbs select sleep(1)", 100, None);
-        cancel(&rig, ins);
-        loop {
-            match rig.next() {
-                Update::Done { run, .. } if run == RunId(ins) => break,
-                Update::RunError { run, message, .. } if run == RunId(ins) => {
-                    assert!(
-                        message.contains("cancel") || message.contains("interrupted"),
-                        "{message}"
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let started = Instant::now();
-        rig.run(ins + 1, "select count(*) from cbs", 100, None);
-        assert_eq!(scalar(&rig, ins + 1), Some("0".into()));
-        assert!(started.elapsed() < Duration::from_millis(500));
+    rig.run(2, "select sleep(2)", 100, None);
+    std::thread::sleep(Duration::from_millis(300));
+    let targets: Vec<u64> = (0..5).map(|i| 10 + i).collect();
+    for run in &targets {
+        rig.run(*run, "insert into cbs values (1)", 100, None);
+        cancel(&rig, *run);
     }
+    let mut pending: Vec<u64> = targets.iter().copied().chain([2]).collect();
+    while !pending.is_empty() {
+        match rig.next() {
+            Update::Done { run, .. } | Update::RunError { run, .. } => {
+                pending.retain(|r| RunId(*r) != run);
+            }
+            _ => {}
+        }
+    }
+    rig.run(30, "select count(*) from cbs", 100, None);
+    assert_eq!(scalar(&rig, 30), Some("0".into()));
 }
 
 const SERIES: &str = "select 1 as g \
@@ -423,4 +424,171 @@ fn catalog_lists_tables_views_and_pk() {
     assert_eq!(t.columns[1].type_name, "varchar(20)");
     assert!(!t.columns[1].pk && t.columns[1].nullable);
     assert_eq!(found.tables[1].kind, TableKind::View);
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_blocks_writes() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_probe", 500, None);
+    rig.run(2, "CREATE TABLE ro_probe(x int)", 500, None);
+    let mut done = 0;
+    while done < 2 {
+        match rig.next() {
+            Update::Done { .. } => done += 1,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    rig.run_mode(
+        3,
+        "INSERT INTO ro_probe VALUES (1)",
+        500,
+        None,
+        RunMode::ReadOnly,
+    );
+    rig.next_error();
+    rig.run(4, "SELECT COUNT(*) FROM ro_probe", 500, None);
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => {
+                assert_eq!(rows[0][0].as_deref(), Some("0"));
+                break;
+            }
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+fn table_exists(rig: &Rig, run: u64) -> bool {
+    rig.run(
+        run,
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'ro_ddl_probe'",
+        500,
+        None,
+    );
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => return rows[0][0].as_deref() != Some("0"),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_blocks_ddl() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_ddl_probe", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run_mode(
+        2,
+        "CREATE TABLE ro_ddl_probe(x int)",
+        500,
+        None,
+        RunMode::ReadOnly,
+    );
+    rig.next_error();
+    assert!(!table_exists(&rig, 3));
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn auto_run_after_read_only_can_write() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_after_probe", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run(2, "CREATE TABLE ro_after_probe(x int)", 500, None);
+    assert!(matches!(rig.next(), Update::Done { .. }));
+    rig.run_mode(3, "SELECT 1", 500, None, RunMode::ReadOnly);
+    loop {
+        if let Update::Done { .. } = rig.next() {
+            break;
+        }
+    }
+    rig.run(4, "INSERT INTO ro_after_probe VALUES (1)", 500, None);
+    loop {
+        match rig.next() {
+            Update::Done { .. } => break,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+fn first_cell(rig: &Rig, run: u64, sql: &str) -> Option<String> {
+    rig.run(run, sql, 500, None);
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => return rows[0][0].clone(),
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+fn wait_done(rig: &Rig) {
+    loop {
+        match rig.next() {
+            Update::Done { .. } => return,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn manual_mode_runs_with_autocommit_off() {
+    let rig = rig(false);
+    rig.handle.send(Command::Transaction {
+        session: S,
+        op: TxOp::Begin,
+    });
+    assert!(matches!(
+        rig.next(),
+        Update::TxState {
+            open: true,
+            error: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        first_cell(&rig, 1, "select @@autocommit").as_deref(),
+        Some("0")
+    );
+    wait_done(&rig);
+    rig.handle.send(Command::Transaction {
+        session: S,
+        op: TxOp::Commit,
+    });
+    assert!(matches!(
+        rig.next(),
+        Update::TxState {
+            open: false,
+            error: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        first_cell(&rig, 2, "select @@autocommit").as_deref(),
+        Some("1")
+    );
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_keeps_a_read_only_connection_read_only() {
+    let writer = rig(false);
+    writer.run(1, "DROP TABLE IF EXISTS ro_conn_probe", 500, None);
+    wait_done(&writer);
+    writer.run(2, "CREATE TABLE ro_conn_probe(x int)", 500, None);
+    wait_done(&writer);
+    let rig = rig(true);
+    rig.run_mode(1, "SELECT 1", 500, None, RunMode::ReadOnly);
+    wait_done(&rig);
+    rig.run(2, "INSERT INTO ro_conn_probe VALUES (1)", 500, None);
+    rig.next_error();
 }

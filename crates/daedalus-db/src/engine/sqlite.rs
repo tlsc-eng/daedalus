@@ -306,6 +306,14 @@ impl Sqlite {
         }
     }
 
+    pub async fn in_transaction(&self) -> Option<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || conn.lock().ok().map(|db| !db.is_autocommit()))
+            .await
+            .ok()
+            .flatten()
+    }
+
     pub fn query(&self, sql: String) -> ItemStream {
         self.start(Work::Sql(sql))
     }
