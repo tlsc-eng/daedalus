@@ -95,6 +95,10 @@ fn scan(sql: &str, engine: Engine) -> Vec<(Tok, Range<usize>)> {
             {
                 out.push((Tok::HiddenCr, start..i));
             }
+        } else if c == b'-' && next == Some(b'-') && engine == Engine::Mysql {
+            // The parser may read this as a comment while the scanner does not, so the chunk cannot be trusted.
+            out.push((Tok::Hazard, start..start + 2));
+            i += 2;
         } else if c == b'/' && next == Some(b'*') {
             i += 2;
             if engine == Engine::Mysql
@@ -522,7 +526,7 @@ fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>)
                 toks = &toks[2..];
                 analyzed = true;
             }
-            _ => return (Kind::Read, false),
+            _ => return (plan_only_kind(sql, &toks[1..], engine), false),
         }
     }
     let (kind, unguarded) = classify_one(sql, toks, engine, parser);
@@ -533,6 +537,24 @@ fn classify(sql: &str, toks: &Toks, engine: Engine, parser: Option<&mut Parser>)
         Kind::Read | Kind::Write => (kind, unguarded),
         _ => (Kind::Unknown, false),
     }
+}
+
+/// Plain EXPLAIN plans without running, but INTO and side-effect calls still act or leak, so they are not Read.
+fn plan_only_kind(sql: &str, inner: &Toks, engine: Engine) -> Kind {
+    let risky = inner.iter().enumerate().any(|(i, t)| {
+        if word(sql, t).is_some_and(|w| w.eq_ignore_ascii_case("into")) {
+            return true;
+        }
+        if t.0 != Tok::Punct(b'(') || i == 0 {
+            return false;
+        }
+        match (&inner[i - 1].0, word(sql, &inner[i - 1])) {
+            (_, Some(name)) => is_side_effect_fn(name, engine),
+            (Tok::Literal, None) => true,
+            _ => false,
+        }
+    });
+    if risky { Kind::Unknown } else { Kind::Read }
 }
 
 fn classify_one(
@@ -619,6 +641,11 @@ const MY_SIDE_EFFECT_FNS: &[&str] = &[
     "release_all_locks",
     "sleep",
     "benchmark",
+    "load_file",
+    "master_pos_wait",
+    "source_pos_wait",
+    "wait_for_executed_gtid_set",
+    "wait_until_sql_thread_after_gtids",
 ];
 
 // These load native code or touch the filesystem.
@@ -647,6 +674,8 @@ fn is_side_effect_fn(name: &str, engine: Engine) -> bool {
                 || n.starts_with("pg_backup_")
                 || n.starts_with("pg_ls_")
                 || n.starts_with("pg_stat_reset")
+                || (n.starts_with("pg_") && n.ends_with("_reset"))
+                || n.starts_with("pg_logical_slot_get_")
                 || n.starts_with("pg_log_")
                 || n.starts_with("pg_replication_origin_")
                 || (n.starts_with("pg_") && n.contains("replication_slot"))
@@ -790,6 +819,61 @@ mod tests {
 
     fn kind(sql: &str) -> Kind {
         one(sql).kind
+    }
+
+    #[test]
+    fn reset_and_consuming_slot_calls_are_not_read() {
+        for s in [
+            "select pg_stat_statements_reset()",
+            "select pg_stat_statements_reset(0,0,0)",
+            "select pg_logical_slot_get_changes('s', null, null)",
+            "select pg_logical_slot_get_binary_changes('s', null, null)",
+            "select pg_replication_slot_advance('s', '0/0')",
+        ] {
+            assert_ne!(kind(s), Kind::Read, "{s}");
+        }
+        assert_eq!(
+            kind("select pg_logical_slot_peek_changes('s', null, null)"),
+            Kind::Read
+        );
+    }
+
+    #[test]
+    fn mysql_file_and_wait_functions_are_not_read() {
+        for f in [
+            "load_file('/etc/passwd')",
+            "master_pos_wait('f', 1)",
+            "source_pos_wait('f', 1)",
+            "wait_for_executed_gtid_set('x')",
+            "wait_until_sql_thread_after_gtids('x')",
+        ] {
+            let sql = format!("select {f}");
+            assert_ne!(split(&sql, MY)[0].kind, Kind::Read, "{sql}");
+        }
+    }
+
+    #[test]
+    fn explain_checks_its_inner_statement() {
+        assert_ne!(
+            split("explain format=json into @v select 1", MY)[0].kind,
+            Kind::Read
+        );
+        assert_ne!(kind("explain select pg_terminate_backend(1)"), Kind::Read);
+        assert_ne!(
+            kind("explain select \"pg_terminate_backend\"(1)"),
+            Kind::Read
+        );
+        assert_eq!(kind("explain select 1"), Kind::Read);
+        assert_eq!(split("explain select 1", MY)[0].kind, Kind::Read);
+        assert_eq!(kind("explain delete from t"), Kind::Read);
+    }
+
+    #[test]
+    fn mysql_double_dash_without_space_is_not_read() {
+        assert_ne!(split("select 1 --1", MY)[0].kind, Kind::Read);
+        assert_eq!(split("select 1 -- 1", MY)[0].kind, Kind::Read);
+        assert_eq!(split("select 1 - -1", MY)[0].kind, Kind::Read);
+        assert_eq!(kind("select 1 --1"), Kind::Read);
     }
 
     #[test]
