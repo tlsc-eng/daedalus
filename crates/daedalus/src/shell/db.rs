@@ -947,6 +947,37 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.db.loaded {
+            self.db_ensure_loaded(cx);
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                    let ready = this.update(cx, |shell, _| shell.db.loaded).ok();
+                    match ready {
+                        Some(false) => continue,
+                        Some(true) => break,
+                        None => return,
+                    }
+                }
+                this.update_in(cx, |shell, window, cx| {
+                    if shell.db.store.is_none() {
+                        let message = shell
+                            .db
+                            .load_error
+                            .clone()
+                            .unwrap_or_else(|| "Could not load connections.".to_owned());
+                        view.update(cx, |c, cx| c.fail(message, cx));
+                    } else {
+                        shell.db_reconnect_console(view, window, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let key = view.read(cx).key().to_owned();
         let listed = self.db.store.as_ref().and_then(|store| {
             daedalus_db::for_project(store, self.active_root().as_deref())
@@ -970,6 +1001,7 @@ impl Shell {
         let handle = self.db.handle.clone()?;
         let session = SessionId(self.db.next_session);
         self.db.next_session += 1;
+        self.db.consoles.retain(|_, w| w.upgrade().is_some());
         self.db.consoles.insert(session, view.downgrade());
         let info = Info::from(listed);
         view.update(cx, |c, cx| c.connecting(session, handle, info, cx));

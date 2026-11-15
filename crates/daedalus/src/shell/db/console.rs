@@ -6,7 +6,7 @@ use std::time::Duration;
 use daedalus_db::classify::{self, Statement};
 use daedalus_db::worker::{Handle, RunMode, SessionId, Update};
 use daedalus_db::{Engine, Listed};
-use daedalus_editor::{EditorView, Marker, MarkerSeverity};
+use daedalus_editor::{EditorEvent, EditorView, Marker, MarkerSeverity};
 use daedalus_ui::motion::{self, Busy};
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, DataGrid, DotState, GridEvent, Space, StatusDot,
@@ -151,6 +151,11 @@ impl DbConsoleView {
             e.set_code_lens(false, cx);
             e.set_inlay_hints(false, cx);
         });
+        let autosave = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::Edited { .. }) {
+                this.editor.update(cx, |e, cx| e.schedule_autosave(cx));
+            }
+        });
         let grid = cx.new(DataGrid::new);
         let fetch = cx.subscribe(&grid, |this, _, _: &GridEvent, cx| this.fetch_more(cx));
         Self {
@@ -173,9 +178,19 @@ impl DbConsoleView {
             tab: ResultTab::Result,
             busy: None,
             spin: None,
-            _release: cx.on_release(|this, _| this.disconnect()),
-            _subs: vec![fetch],
+            _release: cx.on_release(|this, cx| {
+                this.save_text(cx);
+                this.disconnect();
+            }),
+            _subs: vec![fetch, autosave],
         }
+    }
+
+    /// Writes the console's text to its file; the shell never treats a console as a dirty editor.
+    pub fn save_text(&self, cx: &mut gpui::App) {
+        self.editor.update(cx, |e, cx| {
+            e.save(cx);
+        });
     }
 
     pub fn key(&self) -> &str {

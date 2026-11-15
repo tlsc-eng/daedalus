@@ -392,6 +392,22 @@ mod tests {
     }
 
     #[test]
+    fn start_cancels_a_paused_result_before_the_new_run() {
+        let mut b = started(vec![piece("select 1", 0)]);
+        b.on(columns(0));
+        b.on(rows(0, 1, true));
+        assert!(!b.running());
+        let out = b.start(S, vec![piece("select 2", 0)], RunMode::Auto);
+        assert!(matches!(
+            sent(&out)[..],
+            [
+                Command::Cancel { run: RunId(0), .. },
+                Command::Run { run: RunId(1), .. }
+            ]
+        ));
+    }
+
+    #[test]
     fn an_error_stops_the_batch_and_maps_the_position() {
         let mut b = started(vec![piece("select é from x", 10), piece("select 2", 30)]);
         let out = b.on(Update::RunError {

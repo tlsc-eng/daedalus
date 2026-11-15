@@ -60,6 +60,17 @@ impl Shell {
         if self.quit_settled {
             return;
         }
+        let consoles: Vec<_> = self
+            .items
+            .values()
+            .filter_map(|v| match v {
+                ItemView::DbConsole(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        for console in consoles {
+            console.update(cx, |c, cx| c.save_text(cx));
+        }
         if self.autosave_delay().is_some() {
             for editor in self.dirty_editors(None, cx) {
                 editor.update(cx, |e, cx| e.save(cx));

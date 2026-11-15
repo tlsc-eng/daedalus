@@ -159,6 +159,32 @@ mod tests {
     }
 
     #[test]
+    fn production_asks_for_a_mixed_script() {
+        assert!(matches!(
+            check("select 1; update t set a = 1", &target(false, true)),
+            Gate::Confirm { title, detail }
+                if title == "Change data on main?" && detail.contains("production")
+        ));
+    }
+
+    #[test]
+    fn unguarded_asks_for_a_mixed_script() {
+        assert!(matches!(
+            check("select 1; update t set a = 1", &target(false, false)),
+            Gate::Confirm { title, detail }
+                if title == "Change every row?" && detail.contains("update t set a = 1")
+        ));
+    }
+
+    #[test]
+    fn a_transaction_statement_in_a_script_is_refused() {
+        assert!(matches!(
+            check("select 1; commit; select 2", &target(false, false)),
+            Gate::Refuse(m) if m.contains("Manual mode")
+        ));
+    }
+
+    #[test]
     fn plain_write_runs() {
         assert_eq!(
             check("update t set a = 1 where id = 2", &target(false, false)),
