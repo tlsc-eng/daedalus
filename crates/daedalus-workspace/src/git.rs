@@ -1227,23 +1227,33 @@ pub fn revert_file_bytes(
         ".{}.daedalus-revert",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    match std::fs::remove_file(&tmp) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+    let meta = std::fs::metadata(&path).ok();
+    let written = (|| {
+        let mut out = fresh_temp(&tmp, meta.as_ref())?;
+        out.write_all(contents)?;
+        if let Some(meta) = &meta {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(written?)
+}
+
+/// Creates `tmp` anew with the target's mode, so an owner-only file never has a wider temp.
+fn fresh_temp(tmp: &Path, meta: Option<&std::fs::Metadata>) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let meta = std::fs::metadata(&path).ok();
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    if let Some(meta) = &meta {
-        // Created owner-only files must never exist wider than the target, even briefly.
+    if let Some(meta) = meta {
         opts.mode(meta.permissions().mode() & 0o7777);
     }
-    opts.open(&tmp)?.write_all(contents)?;
-    if let Some(meta) = &meta {
-        std::fs::set_permissions(&tmp, meta.permissions())?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    opts.open(tmp)
 }
 
 /// A local or remote-tracking branch, newest commit first in `branches`.
@@ -3096,6 +3106,14 @@ mod tests {
         std::fs::write(&other, "old").unwrap();
         std::fs::hard_link(&other, &tmp).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let created = fresh_temp(&tmp, Some(&meta)).unwrap();
+        assert_eq!(
+            created.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(created);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old");
         revert_file(&dir, Path::new("f.txt"), "b\n", "a\n", &backup).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600);
