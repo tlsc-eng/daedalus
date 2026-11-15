@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use crate::catalog::{Catalog, Schema, Table, TableKind};
 use crate::classify::{self, Kind};
 use crate::config::{self, Connection, Engine, Listed, Store};
+use crate::value::Cell;
+use crate::worker::Update;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_ROWS: u32 = 100;
@@ -296,11 +298,173 @@ pub fn table_json(catalog: &Catalog, schema: Option<&str>, table: &str) -> Resul
     .unwrap_or_default())
 }
 
+/// What the caller does next after feeding the collector one update.
+pub enum Step {
+    Wait,
+    Cancel,
+    /// Cancel the run, then report the message; the result cannot fit the cap.
+    Reject(String),
+    Done(String),
+    Failed(String),
+}
+
+/// Folds one ReadOnly run's updates into a single capped JSON result.
+pub struct Collector {
+    max_rows: usize,
+    columns: Vec<(String, String)>,
+    rows: Vec<Vec<Cell>>,
+    bytes: usize,
+    cells_cut: usize,
+    truncated_by: Option<&'static str>,
+    cancelled: bool,
+    rejected: Option<String>,
+}
+
+const TOO_WIDE: &str =
+    "The result has too many or too wide columns to return; select fewer columns.";
+
+fn cut(text: String) -> (String, bool) {
+    match text.char_indices().nth(MAX_CELL_CHARS) {
+        Some((at, _)) => (text[..at].to_string(), true),
+        None => (text, false),
+    }
+}
+
+impl Collector {
+    pub fn new(max_rows: u32) -> Self {
+        Self {
+            max_rows: max_rows as usize,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            bytes: 0,
+            cells_cut: 0,
+            truncated_by: None,
+            cancelled: false,
+            rejected: None,
+        }
+    }
+
+    pub fn feed(&mut self, update: Update) -> Step {
+        if let Some(message) = &self.rejected {
+            return match update {
+                Update::Done { .. } | Update::RunError { .. } | Update::Failed { .. } => {
+                    Step::Failed(message.clone())
+                }
+                _ => Step::Wait,
+            };
+        }
+        match update {
+            Update::Columns { columns, .. } => {
+                self.columns = columns
+                    .into_iter()
+                    .map(|c| (cut(c.name).0, cut(c.type_name).0))
+                    .collect();
+                self.bytes = self
+                    .render(&[], usize::MAX, Some("max_rows"), usize::MAX, u64::MAX)
+                    .len();
+                if self.bytes > MAX_OUTPUT_BYTES {
+                    self.rejected = Some(TOO_WIDE.into());
+                    self.cancelled = true;
+                    return Step::Reject(TOO_WIDE.into());
+                }
+                Step::Wait
+            }
+            Update::Rows { rows, more, .. } => {
+                if !self.cancelled {
+                    self.append(rows);
+                }
+                if more && !self.cancelled {
+                    self.cancelled = true;
+                    self.truncated_by.get_or_insert("max_rows");
+                    return Step::Cancel;
+                }
+                Step::Wait
+            }
+            Update::Done {
+                elapsed, truncated, ..
+            } => {
+                if truncated {
+                    self.truncated_by.get_or_insert("server");
+                }
+                let ms = elapsed.as_millis() as u64;
+                Step::Done(self.render(
+                    &self.rows,
+                    self.rows.len(),
+                    self.truncated_by,
+                    self.cells_cut,
+                    ms,
+                ))
+            }
+            Update::RunError { message, .. } => Step::Failed(message),
+            Update::Failed { error, .. } => Step::Failed(error),
+            _ => Step::Wait,
+        }
+    }
+
+    fn append(&mut self, rows: Vec<Vec<Cell>>) {
+        for row in rows {
+            if self.truncated_by == Some("bytes") {
+                return;
+            }
+            if self.rows.len() >= self.max_rows {
+                self.truncated_by.get_or_insert("max_rows");
+                return;
+            }
+            let mut cuts = 0;
+            let row: Vec<Cell> = row
+                .into_iter()
+                .map(|cell| {
+                    cell.map(|text| {
+                        let (text, was_cut) = cut(text);
+                        cuts += usize::from(was_cut);
+                        text
+                    })
+                })
+                .collect();
+            let size = serde_json::to_string(&row).map_or(usize::MAX, |s| s.len() + 1);
+            if self.bytes.saturating_add(size) > MAX_OUTPUT_BYTES {
+                self.truncated_by = Some("bytes");
+                return;
+            }
+            self.bytes += size;
+            self.cells_cut += cuts;
+            self.rows.push(row);
+        }
+    }
+
+    fn render(
+        &self,
+        rows: &[Vec<Cell>],
+        row_count: usize,
+        truncated_by: Option<&'static str>,
+        cells_cut: usize,
+        elapsed_ms: u64,
+    ) -> String {
+        let columns: Vec<Value> = self
+            .columns
+            .iter()
+            .map(|(name, ty)| json!({ "name": name, "type": ty }))
+            .collect();
+        json!({
+            "note": NOTE,
+            "columns": columns,
+            "rows": rows,
+            "row_count": row_count,
+            "truncated": truncated_by.is_some(),
+            "truncated_by": truncated_by,
+            "cells_cut": cells_cut,
+            "elapsed_ms": elapsed_ms,
+        })
+        .to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::CatalogColumn;
     use crate::config::{Origin, Tls};
+    use crate::worker::{RunId, SessionId};
 
     const PG: Engine = Engine::Postgres;
 
@@ -619,5 +783,209 @@ mod tests {
             table_json(&cat, None, "zz"),
             Err("No table zz. Call db_list_tables.".into())
         );
+    }
+
+    fn rows(rows: Vec<Vec<Cell>>, more: bool) -> Update {
+        Update::Rows {
+            session: SessionId(1),
+            run: RunId(1),
+            rows,
+            more,
+        }
+    }
+
+    fn done(truncated: bool) -> Update {
+        Update::Done {
+            session: SessionId(1),
+            run: RunId(1),
+            affected: None,
+            elapsed: Duration::from_millis(5),
+            truncated,
+        }
+    }
+
+    fn finished(step: Step) -> Value {
+        match step {
+            Step::Done(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn collector_cuts_long_cells() {
+        let mut c = Collector::new(10);
+        let long = std::iter::once("é")
+            .cycle()
+            .take(MAX_CELL_CHARS + 5)
+            .collect::<String>();
+        assert!(matches!(
+            c.feed(rows(vec![vec![Some(long), None]], false)),
+            Step::Wait
+        ));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["cells_cut"], 1);
+        assert_eq!(
+            v["rows"][0][0].as_str().unwrap().chars().count(),
+            MAX_CELL_CHARS
+        );
+        assert!(v["rows"][0][1].is_null());
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["note"], NOTE);
+    }
+
+    fn columns(names: Vec<(String, String)>) -> Update {
+        Update::Columns {
+            session: SessionId(1),
+            run: RunId(1),
+            columns: names
+                .into_iter()
+                .map(|(name, type_name)| crate::value::Column {
+                    name,
+                    type_name,
+                    table: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn text(ch: char, n: usize) -> String {
+        std::iter::once(ch).cycle().take(n).collect()
+    }
+
+    fn output_len(step: Step) -> (usize, Value) {
+        match step {
+            Step::Done(json) => (json.len(), serde_json::from_str(&json).unwrap()),
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn collector_caps_bytes() {
+        let mut c = Collector::new(u32::MAX);
+        c.feed(columns(vec![("a".into(), "text".into())]));
+        let page: Vec<Vec<Cell>> = (0..400)
+            .map(|_| vec![Some(text('x', MAX_CELL_CHARS))])
+            .collect();
+        c.feed(rows(page, false));
+        let (len, v) = output_len(c.feed(done(false)));
+        assert_eq!(v["truncated_by"], "bytes");
+        let n = v["row_count"].as_u64().unwrap();
+        assert!(n > 0 && n < 400);
+        assert!(len <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn collector_caps_control_character_cells() {
+        let mut c = Collector::new(u32::MAX);
+        c.feed(columns(vec![("a".into(), "text".into())]));
+        let page: Vec<Vec<Cell>> = (0..400)
+            .map(|_| vec![Some(text('\u{1}', MAX_CELL_CHARS))])
+            .collect();
+        c.feed(rows(page, false));
+        let (len, v) = output_len(c.feed(done(true)));
+        assert_eq!(v["truncated_by"], "bytes");
+        assert!(len <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn collector_rejects_columns_that_cannot_fit() {
+        let mut c = Collector::new(10);
+        let wide: Vec<(String, String)> =
+            (0..300).map(|_| (text('n', 200), text('t', 200))).collect();
+        assert!(matches!(c.feed(columns(wide)), Step::Reject(m) if m.contains("too many")));
+        assert!(matches!(c.feed(rows(vec![], true)), Step::Wait));
+        assert!(matches!(c.feed(done(false)), Step::Failed(_)));
+    }
+
+    #[test]
+    fn collector_cuts_long_column_names() {
+        let mut c = Collector::new(10);
+        c.feed(columns(vec![(text('n', 5000), text('t', 5000))]));
+        let (len, v) = output_len(c.feed(done(false)));
+        assert_eq!(
+            v["columns"][0]["name"].as_str().unwrap().len(),
+            MAX_CELL_CHARS
+        );
+        assert!(len <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn collector_holds_the_cap_for_every_row_size() {
+        for size in [1, 7, 100, 499, 500, 900] {
+            for width in [1, 3] {
+                let mut c = Collector::new(u32::MAX);
+                c.feed(columns(
+                    (0..width)
+                        .map(|i| (format!("c{i}"), "text".into()))
+                        .collect(),
+                ));
+                let page: Vec<Vec<Cell>> = (0..2000)
+                    .map(|_| (0..width).map(|_| Some(text('"', size))).collect())
+                    .collect();
+                c.feed(rows(page, false));
+                let (len, _) = output_len(c.feed(done(true)));
+                assert!(len <= MAX_OUTPUT_BYTES, "size {size} width {width}: {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn collector_keeps_rows_that_nearly_fill_the_budget() {
+        let mut c = Collector::new(u32::MAX);
+        c.feed(columns(vec![("a".into(), "text".into())]));
+        let page: Vec<Vec<Cell>> = (0..130)
+            .map(|_| vec![Some(text('x', MAX_CELL_CHARS))])
+            .collect();
+        c.feed(rows(page, false));
+        let (len, v) = output_len(c.feed(done(false)));
+        assert!(len <= MAX_OUTPUT_BYTES);
+        assert!(MAX_OUTPUT_BYTES - len < 2 * MAX_CELL_CHARS);
+        assert_eq!(v["truncated_by"], "bytes");
+    }
+
+    #[test]
+    fn collector_counts_cuts_only_for_kept_rows() {
+        let mut c = Collector::new(1);
+        c.feed(columns(vec![("a".into(), "text".into())]));
+        let long = || vec![Some(text('x', MAX_CELL_CHARS + 1))];
+        c.feed(rows(vec![long(), long()], false));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["row_count"], 1);
+        assert_eq!(v["cells_cut"], 1);
+    }
+
+    #[test]
+    fn collector_cancels_once_on_more() {
+        let mut c = Collector::new(2);
+        let row = || vec![Some("a".to_string())];
+        assert!(matches!(
+            c.feed(rows(vec![row(), row()], true)),
+            Step::Cancel
+        ));
+        assert!(matches!(c.feed(rows(vec![row()], true)), Step::Wait));
+        let v = finished(c.feed(done(false)));
+        assert_eq!(v["row_count"], 2);
+        assert_eq!(v["truncated_by"], "max_rows");
+    }
+
+    #[test]
+    fn collector_reports_server_truncation() {
+        let mut c = Collector::new(10);
+        let v = finished(c.feed(done(true)));
+        assert_eq!(v["truncated_by"], "server");
+        assert_eq!(v["rows"], json!([]));
+        assert_eq!(v["columns"], json!([]));
+    }
+
+    #[test]
+    fn collector_reports_run_error() {
+        let mut c = Collector::new(10);
+        let step = c.feed(Update::RunError {
+            session: SessionId(1),
+            run: RunId(1),
+            message: "no such table".into(),
+            position: None,
+        });
+        assert!(matches!(step, Step::Failed(m) if m == "no such table"));
     }
 }
