@@ -1,14 +1,17 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{StreamExt, stream};
+use mysql_async::Params;
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, DriverError, Opts, OptsBuilder, SslOpts, Value};
 use tokio::sync::{Mutex, mpsc};
 
-use super::{Failure, Item, ItemStream};
+use super::{ApplyError, Failure, Item, ItemStream};
 use crate::config::{Connection, Tls};
+use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column};
 
@@ -72,6 +75,7 @@ fn build_opts(conn: &Connection, password: Option<&Secret>, tls: Option<SslOpts>
         .db_name((!conn.database.is_empty()).then_some(conn.database.as_str()))
         .pass(password.map(|p| p.expose().to_owned()))
         .ssl_opts(tls)
+        .client_found_rows(true)
         .into()
 }
 
@@ -236,6 +240,66 @@ impl Mysql {
             rx.recv().await.map(|i| (i, Lazy::Running(rx)))
         })
         .boxed()
+    }
+}
+
+impl Mysql {
+    pub async fn apply(&self, statements: Vec<Stmt>, stop: &AtomicBool) -> Result<u64, ApplyError> {
+        let mut conn = self.conn.lock().await;
+        if let Err(e) = conn.query_drop("START TRANSACTION").await {
+            return Err(ApplyError {
+                index: None,
+                message: describe(&e),
+            });
+        }
+        let total = statements.len() as u64;
+        for (i, stmt) in statements.into_iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(ApplyError::timed_out());
+            }
+            let values = stmt
+                .params
+                .into_iter()
+                .map(|c| c.map_or(Value::NULL, |s| Value::Bytes(s.into_bytes())))
+                .collect();
+            if let Err(e) = conn.exec_drop(stmt.sql, Params::Positional(values)).await {
+                let _ = conn.query_drop("ROLLBACK").await;
+                if stop.load(Ordering::SeqCst) {
+                    return Err(ApplyError::timed_out());
+                }
+                return Err(ApplyError {
+                    index: Some(i),
+                    message: describe(&e),
+                });
+            }
+            let n = conn.affected_rows();
+            if n != 1 {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(ApplyError::mismatch(i, n));
+            }
+            if conn.get_warnings() > 0 {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(ApplyError {
+                    index: Some(i),
+                    message: format!(
+                        "Row {}: MySQL changed the value (truncated or converted); nothing was saved.",
+                        i + 1
+                    ),
+                });
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(ApplyError::timed_out());
+        }
+        match conn.query_drop("COMMIT").await {
+            Ok(()) => Ok(total),
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                Err(ApplyError::commit(&describe(&e)))
+            }
+        }
     }
 }
 

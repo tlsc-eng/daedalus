@@ -10,8 +10,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Batch, Connection as Db, Error, InterruptHandle, OpenFlags};
 use tokio::sync::mpsc;
 
-use super::{Failure, Item, ItemStream};
+use super::{ApplyError, Failure, Item, ItemStream};
 use crate::config::Connection;
+use crate::edit::Stmt;
 use crate::value::{Cell, Column};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,6 +139,60 @@ type Tx = mpsc::Sender<Result<Item, Failure>>;
 
 fn send(tx: &Tx, item: Result<Item, Failure>) -> bool {
     tx.blocking_send(item).is_ok()
+}
+
+fn apply_blocking(
+    conn: &Mutex<Db>,
+    statements: &[Stmt],
+    stop: &AtomicBool,
+) -> Result<u64, ApplyError> {
+    let db = conn.lock().map_err(|_| ApplyError {
+        index: None,
+        message: lock_failure().message,
+    })?;
+    let rollback = || {
+        let _ = db.execute_batch("ROLLBACK");
+    };
+    if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+        return Err(ApplyError {
+            index: None,
+            message: failure(&e, "").message,
+        });
+    }
+    for (i, stmt) in statements.iter().enumerate() {
+        if stop.load(Ordering::SeqCst) {
+            rollback();
+            return Err(ApplyError::timed_out());
+        }
+        match db.execute(&stmt.sql, rusqlite::params_from_iter(stmt.params.iter())) {
+            Ok(1) => {}
+            Ok(n) => {
+                rollback();
+                return Err(ApplyError::mismatch(i, n as u64));
+            }
+            Err(e) => {
+                rollback();
+                if stop.load(Ordering::SeqCst) {
+                    return Err(ApplyError::timed_out());
+                }
+                return Err(ApplyError {
+                    index: Some(i),
+                    message: failure(&e, &stmt.sql).message,
+                });
+            }
+        }
+    }
+    if stop.load(Ordering::SeqCst) {
+        rollback();
+        return Err(ApplyError::timed_out());
+    }
+    match db.execute_batch("COMMIT") {
+        Ok(()) => Ok(statements.len() as u64),
+        Err(e) => {
+            rollback();
+            Err(ApplyError::commit(&failure(&e, "").message))
+        }
+    }
 }
 
 fn run_catalog(db: &Db, tx: &Tx, cancelled: &AtomicBool) {
@@ -321,6 +376,22 @@ impl Sqlite {
     /// Streams the catalog in the engine's 7-column row contract.
     pub fn catalog(&self) -> ItemStream {
         self.start(Work::Catalog)
+    }
+
+    pub async fn apply(
+        &self,
+        statements: Vec<Stmt>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<u64, ApplyError> {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = stop.clone();
+        let conn = self.conn.clone();
+        let job = tokio::task::spawn_blocking(move || apply_blocking(&conn, &statements, &stop));
+        job.await.unwrap_or_else(|_| {
+            Err(ApplyError {
+                index: None,
+                message: "the SQLite connection is unavailable".into(),
+            })
+        })
     }
 
     fn start(&self, work: Work) -> ItemStream {

@@ -355,6 +355,7 @@ impl DbConsoleView {
                 let effects = self.batch.on(update);
                 self.apply(effects, cx);
             }
+            Update::Applied { .. } => {}
             Update::TxState { open, error, .. } => {
                 self.tx_open = open;
                 if let Some(message) = error {

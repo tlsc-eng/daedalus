@@ -5,10 +5,13 @@ pub mod sqlite;
 use std::path::Path;
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use futures::Stream;
 
 use crate::config::{Connection, Engine};
+use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column};
 
@@ -24,6 +27,39 @@ pub enum Item {
 pub struct Failure {
     pub message: String,
     pub position: Option<usize>,
+}
+
+/// Why an apply was rolled back; `index` is the failing statement, when one is to blame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyError {
+    pub index: Option<usize>,
+    pub message: String,
+}
+
+impl ApplyError {
+    pub(crate) fn mismatch(index: usize, n: u64) -> Self {
+        ApplyError {
+            index: Some(index),
+            message: format!(
+                "Row {}: expected 1 row, the statement matched {n}; nothing was saved.",
+                index + 1
+            ),
+        }
+    }
+
+    pub(crate) fn timed_out() -> Self {
+        ApplyError {
+            index: None,
+            message: "Apply timed out; nothing was saved.".into(),
+        }
+    }
+
+    pub(crate) fn commit(e: &str) -> Self {
+        ApplyError {
+            index: None,
+            message: format!("Commit failed: {e}. Reload to check what was saved."),
+        }
+    }
 }
 
 pub type ItemStream = Pin<Box<dyn Stream<Item = Result<Item, Failure>> + Send>>;
@@ -71,6 +107,19 @@ impl Driver {
             Driver::Postgres(pg) => pg.query(sql),
             Driver::Sqlite(db) => db.query(sql),
             Driver::Mysql(m) => m.query(sql),
+        }
+    }
+
+    /// Runs the statements in one transaction and commits only if each one touched exactly one row.
+    pub async fn apply(
+        &self,
+        statements: Vec<Stmt>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<u64, ApplyError> {
+        match self {
+            Driver::Postgres(pg) => pg.apply(statements, &stop).await,
+            Driver::Sqlite(db) => db.apply(statements, stop).await,
+            Driver::Mysql(m) => m.apply(statements, &stop).await,
         }
     }
 

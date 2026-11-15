@@ -1,6 +1,9 @@
+use std::error::Error;
 use std::future::ready;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::BytesMut;
 use futures::{StreamExt, stream};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, ring};
@@ -9,6 +12,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::DbError;
+use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -26,8 +30,9 @@ ORDER BY n.nspname, c.relname LIMIT 5001) t \
 LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped \
 ORDER BY t.nspname, t.relname, a.attnum";
 
-use super::{Failure, Item, ItemStream};
+use super::{ApplyError, Failure, Item, ItemStream};
 use crate::config::{Connection, Tls};
+use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column, TableRef};
 
@@ -206,6 +211,37 @@ fn failure(e: &tokio_postgres::Error) -> Failure {
     }
 }
 
+/// Sends a cell as text so the server parses it for the column's own type.
+struct TextParam<'a>(Option<&'a str>);
+
+impl std::fmt::Debug for TextParam<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TextParam(..)")
+    }
+}
+
+impl ToSql for TextParam<'_> {
+    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        match self.0 {
+            None => Ok(IsNull::Yes),
+            Some(s) => {
+                out.extend_from_slice(s.as_bytes());
+                Ok(IsNull::No)
+            }
+        }
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _: &Type) -> Format {
+        Format::Text
+    }
+
+    to_sql_checked!();
+}
+
 impl Pg {
     pub async fn connect(
         conn: &Connection,
@@ -254,6 +290,61 @@ impl Pg {
         PgCanceller {
             token: self.client.cancel_token(),
             tls: self.tls.clone(),
+        }
+    }
+
+    pub async fn apply(&self, statements: Vec<Stmt>, stop: &AtomicBool) -> Result<u64, ApplyError> {
+        let client = &self.client;
+        let rollback = || async {
+            let _ = client.batch_execute("ROLLBACK").await;
+        };
+        if let Err(e) = client.batch_execute("BEGIN").await {
+            return Err(ApplyError {
+                index: None,
+                message: describe(&e),
+            });
+        }
+        let total = statements.len() as u64;
+        for (i, stmt) in statements.iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                rollback().await;
+                return Err(ApplyError::timed_out());
+            }
+            let params: Vec<TextParam> = stmt
+                .params
+                .iter()
+                .map(|c| TextParam(c.as_deref()))
+                .collect();
+            let refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+            match client.execute(stmt.sql.as_str(), &refs).await {
+                Ok(1) => {}
+                Ok(n) => {
+                    rollback().await;
+                    return Err(ApplyError::mismatch(i, n));
+                }
+                Err(e) => {
+                    rollback().await;
+                    if stop.load(Ordering::SeqCst) {
+                        return Err(ApplyError::timed_out());
+                    }
+                    return Err(ApplyError {
+                        index: Some(i),
+                        message: failure(&e).message,
+                    });
+                }
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            rollback().await;
+            return Err(ApplyError::timed_out());
+        }
+        match client.batch_execute("COMMIT").await {
+            Ok(()) => Ok(total),
+            Err(e) => {
+                rollback().await;
+                Err(ApplyError::commit(&describe(&e)))
+            }
         }
     }
 
@@ -352,6 +443,11 @@ mod tests {
             projects: Vec::new(),
             save_password: false,
         }
+    }
+
+    #[test]
+    fn text_param_debug_redacts_the_value() {
+        assert!(!format!("{:?}", TextParam(Some("secret"))).contains("secret"));
     }
 
     #[test]
