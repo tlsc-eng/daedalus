@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use daedalus_db::{Engine, Listed};
 use daedalus_ui::{
@@ -174,8 +175,18 @@ impl Shell {
         let t = cx.theme().clone();
         let selected = self.db.selected.as_deref() == Some(key.as_str());
         let tint = color.map_or(t.color.content_muted, |c| folder_color(&t, c));
-        let dot = match &phase {
-            Phase::Connecting(busy) if busy.shows(t.motion.indicator_delay) => {
+        let (delay, hold) = (t.motion.indicator_delay, t.motion.indicator_hold);
+        let spinning = match &phase {
+            Phase::Connecting(busy) => Some(busy.shows(delay)).filter(|s| *s).map(|_| *busy),
+            Phase::Connected { busy, at, .. }
+                if super::spinner_lingers(*busy, *at, Instant::now(), delay, hold) =>
+            {
+                Some(*busy)
+            }
+            _ => None,
+        };
+        let dot = match (spinning, &phase) {
+            (Some(busy), _) => {
                 let angle = match t.motion.reduced {
                     true => 0.,
                     false => motion::spin_turn(busy.since().elapsed()),
@@ -184,14 +195,14 @@ impl Shell {
                     .rotation(angle)
                     .into_any_element()
             }
-            Phase::Connected(_) => dot_shape(true, tint, &t),
+            (None, Phase::Connected { .. }) => dot_shape(true, tint, &t),
             _ => dot_shape(false, tint, &t),
         };
         let server = match &phase {
-            Phase::Connected(server) => Some(server.clone()),
+            Phase::Connected { server, .. } => Some(server.clone()),
             _ => None,
         };
-        let connected = matches!(phase, Phase::Connecting(_) | Phase::Connected(_));
+        let connected = matches!(phase, Phase::Connecting(_) | Phase::Connected { .. });
         let listed_conn = listed
             .iter()
             .find(|l| conn_key(l.origin, &l.conn.id) == key)
@@ -307,7 +318,7 @@ impl Shell {
         };
         let connected = matches!(
             self.db.phase(&key),
-            Phase::Connecting(_) | Phase::Connected(_)
+            Phase::Connecting(_) | Phase::Connected { .. }
         );
         let toggle = match connected {
             true => shell_item("Disconnect", cx, {

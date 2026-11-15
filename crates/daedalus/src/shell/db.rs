@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use daedalus_db::worker::{Command, Handle, SessionId, Update};
-use daedalus_db::{Engine, Listed, Origin, Secret, Store};
+use daedalus_db::{Connection, Engine, Listed, Origin, Secret, Store};
+use daedalus_ui::ActiveTheme;
 use daedalus_ui::motion::{self, Busy};
 use gpui::{Context, Task};
 
@@ -37,7 +38,11 @@ pub(super) enum Phase {
     #[default]
     Idle,
     Connecting(Busy),
-    Connected(String),
+    Connected {
+        server: String,
+        busy: Busy,
+        at: Instant,
+    },
     Failed(String),
 }
 
@@ -46,6 +51,15 @@ fn conn_key(origin: Origin, id: &str) -> String {
         Origin::Global => format!("g:{id}"),
         Origin::Project => format!("p:{id}"),
     }
+}
+
+/// Whether a spinner that began at `busy` still shows at `now` for a connect that finished at `at`.
+fn spinner_lingers(busy: Busy, at: Instant, now: Instant, delay: Duration, hold: Duration) -> bool {
+    let waited = at.saturating_duration_since(busy.since());
+    if waited < delay {
+        return false;
+    }
+    now.saturating_duration_since(at) < (delay + hold).saturating_sub(waited)
 }
 
 fn path() -> Result<PathBuf, String> {
@@ -62,10 +76,46 @@ impl DbState {
             .unwrap_or_default()
     }
 
-    fn connecting(&self) -> bool {
-        self.meta
-            .values()
-            .any(|m| matches!(m.phase, Phase::Connecting(_)))
+    /// Whether any row still needs frames: connecting, or holding the spinner after it connected.
+    fn animating(&self, now: Instant, delay: Duration, hold: Duration) -> bool {
+        self.meta.values().any(|m| match &m.phase {
+            Phase::Connecting(_) => true,
+            Phase::Connected { busy, at, .. } => spinner_lingers(*busy, *at, now, delay, hold),
+            _ => false,
+        })
+    }
+
+    /// Decides what a finished Keychain read means; the secret moves straight into the command.
+    fn keychain_loaded(
+        &mut self,
+        key: &str,
+        session: SessionId,
+        loaded: Result<Option<Secret>, String>,
+        conn: Connection,
+        root: Option<PathBuf>,
+    ) -> Option<Command> {
+        if self.meta.get(key).and_then(|m| m.session) != Some(session) {
+            return None;
+        }
+        match loaded {
+            Ok(Some(secret)) => Some(Command::Connect {
+                session,
+                conn,
+                password: Some(secret),
+                root,
+            }),
+            Ok(None) => {
+                self.fail(
+                    key,
+                    "No saved password. Edit the connection to add one.".into(),
+                );
+                None
+            }
+            Err(e) => {
+                self.fail(key, e);
+                None
+            }
+        }
     }
 
     fn send(&self, command: Command) {
@@ -111,7 +161,13 @@ impl DbState {
                 let key = self.key_of(session).map(str::to_owned);
                 match key.and_then(|k| self.meta.get_mut(&k)) {
                     Some(meta) => {
-                        meta.phase = Phase::Connected(server);
+                        if let Phase::Connecting(busy) = meta.phase {
+                            meta.phase = Phase::Connected {
+                                server,
+                                busy,
+                                at: Instant::now(),
+                            };
+                        }
                         None
                     }
                     None => Some(Command::Disconnect { session }),
@@ -154,7 +210,13 @@ impl Shell {
         }));
     }
 
-    /// Wakes only while a row connects and the Data panel shows, so an idle panel costs no frames.
+    /// Redraws the connecting spinner on a timer while the Data panel is on screen.
+    fn data_shown(&self) -> bool {
+        self.workspace.active.is_some()
+            && self.workspace.ui.tree_visible
+            && self.workspace.ui.side_mode == daedalus_workspace::SideMode::Data
+    }
+
     fn db_start_spin(&mut self, cx: &mut Context<Self>) {
         if self.db.spin.is_some() {
             return;
@@ -165,10 +227,12 @@ impl Shell {
                 let wait = motion::until_next_spin(start.elapsed());
                 cx.background_executor().timer(wait).await;
                 let kept = this.update(cx, |shell, cx| {
-                    let kept = shell.db.connecting();
+                    let m = &cx.theme().motion;
+                    let (delay, hold) = (m.indicator_delay, m.indicator_hold);
+                    let kept = shell.db.animating(Instant::now(), delay, hold);
                     if !kept {
                         shell.db.spin = None;
-                    } else if shell.workspace.ui.side_mode == daedalus_workspace::SideMode::Data {
+                    } else if shell.data_shown() {
                         cx.notify();
                     }
                     kept
@@ -215,7 +279,7 @@ impl Shell {
         let key = conn_key(listed.origin, &listed.conn.id);
         if matches!(
             self.db.phase(&key),
-            Phase::Connecting(_) | Phase::Connected(_)
+            Phase::Connecting(_) | Phase::Connected { .. }
         ) {
             return;
         }
@@ -241,22 +305,8 @@ impl Shell {
                 .spawn(async move { db_secrets::load(&account).map_err(|e| e.to_string()) })
                 .await;
             this.update(cx, |shell, cx| {
-                let current = shell.db.meta.get(&key).and_then(|m| m.session) == Some(session);
-                if !current {
-                    return;
-                }
-                match loaded {
-                    Ok(Some(secret)) => shell.db.send(Command::Connect {
-                        session,
-                        conn,
-                        password: Some(secret),
-                        root,
-                    }),
-                    Ok(None) => shell.db.fail(
-                        &key,
-                        "No saved password. Edit the connection to add one.".into(),
-                    ),
-                    Err(e) => shell.db.fail(&key, e),
+                if let Some(cmd) = shell.db.keychain_loaded(&key, session, loaded, conn, root) {
+                    shell.db.send(cmd);
                 }
                 cx.notify();
             })
@@ -302,7 +352,9 @@ mod tests {
             server: "SQLite 3.45".into(),
         });
         assert!(cmd.is_none());
-        assert_eq!(db.phase("g:a"), Phase::Connected("SQLite 3.45".into()));
+        assert!(
+            matches!(db.phase("g:a"), Phase::Connected { server, .. } if server == "SQLite 3.45")
+        );
     }
 
     #[test]
@@ -331,5 +383,52 @@ mod tests {
             })
         ));
         assert!(matches!(db.phase("g:a"), Phase::Connecting(_)));
+    }
+
+    fn conn() -> Connection {
+        serde_json::from_str(r#"{"id":"a","name":"A","engine":"sqlite"}"#).unwrap()
+    }
+
+    #[test]
+    fn a_row_disconnected_during_the_keychain_load_sends_nothing() {
+        let mut db = state_with("g:a", 1);
+        db.meta.get_mut("g:a").unwrap().session = None;
+        let cmd = db.keychain_loaded(
+            "g:a",
+            SessionId(1),
+            Ok(Some(Secret::new(String::from("pw")))),
+            conn(),
+            None,
+        );
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn a_newer_session_makes_the_old_keychain_result_a_no_op() {
+        let mut db = state_with("g:a", 2);
+        let cmd = db.keychain_loaded("g:a", SessionId(1), Ok(None), conn(), None);
+        assert!(cmd.is_none());
+        assert!(matches!(db.phase("g:a"), Phase::Connecting(_)));
+        let cmd = db.keychain_loaded(
+            "g:a",
+            SessionId(2),
+            Ok(Some(Secret::new(String::from("pw")))),
+            conn(),
+            None,
+        );
+        assert!(matches!(cmd, Some(Command::Connect { .. })));
+    }
+
+    #[test]
+    fn a_connect_finishing_after_the_delay_keeps_the_spinner_until_the_hold_ends() {
+        let (delay, hold) = (Duration::from_millis(250), Duration::from_millis(400));
+        let busy = Busy::start();
+        let at = busy.since() + Duration::from_millis(300);
+        let lingers = |ms| spinner_lingers(busy, at, at + Duration::from_millis(ms), delay, hold);
+        assert!(lingers(0));
+        assert!(lingers(349));
+        assert!(!lingers(350));
+        let quick = busy.since() + Duration::from_millis(100);
+        assert!(!spinner_lingers(busy, quick, quick, delay, hold));
     }
 }
