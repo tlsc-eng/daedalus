@@ -105,6 +105,8 @@ pub struct DataGrid {
     editable: bool,
     marks: GridMarks,
     editing: Option<Editing>,
+    // show() has no window, so render restores grid focus if the dropped editor still held it.
+    refocus_pending: Option<FocusHandle>,
 }
 
 impl EventEmitter<GridEvent> for DataGrid {}
@@ -137,6 +139,7 @@ impl DataGrid {
             editable: false,
             marks: GridMarks::default(),
             editing: None,
+            refocus_pending: None,
         }
     }
 
@@ -150,7 +153,7 @@ impl DataGrid {
     ) {
         self.model.show(columns, rows, more);
         if let Some(editing) = self.editing.take() {
-            self.refocus_if_focused(editing.input.focus_handle(cx), cx);
+            self.refocus_pending = Some(editing.input.focus_handle(cx));
         }
         self.clear_stale(cx);
         self.generation += 1;
@@ -282,22 +285,6 @@ impl DataGrid {
             }
             cx.notify();
         }
-    }
-
-    /// `show` has no window, so the check and the focus move run in a deferred window update.
-    fn refocus_if_focused(&self, editor: FocusHandle, cx: &mut Context<Self>) {
-        let (Some(window), grid) = (cx.active_window(), self.focus.clone()) else {
-            return;
-        };
-        cx.defer(move |cx| {
-            window
-                .update(cx, |_, window, _| {
-                    if editor.is_focused(window) {
-                        window.focus(&grid);
-                    }
-                })
-                .ok();
-        });
     }
 
     fn request_edit(&mut self, pos: CellPos, cx: &mut Context<Self>) {
@@ -786,6 +773,11 @@ impl DataGrid {
 
 impl Render for DataGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(editor) = self.refocus_pending.take()
+            && editor.is_focused(window)
+        {
+            window.focus(&self.focus);
+        }
         let m = self.metrics(window, cx);
         let t = m.theme.clone();
         if self.dim.running() {
