@@ -14,6 +14,18 @@ use crate::value::{Cell, Column};
 
 const DEFAULT_PORT: u16 = 3306;
 
+/// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
+pub const CATALOG_SQL: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, \
+CASE WHEN t.TABLE_TYPE LIKE '%VIEW' THEN 'view' ELSE 'table' END, \
+c.COLUMN_NAME, c.COLUMN_TYPE, \
+CASE WHEN c.COLUMN_NAME IS NULL THEN NULL WHEN c.IS_NULLABLE = 'YES' THEN '1' ELSE '0' END, \
+CASE WHEN c.COLUMN_NAME IS NULL THEN NULL WHEN c.COLUMN_KEY = 'PRI' THEN '1' ELSE '0' END \
+FROM (SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+WHERE TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys') \
+ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT 5001) t \
+LEFT JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION";
+
 pub struct Mysql {
     conn: Arc<Mutex<Conn>>,
     opts: Arc<Opts>,

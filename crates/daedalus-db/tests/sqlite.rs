@@ -422,3 +422,46 @@ fn cancel_before_start_does_not_execute() {
         assert_eq!(row_count(&rig, run + 1), completed);
     }
 }
+
+#[test]
+fn catalog_lists_tables_columns_and_pk() {
+    use daedalus_db::catalog::TableKind;
+    let rig = rig(false);
+    let setup = [
+        "create table pairs(a integer not null, b text not null, note text, primary key (a, b))",
+        "create view pair_notes as select a, note from pairs",
+        "create table \"my table\"(id integer primary key)",
+    ];
+    for (i, sql) in setup.iter().enumerate() {
+        rig.run(i as u64 + 1, sql, 10);
+        rig.collect(i as u64 + 1).expect("setup");
+    }
+    rig.handle.send(Command::Introspect { session: S });
+    let catalog = loop {
+        if let Update::Catalog { catalog, .. } = rig.next() {
+            break catalog.expect("catalog");
+        }
+    };
+    assert!(!catalog.truncated);
+    assert_eq!(catalog.schemas.len(), 1);
+    let schema = &catalog.schemas[0];
+    assert_eq!(schema.name, "main");
+    let names: Vec<_> = schema.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["my table", "pair_notes", "pairs"]);
+    assert_eq!(schema.tables[0].kind, TableKind::Table);
+    assert!(schema.tables[0].columns[0].pk);
+    assert_eq!(schema.tables[1].kind, TableKind::View);
+    let cols = &schema.tables[2].columns;
+    let got: Vec<_> = cols
+        .iter()
+        .map(|c| (c.name.as_str(), c.type_name.as_str(), c.nullable, c.pk))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("a", "INTEGER", false, true),
+            ("b", "TEXT", false, true),
+            ("note", "TEXT", true, false)
+        ]
+    );
+}

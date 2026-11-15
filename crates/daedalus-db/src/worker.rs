@@ -6,12 +6,14 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::catalog::{self, Catalog};
 use crate::config::Connection;
 use crate::engine::{Driver, Item};
 use crate::secret::Secret;
 use crate::value::{Budget, Cell, Column};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const INTROSPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_RESEND: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +47,9 @@ pub enum Command {
     Cancel {
         session: SessionId,
         run: RunId,
+    },
+    Introspect {
+        session: SessionId,
     },
 }
 
@@ -82,6 +87,10 @@ pub enum Update {
         run: RunId,
         message: String,
         position: Option<usize>,
+    },
+    Catalog {
+        session: SessionId,
+        catalog: Result<Catalog, String>,
     },
 }
 
@@ -125,7 +134,8 @@ impl Command {
             | Command::Disconnect { session }
             | Command::Run { session, .. }
             | Command::FetchMore { session, .. }
-            | Command::Cancel { session, .. } => *session,
+            | Command::Cancel { session, .. }
+            | Command::Introspect { session } => *session,
         }
     }
 }
@@ -164,6 +174,7 @@ async fn dispatch(
                 Command::Run { run, .. } => Some(*run),
                 _ => None,
             };
+            let introspect = matches!(command, Command::Introspect { .. });
             let delivered = sessions
                 .get(&session)
                 .is_some_and(|tx| tx.send(command).is_ok());
@@ -178,6 +189,10 @@ async fn dispatch(
                             position: None,
                         })
                         .await;
+                }
+                if introspect {
+                    let catalog = Err("not connected".into());
+                    let _ = updates.send(Update::Catalog { session, catalog }).await;
                 }
             }
         }
@@ -204,7 +219,7 @@ async fn session_task(
                 biased;
                 command = rx.recv() => match command {
                     None | Some(Command::Disconnect { .. }) => return,
-                    Some(c @ (Command::Run { .. } | Command::Cancel { .. })) => queued.push_back(c),
+                    Some(c @ (Command::Run { .. } | Command::Cancel { .. } | Command::Introspect { .. })) => queued.push_back(c),
                     Some(_) => {}
                 },
                 result = &mut connect => break result,
@@ -270,10 +285,72 @@ async fn session_task(
                     return;
                 }
             }
+            Command::Introspect { .. } => {
+                if !introspect(&driver, &mut rx, &mut queued, &updates, session).await {
+                    return;
+                }
+            }
             Command::Disconnect { .. } => return,
             _ => {}
         }
     }
+}
+
+/// Returns false when the session should end.
+async fn introspect(
+    driver: &Driver,
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut VecDeque<Command>,
+    updates: &async_channel::Sender<Update>,
+    session: SessionId,
+) -> bool {
+    let canceller = driver.canceller();
+    // Detached and bounded so a dead network cannot wedge the session.
+    let cancel_detached = || {
+        let canceller = canceller.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, canceller.cancel()).await;
+        });
+    };
+    let collect = async {
+        let mut stream = driver.query(driver.catalog_sql().to_owned());
+        let mut rows = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(Item::Row(row)) => rows.push(row),
+                Ok(_) => {}
+                Err(failure) => return Err(failure.message),
+            }
+        }
+        Ok(rows)
+    };
+    let collect = tokio::time::timeout(INTROSPECT_TIMEOUT, collect);
+    tokio::pin!(collect);
+    let rows = loop {
+        tokio::select! {
+            biased;
+            command = rx.recv() => match command {
+                None | Some(Command::Disconnect { .. }) => {
+                    cancel_detached();
+                    return false;
+                }
+                Some(c) => queued.push_back(c),
+            },
+            result = &mut collect => break result,
+        }
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(_) => {
+            cancel_detached();
+            Err("catalog timed out after 30s".into())
+        }
+    };
+    let catalog = rows.and_then(catalog::from_rows);
+    updates
+        .send(Update::Catalog { session, catalog })
+        .await
+        .is_ok()
 }
 
 struct Job {
@@ -327,7 +404,7 @@ fn route(command: Command, run: RunId, queued: &mut VecDeque<Command>) -> Route 
             }
         }
         Command::Disconnect { .. } => Route::Disconnect,
-        c @ Command::Run { .. } => {
+        c @ (Command::Run { .. } | Command::Introspect { .. }) => {
             queued.push_back(c);
             Route::Nothing
         }
@@ -655,6 +732,16 @@ mod tests {
         });
         assert!(
             matches!(update, Update::RunError { ref message, .. } if message == "not connected")
+        );
+    }
+
+    #[test]
+    fn introspect_without_a_session_reports_not_connected() {
+        let update = first_update(Command::Introspect {
+            session: SessionId(9),
+        });
+        assert!(
+            matches!(update, Update::Catalog { catalog: Err(ref m), .. } if m == "not connected")
         );
     }
 }

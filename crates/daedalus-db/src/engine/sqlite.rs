@@ -16,6 +16,13 @@ use crate::value::{Cell, Column};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
+pub const CATALOG_SQL: &str = "SELECT 'main', m.name, m.type, p.name, p.type, \
+CASE WHEN p.\"notnull\" THEN '0' ELSE '1' END, CASE WHEN p.pk > 0 THEN '1' ELSE '0' END \
+FROM (SELECT name, type FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' \
+AND coalesce(sql,'') NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name LIMIT 5001) m \
+JOIN pragma_table_info(m.name) p ORDER BY m.name, p.cid";
+
 pub struct Sqlite {
     conn: Arc<Mutex<Db>>,
     interrupt: Arc<InterruptHandle>,

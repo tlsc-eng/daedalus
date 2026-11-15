@@ -74,6 +74,15 @@ impl Driver {
         }
     }
 
+    /// The query that lists this engine's tables and columns in the catalog row contract.
+    pub fn catalog_sql(&self) -> &'static str {
+        match self {
+            Driver::Postgres(_) => pg::CATALOG_SQL,
+            Driver::Sqlite(_) => sqlite::CATALOG_SQL,
+            Driver::Mysql(_) => mysql::CATALOG_SQL,
+        }
+    }
+
     pub fn canceller(&self) -> Canceller {
         match self {
             Driver::Postgres(pg) => Canceller::Postgres(pg.canceller()),
