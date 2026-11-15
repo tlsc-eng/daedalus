@@ -190,6 +190,9 @@ fn tokens() -> Value {
             "fast_ms": m.fast.as_millis() as u64,
             "base_ms": m.base.as_millis() as u64,
             "slow_ms": m.slow.as_millis() as u64,
+            "indicator_delay_ms": m.indicator_delay.as_millis() as u64,
+            "indicator_hold_ms": m.indicator_hold.as_millis() as u64,
+            "stale_opacity": num(crate::motion::STALE_OPACITY),
             "easing": {
                 "standard": curve(EASE_STANDARD),
                 "enter": curve(EASE_ENTER),

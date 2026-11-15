@@ -116,6 +116,8 @@ pub struct Motion {
     pub fast: Duration,
     pub base: Duration,
     pub slow: Duration,
+    pub indicator_delay: Duration,
+    pub indicator_hold: Duration,
 }
 
 /// Terminal palette: the 16 ANSI colours plus defaults, minted at one tonal level.
@@ -422,6 +424,8 @@ impl Theme {
                 fast: Duration::from_millis(120),
                 base: Duration::from_millis(200),
                 slow: Duration::from_millis(320),
+                indicator_delay: Duration::from_millis(250),
+                indicator_hold: Duration::from_millis(400),
             },
         }
     }
