@@ -1,0 +1,16 @@
+# GitHub login -> Slack member id, read by pr-reminder-server
+# (github.com/tlsc-eng/pr-reminder-server) for every Slack message about this repository.
+#
+# A login that is not listed here is written into the Slack message as plain
+# text with no mention. That is the point of the file rather than a users.read
+# lookup: a missing entry degrades to a message nobody is pinged by, never to a
+# failed run.
+#
+# A Slack member id is the "Member ID" under a profile's ... menu -> Copy
+# member ID. It starts with U (or W on some workspaces) -- it is not the
+# @handle and not the display name.
+#
+# Flat map only: one "login: id" per line. Comments and blank lines are fine.
+#
+bjsonn: U0AEHKH7761
+gkevin9: U0AF07DBGUR
