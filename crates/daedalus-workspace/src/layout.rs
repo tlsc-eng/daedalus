@@ -60,6 +60,12 @@ pub enum ItemKind {
     DbConsole {
         connection: String,
     },
+    /// A table of one connection, named by its `conn_key`; never saved with the workspace.
+    DbTable {
+        connection: String,
+        schema: String,
+        table: String,
+    },
     /// One Claude session's plan, changes and review comments; never saved with the workspace.
     Session {
         id: String,
@@ -110,6 +116,7 @@ impl ItemKind {
             | Self::Settings
             | Self::Shortcuts
             | Self::DbConsole { .. }
+            | Self::DbTable { .. }
             | Self::Session { .. } => None,
         }
     }

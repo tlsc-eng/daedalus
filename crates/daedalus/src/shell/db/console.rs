@@ -30,6 +30,8 @@ mod complete;
 mod gate;
 mod text;
 
+pub(super) use batch::grid_columns;
+
 const OUTPUT_CAP: usize = 500;
 
 /// What the console shows of its connection; copied so the view never holds a `Listed`.
