@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, Update, start};
 use daedalus_db::{Secret, from_url};
 
 const S: SessionId = SessionId(1);
@@ -56,12 +56,17 @@ impl Rig {
     }
 
     fn run(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>) {
+        self.run_mode(run, sql, page, timeout, RunMode::Auto);
+    }
+
+    fn run_mode(&self, run: u64, sql: &str, page: usize, timeout: Option<Duration>, mode: RunMode) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
             sql: sql.into(),
             page,
             timeout,
+            mode,
         });
     }
 }
@@ -423,4 +428,39 @@ fn catalog_lists_tables_views_and_pk() {
     assert_eq!(t.columns[1].type_name, "varchar(20)");
     assert!(!t.columns[1].pk && t.columns[1].nullable);
     assert_eq!(found.tables[1].kind, TableKind::View);
+}
+
+#[test]
+#[ignore = "needs MySQL or MariaDB at DAEDALUS_TEST_MYSQL"]
+fn read_only_run_blocks_writes() {
+    let rig = rig(false);
+    rig.run(1, "DROP TABLE IF EXISTS ro_probe", 500, None);
+    rig.run(2, "CREATE TABLE ro_probe(x int)", 500, None);
+    let mut done = 0;
+    while done < 2 {
+        match rig.next() {
+            Update::Done { .. } => done += 1,
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    rig.run_mode(
+        3,
+        "INSERT INTO ro_probe VALUES (1)",
+        500,
+        None,
+        RunMode::ReadOnly,
+    );
+    rig.next_error();
+    rig.run(4, "SELECT COUNT(*) FROM ro_probe", 500, None);
+    loop {
+        match rig.next() {
+            Update::Rows { rows, .. } => {
+                assert_eq!(rows[0][0].as_deref(), Some("0"));
+                break;
+            }
+            Update::RunError { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
 }

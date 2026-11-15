@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use daedalus_db::worker::{Command, Handle, RunId, SessionId, Update, start};
+use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start};
 use daedalus_db::{Connection, Engine, Tls};
 
 const S: SessionId = SessionId(1);
@@ -96,13 +96,22 @@ impl Rig {
     }
 
     fn run(&self, run: u64, sql: &str, page: usize) {
+        self.run_mode(run, sql, page, RunMode::Auto);
+    }
+
+    fn run_mode(&self, run: u64, sql: &str, page: usize, mode: RunMode) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
             sql: sql.into(),
             page,
             timeout: None,
+            mode,
         });
+    }
+
+    fn tx(&self, op: TxOp) {
+        self.handle.send(Command::Transaction { session: S, op });
     }
 
     fn cancel(&self, run: u64) {
@@ -350,6 +359,7 @@ fn timeout_stops_multi_statement_script() {
         sql: insert_script(),
         page: 100,
         timeout: Some(Duration::from_millis(50)),
+        mode: RunMode::Auto,
     });
     match rig.collect(2) {
         Err(message) => assert!(message.contains("timed out"), "{message}"),
@@ -529,4 +539,77 @@ fn run_sent_during_introspect_runs_after_it_in_order() {
     rig.run(1, "select 1", 10);
     assert!(matches!(rig.next(), Update::Catalog { .. }));
     assert_eq!(rig.collect(1).expect("run"), [[Some("1".to_owned())]]);
+}
+
+fn next_tx(rig: &Rig) -> (bool, Option<String>) {
+    loop {
+        if let Update::TxState { open, error, .. } = rig.next() {
+            return (open, error);
+        }
+    }
+}
+
+fn finish_tx_run(rig: &Rig, sql: &str, run: u64) {
+    rig.run_mode(run, sql, 100, RunMode::Transaction);
+    assert_eq!(next_tx(rig), (true, None));
+    assert!(rig.collect(run).is_ok());
+}
+
+#[test]
+fn manual_transaction_rolls_back() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.tx(TxOp::Rollback);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 3), 0);
+}
+
+#[test]
+fn manual_transaction_commits() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    finish_tx_run(&rig, "insert into t values (1)", 2);
+    rig.tx(TxOp::Commit);
+    assert_eq!(next_tx(&rig), (false, None));
+    assert_eq!(row_count(&rig, 3), 1);
+}
+
+#[test]
+fn commit_without_a_transaction_is_a_no_op() {
+    let rig = rig(false);
+    rig.tx(TxOp::Commit);
+    assert_eq!(next_tx(&rig), (false, None));
+}
+
+#[test]
+fn begin_on_a_read_only_connection_is_refused() {
+    let rig = rig(true);
+    rig.tx(TxOp::Begin);
+    let (open, error) = next_tx(&rig);
+    assert!(!open);
+    assert!(error.is_some());
+}
+
+#[test]
+fn read_only_mode_refuses_a_write_on_a_writable_connection() {
+    let rig = rig(false);
+    rig.run(1, "create table t(x)", 100);
+    assert!(rig.collect(1).is_ok());
+    rig.run_mode(2, "insert into t values (1)", 100, RunMode::ReadOnly);
+    assert!(rig.collect(2).is_err());
+    rig.run(3, "insert into t values (1)", 100);
+    assert!(rig.collect(3).is_ok());
+    assert_eq!(row_count(&rig, 4), 1);
+}
+
+#[test]
+fn read_only_mode_is_refused_while_a_transaction_is_open() {
+    let rig = rig(false);
+    rig.tx(TxOp::Begin);
+    assert_eq!(next_tx(&rig), (true, None));
+    rig.run_mode(1, "select 1", 100, RunMode::ReadOnly);
+    assert!(rig.collect(1).is_err());
 }

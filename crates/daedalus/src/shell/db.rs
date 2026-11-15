@@ -318,7 +318,8 @@ impl DbState {
             Update::Columns { .. }
             | Update::Rows { .. }
             | Update::Done { .. }
-            | Update::RunError { .. } => None,
+            | Update::RunError { .. }
+            | Update::TxState { .. } => None,
         }
     }
 }
