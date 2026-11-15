@@ -848,6 +848,11 @@ impl Render for Shell {
                 this.show_side_mode(SideMode::Data, w, cx)
             }))
             .on_action(
+                cx.listener(|this, _: &crate::actions::NewDatabaseConnection, w, cx| {
+                    this.db_new_connection(w, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &FindInProject, w, cx| this.find_in_project(None, w, cx)),
             )
             .on_action(cx.listener(|this, _: &ShowChanges, _, cx| this.toggle_changes(cx)))
@@ -1021,6 +1026,7 @@ impl Render for Shell {
             .children(self.render_bell_popover(window, cx))
             .children(self.render_toasts(cx))
             .children(self.render_palette(window, cx))
+            .children(self.render_db_sheet(cx))
             .children(self.render_pairing(cx))
             .children(self.context_menu.as_ref().map(|(menu, _)| menu.clone()))
             .children(self.render_splash(cx))

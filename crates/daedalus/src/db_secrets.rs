@@ -1,6 +1,3 @@
-// Used from DB-7.
-#![allow(dead_code)]
-
 use anyhow::{Result, anyhow};
 use daedalus_db::Secret;
 use security_framework::passwords::{
