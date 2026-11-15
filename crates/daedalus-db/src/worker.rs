@@ -137,10 +137,22 @@ async fn dispatch(
 ) {
     let session = command.session();
     match command {
-        Command::Connect { conn, password, .. } => {
+        Command::Connect {
+            conn,
+            password,
+            root,
+            ..
+        } => {
             let (tx, rx) = mpsc::unbounded_channel();
             sessions.insert(session, tx);
-            tokio::spawn(session_task(session, conn, password, rx, updates.clone()));
+            tokio::spawn(session_task(
+                session,
+                conn,
+                password,
+                root,
+                rx,
+                updates.clone(),
+            ));
         }
         Command::Disconnect { .. } => {
             if let Some(tx) = sessions.remove(&session) {
@@ -176,13 +188,16 @@ async fn session_task(
     session: SessionId,
     conn: Connection,
     password: Option<Secret>,
+    root: Option<PathBuf>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     updates: async_channel::Sender<Update>,
 ) {
     let mut queued: VecDeque<Command> = VecDeque::new();
     let connected = {
-        let connect =
-            tokio::time::timeout(CONNECT_TIMEOUT, Driver::connect(&conn, password.as_ref()));
+        let connect = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            Driver::connect(&conn, password.as_ref(), root.as_deref()),
+        );
         tokio::pin!(connect);
         loop {
             tokio::select! {
@@ -616,7 +631,7 @@ mod tests {
     fn other_engines_are_not_supported_yet() {
         let update = first_update(Command::Connect {
             session: SessionId(1),
-            conn: conn(Engine::Sqlite, "", 0),
+            conn: conn(Engine::Mysql, "", 0),
             password: None,
             root: None,
         });
