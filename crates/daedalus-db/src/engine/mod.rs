@@ -1,3 +1,4 @@
+pub mod mysql;
 pub mod pg;
 pub mod sqlite;
 
@@ -31,6 +32,7 @@ pub type ItemStream = Pin<Box<dyn Stream<Item = Result<Item, Failure>> + Send>>;
 pub enum Driver {
     Postgres(pg::Pg),
     Sqlite(sqlite::Sqlite),
+    Mysql(mysql::Mysql),
 }
 
 /// Asks the server to stop whatever its connection is running.
@@ -38,6 +40,7 @@ pub enum Driver {
 pub enum Canceller {
     Postgres(pg::PgCanceller),
     Sqlite(sqlite::SqliteCanceller),
+    Mysql(mysql::MysqlCanceller),
 }
 
 impl Driver {
@@ -56,7 +59,10 @@ impl Driver {
                 let (db, server) = sqlite::Sqlite::connect(conn, root).await?;
                 Ok((Driver::Sqlite(db), server))
             }
-            Engine::Mysql => Err("engine not supported yet".into()),
+            Engine::Mysql => {
+                let (mysql, server) = mysql::Mysql::connect(conn, password).await?;
+                Ok((Driver::Mysql(mysql), server))
+            }
         }
     }
 
@@ -64,6 +70,7 @@ impl Driver {
         match self {
             Driver::Postgres(pg) => pg.query(sql),
             Driver::Sqlite(db) => db.query(sql),
+            Driver::Mysql(m) => m.query(sql),
         }
     }
 
@@ -71,6 +78,7 @@ impl Driver {
         match self {
             Driver::Postgres(pg) => Canceller::Postgres(pg.canceller()),
             Driver::Sqlite(db) => Canceller::Sqlite(db.canceller()),
+            Driver::Mysql(m) => Canceller::Mysql(m.canceller()),
         }
     }
 }
@@ -80,6 +88,7 @@ impl Canceller {
         match self {
             Canceller::Postgres(c) => c.cancel().await,
             Canceller::Sqlite(c) => c.cancel().await,
+            Canceller::Mysql(c) => c.cancel().await,
         }
     }
 }

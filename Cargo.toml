@@ -70,6 +70,7 @@ tokio-postgres = { version = "0.7.18", default-features = false, features = ["ru
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "native-tls-tls"] }
 percent-encoding = "2.3"
 qrcode = { version = "0.14.1", default-features = false }
 encoding_rs = "0.8.42"
