@@ -887,6 +887,18 @@ that Claude should `open_file` it first. Every answer is capped to fit one 1 MiB
 | `run_tests`, `get_test_results` | Start go test or Vitest/Jest in the Tests panel (all, a package or file, or one test or `TestX/subtest` by name), then read counts and failures. The path must lie in the session's own project. Vitest and Jest run the project's `node_modules`, so for Claude they run only once the project's code is allowed; a Go and JavaScript run keeps its go test and says what was skipped. |
 | `git_status` | Branch, ahead/behind and changed files of a project; ignored files left out. |
 | `debug_state` | Read-only: whether the session's project is being debugged and, while paused, why, where (file and 1-based line), the call stack (up to 20 frames) and the selected frame's locals (up to 50, values and types cut at 200 characters; long names, frames and descriptions are shortened too). It never resumes or steps the program. |
+| `db_list_connections` | The database connections you shared with Claude: id, engine, whether connected. |
+| `db_list_tables`, `db_describe_table` | Tables and views of a shared connection, and a table's columns, types, nullability and primary key. |
+| `db_query` | Runs one read-only statement on a shared connection; at most 200 rows (100 by default), long cells cut. |
+
+**Databases.** A connection is visible to Claude only when you opt it in for Claude,
+and only while you have it connected in the Data panel; Claude never connects one itself or asks
+for a password. Each query is checked to be a single read, runs in a read-only transaction and is
+capped by rows, size and time (10 seconds). The connection's "claude" tag lights up while Claude
+is using it, and a toast tells you the first time. Daedalus cannot see what a function does inside
+the database, so give a shared connection a database user that can only read, for example
+`GRANT pg_read_all_data TO claude_reader` on Postgres or `GRANT SELECT ON mydb.* TO 'claude_reader'@'%'`
+on MySQL.
 
 ### Hooks
 

@@ -22,6 +22,7 @@ use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
 
 mod console;
 mod explorer;
+mod mcp;
 mod sheet;
 mod tab;
 mod table;
@@ -80,6 +81,7 @@ pub(super) struct DbState {
     test: Option<(SessionId, Instant)>,
     test_done: Option<(Result<String, String>, u128)>,
     tabs: HashMap<SessionId, DbTabRef>,
+    claude: mcp::ClaudeDb,
 }
 
 #[derive(Clone, Default)]
@@ -89,6 +91,7 @@ pub(super) struct Meta {
     pub catalog: Option<Catalog>,
     pub catalog_error: Option<String>,
     pub reading: Option<Busy>,
+    pub claude_runs: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -350,6 +353,7 @@ impl Shell {
             while let Ok(update) = rx.recv().await {
                 let kept = this.update(cx, |shell, cx| {
                     if let Some(update) = shell.db_route_tab(update, cx)
+                        && let Some(update) = shell.db_route_claude(update)
                         && let Some(cmd) = shell.db.on_update(update)
                     {
                         shell.db.send(cmd);
@@ -505,10 +509,13 @@ impl Shell {
     fn db_disconnect(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(meta) = self.db.meta.get_mut(key) {
             if let Some(session) = meta.session.take() {
+                let name = self.db_name_of(key);
+                self.db_fail_claude(session, &format!("The user disconnected {name}."));
                 self.db.send(Command::Disconnect { session });
             }
             if let Some(meta) = self.db.meta.get_mut(key) {
                 meta.phase = Phase::Idle;
+                meta.claude_runs = 0;
             }
         }
         self.db.forget_tree(key);

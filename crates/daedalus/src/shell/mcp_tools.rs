@@ -135,7 +135,7 @@ impl Shell {
     }
 
     /// The project a tool works in: the caller's terminal's, else the active one.
-    fn caller_root(&self, caller: Option<PaneId>) -> Option<PathBuf> {
+    pub(super) fn caller_root(&self, caller: Option<PaneId>) -> Option<PathBuf> {
         caller
             .and_then(|s| self.session_root(s))
             .or_else(|| self.active_root())
@@ -190,9 +190,13 @@ impl Shell {
     pub(super) fn answer_later(
         &mut self,
         msg: &AppMsg,
+        caller: Option<PaneId>,
         reply: &SyncSender<AppReply>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.db_answer_claude(msg, caller, reply, cx) {
+            return true;
+        }
         let reply = reply.clone();
         let fail = |e: String| {
             let _ = reply.send(AppReply::Error(e));

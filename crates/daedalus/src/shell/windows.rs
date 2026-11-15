@@ -1431,7 +1431,11 @@ fn target(
         | AppMsg::ClaudeWaiting { .. }
         | AppMsg::RunTests { .. }
         | AppMsg::TestResults
-        | AppMsg::DebugState => Target::Window(caller.unwrap_or(focused)),
+        | AppMsg::DebugState
+        | AppMsg::DbConnections
+        | AppMsg::DbTables { .. }
+        | AppMsg::DbDescribe { .. }
+        | AppMsg::DbQuery { .. } => Target::Window(caller.unwrap_or(focused)),
     }
 }
 
@@ -1568,7 +1572,7 @@ fn serve(request: Request, cx: &mut App) {
                 {
                     return shell.confirm_run(session, text, newline, caller, reply, window, cx);
                 }
-                if shell.answer_later(&msg, &reply, cx) {
+                if shell.answer_later(&msg, caller, &reply, cx) {
                     return;
                 }
                 let _ = reply.send(shell.handle_app(msg, caller, window, cx));
@@ -2080,6 +2084,17 @@ mod tests {
         }
         assert_eq!(route(AppMsg::WhoAmI, Some(0)), Target::Window(0));
         assert_eq!(route(AppMsg::DebugState, Some(1)), Target::Window(1));
+        assert_eq!(
+            route(
+                AppMsg::DbQuery {
+                    connection: "main".into(),
+                    sql: daedalus_proto::Private("select 1".into()),
+                    max_rows: 5
+                },
+                Some(1)
+            ),
+            Target::Window(1)
+        );
         assert_eq!(
             route(
                 AppMsg::RunTests {
