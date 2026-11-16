@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,16 +17,19 @@ use daedalus_ui::motion::{self, Busy};
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, ContextMenu, DataGrid, DotState, GridEvent, Space, StatusDot,
 };
+use daedalus_workspace::Axis;
 use gpui::{
-    AnyElement, ClickEvent, Context, DismissEvent, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Pixels, Point, PromptLevel, Render, Subscription, Task,
-    Window, div, prelude::*, relative,
+    AnyElement, Bounds, ClickEvent, Context, CursorStyle, DismissEvent, DispatchPhase, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptLevel, Render, Subscription,
+    Task, Window, canvas, div, prelude::*, px, relative,
 };
 
 use super::explorer::{data_color, dot_shape, engine_label, tag};
 use super::exporting::{self, Export, Outcome, Spec};
 use crate::actions::{RunAll, RunStatement, StopRun};
 use crate::shell::lsp::{CONFIRMED, confirm_buttons};
+use crate::shell::panes::{DIVIDER_HIT, resize_handle};
 use crate::shell::sidebar::folder_color;
 use batch::{Batch, Effect, Piece};
 use gate::{Gate, Target};
@@ -65,6 +70,19 @@ impl From<&Listed> for Info {
 pub(in crate::shell) enum DbConsoleEvent {
     Connect,
     WantCatalog,
+    SplitChanged(f32),
+}
+
+const EDITOR_MIN: f32 = 80.;
+const RESULTS_MIN: f32 = 120.;
+pub(in crate::shell) const DEFAULT_SPLIT: f32 = 0.4;
+
+/// The editor's share of `len` px, keeping both panes at their minimum; the default when they cannot both fit.
+fn clamp_split(ratio: f32, len: f32) -> f32 {
+    if !ratio.is_finite() || !len.is_finite() || len < EDITOR_MIN + RESULTS_MIN {
+        return DEFAULT_SPLIT;
+    }
+    ratio.clamp(EDITOR_MIN / len, 1. - RESULTS_MIN / len)
 }
 
 enum ConsolePhase {
@@ -108,6 +126,9 @@ pub(in crate::shell) struct DbConsoleView {
     handle: Option<Handle>,
     setup_error: Option<String>,
     editor: Entity<EditorView>,
+    split: f32,
+    split_area: Rc<RefCell<Bounds<Pixels>>>,
+    split_drag: bool,
     grid: Entity<DataGrid>,
     batch: Batch,
     result: Shown,
@@ -152,7 +173,7 @@ fn prepare(path: &Path) -> std::io::Result<()> {
 }
 
 impl DbConsoleView {
-    pub fn new(root: PathBuf, key: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, key: String, split: f32, cx: &mut Context<Self>) -> Self {
         let mut history_path = None;
         let (path, setup_error) = match daedalus_proto::data_dir() {
             Ok(dir) => {
@@ -202,6 +223,9 @@ impl DbConsoleView {
             handle: None,
             setup_error,
             editor,
+            split,
+            split_area: Rc::new(RefCell::new(Bounds::default())),
+            split_drag: false,
             grid,
             batch: Batch::default(),
             result: Shown::Nothing,
@@ -683,12 +707,100 @@ impl DbConsoleView {
     }
 }
 
+impl DbConsoleView {
+    fn split_handle(&self, editor_h: f32, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        resize_handle("db-console-split", Axis::Vertical, cx.theme().color.accent)
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(editor_h - DIVIDER_HIT))
+            .h(px(1. + 2. * DIVIDER_HIT))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if e.click_count == 2 {
+                        this.split_drag = false;
+                        this.split = DEFAULT_SPLIT;
+                        cx.emit(DbConsoleEvent::SplitChanged(DEFAULT_SPLIT));
+                    } else {
+                        this.split_drag = true;
+                    }
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Mouse listeners last one frame, so the hook is re-registered on every paint of a drag.
+    fn split_hook(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if !self.split_drag {
+            return None;
+        }
+        let view = cx.entity().downgrade();
+        Some(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let v = view.clone();
+                    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        v.update(cx, |this, cx| {
+                            if e.pressed_button != Some(MouseButton::Left) {
+                                this.end_split_drag(cx);
+                                return;
+                            }
+                            let a = *this.split_area.borrow();
+                            if a.size.height > px(0.) {
+                                let h = f32::from(a.size.height);
+                                this.split = clamp_split(f32::from(e.position.y - a.top()) / h, h);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            view.update(cx, |this, cx| this.end_split_drag(cx)).ok();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+    }
+
+    fn end_split_drag(&mut self, cx: &mut Context<Self>) {
+        if self.split_drag {
+            self.split_drag = false;
+            cx.emit(DbConsoleEvent::SplitChanged(self.split));
+            cx.notify();
+        }
+    }
+}
+
 impl Render for DbConsoleView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_subs(window, cx);
         let t = cx.theme().clone();
         let toolbar = self.render_toolbar(cx);
         let results = self.render_results(cx);
+        let h = f32::from(self.split_area.borrow().size.height);
+        let ratio = clamp_split(self.split, h);
+        let area = self.split_area.clone();
+        let recorder = canvas(
+            move |bounds, _, _| {
+                let mut stored = area.borrow_mut();
+                if *stored != bounds {
+                    *stored = bounds;
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         div()
             .size_full()
             .relative()
@@ -699,15 +811,28 @@ impl Render for DbConsoleView {
             .on_action(cx.listener(Self::run_statement))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::stop_run))
+            .when(self.split_drag, |d| d.cursor(CursorStyle::ResizeUpDown))
             .child(toolbar)
             .child(
                 div()
-                    .flex_basis(relative(0.4))
+                    .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
-                    .child(div().size_full().child(self.editor.clone())),
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .child(recorder)
+                    .child(
+                        div()
+                            .h(relative(ratio))
+                            .flex_none()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(div().size_full().child(self.editor.clone())),
+                    )
+                    .child(results)
+                    .child(self.split_handle(h * ratio, cx))
+                    .children(self.split_hook(cx)),
             )
-            .child(results)
             .children(self.menu.as_ref().map(|(menu, _)| menu.clone()))
             .children(self.history.as_ref().map(|(popover, _)| popover.clone()))
     }
@@ -1230,6 +1355,16 @@ impl DbConsoleView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clamp_split_keeps_both_panes_usable() {
+        assert_eq!(clamp_split(0.4, 600.), 0.4);
+        assert_eq!(clamp_split(0.05, 600.), 80. / 600.);
+        assert_eq!(clamp_split(0.95, 600.), 1. - 120. / 600.);
+        assert_eq!(clamp_split(0.4, 150.), 0.4);
+        assert_eq!(clamp_split(f32::NAN, 600.), 0.4);
+        assert_eq!(clamp_split(7.0, 600.), 1. - 120. / 600.);
+    }
+
     use super::*;
 
     #[test]

@@ -1340,20 +1340,28 @@ impl Shell {
         connection: &str,
         cx: &mut Context<Self>,
     ) -> ItemView {
-        let view = cx.new(|cx| DbConsoleView::new(root.to_path_buf(), connection.to_owned(), cx));
+        let split = self.workspace.ui.db_console_split;
+        let view =
+            cx.new(|cx| DbConsoleView::new(root.to_path_buf(), connection.to_owned(), split, cx));
         // The click that asks to connect carries no window, so the sheet is opened from a deferred one.
-        cx.subscribe(&view, |this, view, event: &DbConsoleEvent, cx| {
-            if matches!(event, DbConsoleEvent::WantCatalog) {
-                let key = view.read(cx).key().to_owned();
-                this.db_ensure_shared(cx);
-                match this.db.meta.get(&key).and_then(|m| m.catalog.clone()) {
-                    Some(c) => view.update(cx, |v, _| v.set_catalog(Arc::new(c))),
-                    None => view.update(cx, |v, _| v.introspect()),
+        cx.subscribe(
+            &view,
+            |this, view, event: &DbConsoleEvent, cx| match event {
+                DbConsoleEvent::WantCatalog => {
+                    let key = view.read(cx).key().to_owned();
+                    this.db_ensure_shared(cx);
+                    match this.db.meta.get(&key).and_then(|m| m.catalog.clone()) {
+                        Some(c) => view.update(cx, |v, _| v.set_catalog(Arc::new(c))),
+                        None => view.update(cx, |v, _| v.introspect()),
+                    }
                 }
-                return;
-            }
-            this.db_defer_reconnect(DbTab::Console(view), cx);
-        })
+                DbConsoleEvent::SplitChanged(split) => {
+                    this.workspace.ui.db_console_split = *split;
+                    this.schedule_save(cx);
+                }
+                DbConsoleEvent::Connect => this.db_defer_reconnect(DbTab::Console(view), cx),
+            },
+        )
         .detach();
         ItemView::DbConsole(view)
     }
