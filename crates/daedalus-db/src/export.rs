@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Engine;
 use crate::edit::quote_ident;
@@ -193,6 +194,8 @@ impl<W: Write> Exporter<W> {
     }
 }
 
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Streams an export into a hidden temp file that replaces the destination only on commit.
 pub struct FileExport {
     exporter: Option<Exporter<BufWriter<File>>>,
@@ -213,7 +216,9 @@ impl FileExport {
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned());
         let name = name.unwrap_or_else(|| "export".to_string());
         // Beside the destination, because rename is only atomic within one filesystem.
-        let temp = dest.with_file_name(format!(".{name}.{}.part", std::process::id()));
+        // The sequence keeps two exports to one destination from deleting each other's temp.
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp = dest.with_file_name(format!(".{name}.{}.{seq}.part", std::process::id()));
         let _ = fs::remove_file(&temp);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -509,6 +514,22 @@ mod tests {
         f.write(&[vec![s("x")]]).unwrap();
         drop(f);
         assert_eq!(fs::read_to_string(&dest).unwrap(), "old");
+        assert_eq!(leftovers(&dir), ["out.csv"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_exports_to_one_destination_do_not_share_a_temp() {
+        let dir = scratch("concurrent");
+        let dest = dir.join("out.csv");
+        let cols = [col("a", "text")];
+        let mut a = FileExport::create(&dest, Format::Csv, Engine::Sqlite, None, &cols).unwrap();
+        let mut b = FileExport::create(&dest, Format::Csv, Engine::Sqlite, None, &cols).unwrap();
+        a.write(&[vec![s("from-a")]]).unwrap();
+        b.write(&[vec![s("from-b")]]).unwrap();
+        a.commit().unwrap();
+        drop(b);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "a\r\nfrom-a\r\n");
         assert_eq!(leftovers(&dir), ["out.csv"]);
         let _ = fs::remove_dir_all(&dir);
     }
