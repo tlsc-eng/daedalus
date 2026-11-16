@@ -154,6 +154,17 @@ fn stale_project_keys(old: &[Connection], new: &[Connection]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a project row still exists in the shared file read for the active root.
+fn shared_row_still_current(
+    shared: Option<&SharedFile>,
+    active_root: Option<&Path>,
+    id: &str,
+) -> bool {
+    shared.is_some_and(|s| {
+        Some(s.root.as_path()) == active_root && s.conns.iter().any(|c| c.id == id)
+    })
+}
+
 /// The connection as written to the shared file: a SQLite path inside the project is stored relative.
 fn shared_form(mut conn: Connection, root: &Path) -> Connection {
     if conn.engine == Engine::Sqlite
@@ -1153,11 +1164,14 @@ impl Shell {
                 .await;
             this.update_in(cx, |shell, window, cx| match saved {
                 Ok(loaded) => {
-                    shell.db_apply_shared(root, loaded, cx);
-                    if old.is_some_and(|old| needs_reconnect(&old, &new)) {
-                        shell.db_disconnect(&key, cx);
+                    // A project switch mid-save must not touch the new project's state.
+                    if shell.active_root().as_ref() == Some(&root) {
+                        shell.db_apply_shared(root, loaded, cx);
+                        if old.is_some_and(|old| needs_reconnect(&old, &new)) {
+                            shell.db_disconnect(&key, cx);
+                        }
+                        shell.db.selected = Some(key);
                     }
-                    shell.db.selected = Some(key);
                     if shell.db_sheet_is(opened) {
                         shell.db_close_sheet(window, cx);
                     }
@@ -1557,6 +1571,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if listed.origin == Origin::Project && !self.db_project_row_current(&listed.conn.id) {
+            return self.transient_notice(
+                "Could not delete the connection",
+                "This connection is no longer in the project file.",
+                cx,
+            );
+        }
         let root = self.active_root();
         let (title, detail) = match listed.origin {
             Origin::Project => (
@@ -1584,6 +1605,10 @@ impl Shell {
             }
         })
         .detach();
+    }
+
+    fn db_project_row_current(&self, id: &str) -> bool {
+        shared_row_still_current(self.db.shared.as_ref(), self.active_root().as_deref(), id)
     }
 
     fn db_delete_confirmed(
@@ -1685,7 +1710,9 @@ impl Shell {
                 }
                 match removed {
                     Ok(loaded) => {
-                        shell.db_apply_shared(root, loaded, cx);
+                        if shell.active_root().as_ref() == Some(&root) {
+                            shell.db_apply_shared(root, loaded, cx);
+                        }
                         if shell.db_sheet_is(opened) {
                             shell.db_close_sheet(window, cx);
                         }
@@ -1700,6 +1727,13 @@ impl Shell {
     }
 
     pub(super) fn db_make_personal(&mut self, listed: Listed, cx: &mut Context<Self>) {
+        if listed.origin == Origin::Project && !self.db_project_row_current(&listed.conn.id) {
+            return self.transient_notice(
+                "Could not make a personal copy",
+                "This connection is no longer in the project file.",
+                cx,
+            );
+        }
         let Some(root) = self
             .active_root()
             .filter(|_| listed.origin == Origin::Project)
@@ -2204,6 +2238,25 @@ mod tests {
         conn.projects = vec![PathBuf::from("/work/app")];
         let out = shared_form(conn, Path::new("/work/app"));
         assert!(!out.claude && out.projects.is_empty());
+    }
+
+    #[test]
+    fn shared_row_still_current_needs_same_root_and_id() {
+        let shared = SharedFile {
+            root: PathBuf::from("/a"),
+            conns: vec![pg("x")],
+            problems: vec![],
+            error: None,
+        };
+        let a = Some(Path::new("/a"));
+        assert!(shared_row_still_current(Some(&shared), a, "x"));
+        assert!(!shared_row_still_current(Some(&shared), a, "y"));
+        assert!(!shared_row_still_current(
+            Some(&shared),
+            Some(Path::new("/b")),
+            "x"
+        ));
+        assert!(!shared_row_still_current(None, a, "x"));
     }
 
     #[test]
