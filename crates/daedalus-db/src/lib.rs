@@ -7,6 +7,7 @@ pub mod config;
 pub mod edit;
 pub mod engine;
 pub mod export;
+pub mod history;
 pub mod secret;
 pub mod value;
 pub mod worker;
