@@ -456,10 +456,10 @@ mod tests {
                 Err(e) if e.raw_os_error() == Some(26) => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                _ => break,
+                _ => return (dir, program),
             }
         }
-        (dir, program)
+        panic!("{program:?} still ETXTBSY after 50 probes")
     }
 
     fn run<F: std::future::Future>(f: F) -> F::Output {
