@@ -1,13 +1,18 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use daedalus_db::detect::{self, Source, Suggestion};
 use daedalus_db::{Connection, Engine, Listed};
 use daedalus_ui::{ActiveTheme, Ellipsis, Space};
-use gpui::{AnyElement, ClickEvent, Context, FontWeight, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, Window, div,
+    prelude::*, px,
+};
 
 use super::explorer::engine_label;
 use super::sheet::{Found, SheetMode, caption_field};
 use crate::shell::Shell;
+use crate::shell::menus::shell_item;
 use crate::shell::tree::ROW_HEIGHT;
 
 /// Suggestions read for one project root; holds found passwords, so no Debug.
@@ -27,13 +32,21 @@ pub(super) struct DetectedRow {
 }
 
 /// Suggestions whose target no listed row already reaches; SSH rows reach another machine, so they hide nothing.
-fn visible<'a>(d: &'a Detected, listed: &[Listed]) -> Vec<&'a Suggestion> {
+fn visible<'a>(
+    d: &'a Detected,
+    listed: &[Listed],
+    hidden: &HashSet<(PathBuf, String)>,
+) -> Vec<&'a Suggestion> {
     let saved: Vec<String> = listed
         .iter()
         .filter(|l| l.conn.ssh.is_none())
         .map(|l| detect::target_key(&l.conn, &d.root))
         .collect();
-    d.found.iter().filter(|s| !saved.contains(&s.key)).collect()
+    d.found
+        .iter()
+        .filter(|s| !saved.contains(&s.key))
+        .filter(|s| !hidden.contains(&(d.root.clone(), s.key.clone())))
+        .collect()
 }
 
 fn source_label(s: &Source) -> String {
@@ -96,13 +109,14 @@ impl Shell {
 
     pub(super) fn db_detect(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         let task_root = root.clone();
+        let containers = self.container_infos();
         let task = cx.spawn(async move |this, cx| {
             let read = root.clone();
             let found = cx
                 .background_executor()
                 .spawn(async move {
                     let env = detect::read_env(&read);
-                    detect::detect(&read, &env, &[], &[])
+                    detect::detect(&read, &env, &containers, &[])
                 })
                 .await;
             this.update(cx, |shell, cx| {
@@ -132,11 +146,28 @@ impl Shell {
         }
     }
 
+    pub(in crate::shell) fn db_containers_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(root) = self.active_root() {
+            let known = self.db.detected.as_ref().is_some_and(|d| d.root == root)
+                || self
+                    .db
+                    .detect_task
+                    .as_ref()
+                    .is_some_and(|(r, _)| *r == root);
+            if known {
+                self.db_detect(root, cx);
+            }
+        }
+    }
+
     pub(super) fn db_detected_rows(&self) -> Vec<DetectedRow> {
         let ready = self.db.loaded && self.db.load_error.is_none() && self.db_shared_ready();
         match (&self.db.detected, self.active_root()) {
             (Some(d), Some(root)) if ready && d.root == root => {
-                visible(d, &self.db_listed()).into_iter().map(row).collect()
+                visible(d, &self.db_listed(), &self.db.hidden_detected)
+                    .into_iter()
+                    .map(row)
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -171,6 +202,52 @@ impl Shell {
         }
     }
 
+    pub(super) fn db_can_look_in_docker(&self) -> bool {
+        self.active_root().is_some() && !self.containers_started()
+    }
+
+    pub(super) fn render_look_in_docker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme().clone();
+        div()
+            .id("db-look-docker")
+            .w_full()
+            .h(t.ui(ROW_HEIGHT))
+            .pl(px(t.ui_scale * 12.))
+            .pr(t.space(Space::Md))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .text_size(t.typography.caption)
+            .text_color(t.color.content_muted)
+            .hover(|s| s.bg(t.color.surface_hover))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.containers_start(cx)))
+            .child("Look in Docker")
+            .into_any_element()
+    }
+
+    fn open_detected_menu(
+        &mut self,
+        key: String,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.active_root() else {
+            return;
+        };
+        let items = vec![
+            shell_item("Add Connection…", cx, {
+                let key = key.clone();
+                move |this, window, cx| this.db_open_detected(&key, window, cx)
+            }),
+            shell_item("Hide", cx, move |this, _, cx| {
+                this.db.hidden_detected.insert((root.clone(), key.clone()));
+                cx.notify();
+            }),
+        ];
+        self.open_context_menu(event.position, items, window, cx);
+    }
+
     pub(super) fn render_detected(
         &self,
         rows: Vec<DetectedRow>,
@@ -186,37 +263,58 @@ impl Shell {
             .font_weight(FontWeight::MEDIUM)
             .text_color(t.color.content_secondary)
             .child("Detected");
-        let items = rows.into_iter().map(|row| {
-            let key = row.key.clone();
-            let tip = row.tip.clone();
-            div()
-                .id(gpui::ElementId::Name(format!("db-detected:{key}").into()))
-                .w_full()
-                .h(t.ui(ROW_HEIGHT))
-                .pl(px(t.ui_scale * 12.))
-                .pr(t.space(Space::Md))
-                .flex()
-                .items_center()
-                .gap(t.space(Space::Sm))
-                .cursor_pointer()
-                .text_size(t.typography.caption)
-                .text_color(t.color.content_muted)
-                .hover(|s| s.bg(t.color.surface_hover))
-                .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.db_open_detected(&key, window, cx);
-                }))
-                .child(div().min_w_0().flex_1().ellipsis().child(row.name))
-                .child(div().flex_none().child(engine_label(row.engine)))
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w(gpui::relative(0.45))
-                        .ellipsis()
-                        .child(row.source),
-                )
-        });
-        div().child(header).children(items).into_any_element()
+        let header = (!rows.is_empty()).then_some(header);
+        let items = rows
+            .into_iter()
+            .map(|row| {
+                let key = row.key.clone();
+                let tip = row.tip.clone();
+                div()
+                    .id(gpui::ElementId::Name(format!("db-detected:{key}").into()))
+                    .w_full()
+                    .h(t.ui(ROW_HEIGHT))
+                    .pl(px(t.ui_scale * 12.))
+                    .pr(t.space(Space::Md))
+                    .flex()
+                    .items_center()
+                    .gap(t.space(Space::Sm))
+                    .cursor_pointer()
+                    .text_size(t.typography.caption)
+                    .text_color(t.color.content_muted)
+                    .hover(|s| s.bg(t.color.surface_hover))
+                    .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let key = key.clone();
+                            move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_detected_menu(key.clone(), event, window, cx);
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.db_open_detected(&key, window, cx);
+                    }))
+                    .child(div().min_w_0().flex_1().ellipsis().child(row.name))
+                    .child(div().flex_none().child(engine_label(row.engine)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(gpui::relative(0.45))
+                            .ellipsis()
+                            .child(row.source),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let look = self
+            .db_can_look_in_docker()
+            .then(|| self.render_look_in_docker(cx));
+        div()
+            .children(header)
+            .children(items)
+            .children(look)
+            .into_any_element()
     }
 }
 
@@ -249,16 +347,16 @@ mod tests {
     #[test]
     fn saved_target_hides_a_suggestion() {
         let d = found("DATABASE_URL=postgres://me@127.0.0.1/app\n");
-        assert_eq!(visible(&d, &[]).len(), 1);
+        assert_eq!(visible(&d, &[], &HashSet::new()).len(), 1);
         let saved = listed("postgres://me@localhost:5432/app", Origin::Global);
-        assert!(visible(&d, &[saved]).is_empty());
+        assert!(visible(&d, &[saved], &HashSet::new()).is_empty());
     }
 
     #[test]
     fn shared_row_hides_a_suggestion() {
         let d = found("DATABASE_URL=postgres://me@127.0.0.1/app\n");
         let saved = listed("postgres://me@localhost/app", Origin::Project);
-        assert!(visible(&d, &[saved]).is_empty());
+        assert!(visible(&d, &[saved], &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -271,14 +369,25 @@ mod tests {
             user: String::new(),
             identity_file: None,
         });
-        assert_eq!(visible(&d, &[saved]).len(), 1);
+        assert_eq!(visible(&d, &[saved], &HashSet::new()).len(), 1);
     }
 
     #[test]
     fn other_user_is_still_suggested() {
         let d = found("DATABASE_URL=postgres://me@127.0.0.1/app\n");
         let saved = listed("postgres://admin@localhost/app", Origin::Global);
-        assert_eq!(visible(&d, &[saved]).len(), 1);
+        assert_eq!(visible(&d, &[saved], &HashSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn hidden_key_is_per_root() {
+        let d = found("DATABASE_URL=postgres://me@127.0.0.1/app\n");
+        let key = d.found[0].key.clone();
+        let mut hidden = HashSet::new();
+        hidden.insert((PathBuf::from("/other"), key.clone()));
+        assert_eq!(visible(&d, &[], &hidden).len(), 1);
+        hidden.insert((PathBuf::from(ROOT), key));
+        assert!(visible(&d, &[], &hidden).is_empty());
     }
 
     #[test]

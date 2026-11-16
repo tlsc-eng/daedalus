@@ -90,6 +90,7 @@ pub(super) struct DbState {
     shared_task: Option<(PathBuf, Task<()>)>,
     detected: Option<detected::Detected>,
     detect_task: Option<(PathBuf, Task<()>)>,
+    hidden_detected: HashSet<(PathBuf, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -554,6 +555,7 @@ impl Shell {
         self.db.load_error = None;
         self.db.load_task = None;
         if let Some(root) = self.active_root() {
+            self.db.hidden_detected.retain(|(r, _)| *r != root);
             self.db_detect(root.clone(), cx);
             self.db_load_shared(root, cx);
         }

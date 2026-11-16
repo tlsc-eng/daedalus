@@ -294,14 +294,22 @@ impl Shell {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.db_open_sheet(SheetMode::New, window, cx)
                     }));
-                empty_state(
-                    "No databases",
-                    "Add a connection here, or edit databases.json.",
-                    Some(new),
-                    cx,
-                )
-                .p(t.space(Space::Lg))
-                .into_any_element()
+                let look = self
+                    .db_can_look_in_docker()
+                    .then(|| self.render_look_in_docker(cx));
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .p(t.space(Space::Lg))
+                    .child(empty_state(
+                        "No databases",
+                        "Add a connection here, or edit databases.json.",
+                        Some(new),
+                        cx,
+                    ))
+                    .children(look)
+                    .into_any_element()
             } else {
                 let delay = t.motion.indicator_delay;
                 let rows = rows(&listed, &self.db.meta, &self.db.expanded, delay);
@@ -322,7 +330,7 @@ impl Shell {
                             false => el,
                         }
                     }))
-                    .when(!detected.is_empty(), |el| {
+                    .when(!detected.is_empty() || self.db_can_look_in_docker(), |el| {
                         el.child(self.render_detected(detected, cx))
                     })
                     .into_any_element()
