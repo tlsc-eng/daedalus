@@ -670,7 +670,9 @@ impl DbTableView {
         if self.submitting.is_some() || self.preview.is_some() || self.export.is_some() {
             return;
         }
-        self.grid.update(cx, |g, cx| g.cancel_edit(window, cx));
+        if let Some((row, col, text)) = self.grid.update(cx, |g, cx| g.take_edit(window, cx)) {
+            self.set_value(row, col, Some(text), cx);
+        }
         let n = self.edits.count();
         if n == 0 {
             return self.run_discarded(then, cx);

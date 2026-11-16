@@ -360,21 +360,24 @@ impl DataGrid {
 
     /// Closes the editor and emits `Edited` if the text changed.
     pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editing) = self.editing.take() else {
-            return;
-        };
-        let text = editing.input.read(cx).text().to_string();
-        if text != editing.initial {
-            cx.emit(GridEvent::Edited {
-                row: editing.row,
-                col: editing.col,
-                text,
-            });
+        if let Some((row, col, text)) = self.take_edit(window, cx) {
+            cx.emit(GridEvent::Edited { row, col, text });
         }
+    }
+
+    /// Closes the editor and returns the edited cell when the text changed, without an event.
+    pub fn take_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(usize, usize, String)> {
+        let editing = self.editing.take()?;
+        let text = editing.input.read(cx).text().to_string();
         if editing.input.focus_handle(cx).is_focused(window) {
             window.focus(&self.focus);
         }
         cx.notify();
+        (text != editing.initial).then_some((editing.row, editing.col, text))
     }
 
     /// Closes the editor without an event.
