@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use daedalus_containers::{Container, Handle, Stats, Update};
+use daedalus_db::detect::ContainerInfo;
 use daedalus_ui::{ActiveTheme, ButtonKind, Ellipsis};
 use gpui::{
     AnyElement, Context, FontWeight, ListSizingBehavior, ScrollStrategy, Task,
@@ -25,6 +26,18 @@ pub(super) struct ContainersState {
     _updates: Option<Task<()>>,
 }
 
+fn info(c: &Container) -> ContainerInfo {
+    ContainerInfo {
+        name: c.name.clone(),
+        image: c.image.clone(),
+        state: c.state.clone(),
+        ports: c.ports.clone(),
+        project: c.project.clone(),
+        service: c.service.clone(),
+        working_dir: c.working_dir.clone(),
+    }
+}
+
 fn megabytes(bytes: u64) -> String {
     let mb = bytes as f64 / (1024. * 1024.);
     if mb >= 1024. {
@@ -37,21 +50,36 @@ fn megabytes(bytes: u64) -> String {
 impl Shell {
     /// Starts watching the engine the first time the tab is shown; polls stats only while visible.
     pub(super) fn containers_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        if visible && self.containers.handle.is_none() {
-            let (tx, rx) = async_channel::unbounded();
-            self.containers.handle = Some(daedalus_containers::start(tx));
-            self.containers._updates = Some(cx.spawn(async move |this, cx| {
-                while let Ok(update) = rx.recv().await {
-                    if this
-                        .update(cx, |this, cx| this.container_update(update, cx))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }));
+        if visible {
+            self.containers_start(cx);
         }
         self.sync_container_watch(visible);
+    }
+
+    pub(super) fn containers_started(&self) -> bool {
+        self.containers.handle.is_some()
+    }
+
+    pub(super) fn containers_start(&mut self, cx: &mut Context<Self>) {
+        if self.containers.handle.is_some() {
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded();
+        self.containers.handle = Some(daedalus_containers::start(tx));
+        self.containers._updates = Some(cx.spawn(async move |this, cx| {
+            while let Ok(update) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.container_update(update, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+    }
+
+    pub(super) fn container_infos(&self) -> Vec<ContainerInfo> {
+        self.containers.list.iter().map(info).collect()
     }
 
     fn sync_container_watch(&mut self, visible: bool) {
@@ -81,15 +109,23 @@ impl Shell {
         match update {
             Update::Unreachable(tried) => {
                 state.unreachable = Some(tried);
+                let had = !state.list.is_empty();
                 state.list.clear();
                 state.loaded = true;
+                if had {
+                    self.db_containers_changed(cx);
+                }
             }
             Update::Containers(list) => {
                 state.unreachable = None;
+                let changed = list.iter().map(info).ne(state.list.iter().map(info));
                 state.list = list;
                 state.loaded = true;
                 let visible = self.drawer == Some(super::drawer::DrawerTab::Containers);
                 self.sync_container_watch(visible);
+                if changed {
+                    self.db_containers_changed(cx);
+                }
             }
             Update::Stats(stats) => state.stats = stats,
             Update::Logs { id, lines } => {
@@ -290,5 +326,37 @@ impl Shell {
             .text_size(t.typography.body)
             .children(rows)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_info_maps_every_field() {
+        let c = Container {
+            id: "abc".into(),
+            name: "db-1".into(),
+            image: "postgres:16".into(),
+            state: "running".into(),
+            status: "Up 3 hours".into(),
+            ports: vec!["5432:5432".into()],
+            project: Some("shop".into()),
+            service: Some("db".into()),
+            working_dir: Some("/proj".into()),
+        };
+        assert_eq!(
+            info(&c),
+            ContainerInfo {
+                name: "db-1".into(),
+                image: "postgres:16".into(),
+                state: "running".into(),
+                ports: vec!["5432:5432".into()],
+                project: Some("shop".into()),
+                service: Some("db".into()),
+                working_dir: Some("/proj".into()),
+            }
+        );
     }
 }

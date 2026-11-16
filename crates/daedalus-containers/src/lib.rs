@@ -33,6 +33,7 @@ pub struct Container {
     /// Docker Compose project, which is how containers are grouped.
     pub project: Option<String>,
     pub service: Option<String>,
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -137,6 +138,9 @@ fn summarize(c: ContainerSummary) -> Container {
         ports,
         project: labels.get("com.docker.compose.project").cloned(),
         service: labels.get("com.docker.compose.service").cloned(),
+        working_dir: labels
+            .get("com.docker.compose.project.working_dir")
+            .map(PathBuf::from),
     }
 }
 
