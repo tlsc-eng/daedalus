@@ -393,6 +393,7 @@ impl DbTableView {
             page: PAGE_ROWS + 1,
             timeout: None,
             mode: run_mode(info.read_only),
+            capped: true,
         });
         self.busy = Some(Busy::start());
         self.start_spin(cx);

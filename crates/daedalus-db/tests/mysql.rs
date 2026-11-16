@@ -70,6 +70,7 @@ impl Rig {
             page,
             timeout,
             mode,
+            capped: true,
         });
     }
 }

@@ -114,6 +114,7 @@ impl Batch {
             page: PAGE,
             timeout: None,
             mode,
+            capped: true,
         }));
         self.current = Some(Current {
             run,
