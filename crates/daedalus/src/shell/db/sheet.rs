@@ -243,6 +243,34 @@ fn password_change(base: Option<&Connection>, conn: &Connection, typed: &str) ->
     }
 }
 
+/// A connection found in project files, offered to a New sheet.
+pub(in crate::shell) struct Found {
+    pub conn: Connection,
+    pub password: Option<Secret>,
+    pub note: String,
+    pub password_note: String,
+}
+
+/// The password a Save or Test uses: what was typed, else a found one the user chose for its own target.
+fn effective_password(
+    typed: &str,
+    found: Option<&Found>,
+    use_found: bool,
+    built: &Connection,
+) -> String {
+    if !typed.is_empty() {
+        return typed.to_owned();
+    }
+    match found {
+        Some(f) if use_found && same_target(&f.conn, built) => f
+            .password
+            .as_ref()
+            .map(|p| p.expose().to_owned())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 enum Status {
     None,
     Testing(Busy),
@@ -270,6 +298,8 @@ pub(in crate::shell) struct DbSheet {
     production: bool,
     claude: bool,
     only_here: bool,
+    found: Option<Found>,
+    use_found: bool,
     status: Status,
     status_timer: Option<Task<()>>,
     new_id: String,
@@ -335,6 +365,8 @@ impl DbSheet {
             production: false,
             claude: false,
             only_here: false,
+            found: None,
+            use_found: false,
             status: Status::None,
             status_timer: None,
             new_id: daedalus_db::new_id().unwrap_or_default(),
@@ -379,6 +411,25 @@ impl DbSheet {
             .root
             .as_ref()
             .is_some_and(|r| conn.projects.contains(r));
+    }
+
+    pub(in crate::shell) fn prefill(&mut self, found: Found, cx: &mut Context<Self>) {
+        self.fill(&found.conn, cx);
+        let name = caption_field(&found.conn.name);
+        self.name.update(cx, |i, cx| i.set_text(&name, cx));
+        self.keychain = true;
+        self.found = Some(found);
+        self.use_found = false;
+        cx.notify();
+    }
+
+    fn password_for(&self, built: &Connection, cx: &App) -> String {
+        effective_password(
+            &self.typed_password(cx),
+            self.found.as_ref(),
+            self.use_found,
+            built,
+        )
     }
 
     fn fill_from_url(&mut self, conn: &Connection, cx: &mut Context<Self>) {
@@ -444,7 +495,7 @@ impl DbSheet {
                 return;
             }
         };
-        let password = password_change(self.base.as_ref(), &conn, &self.typed_password(cx));
+        let password = password_change(self.base.as_ref(), &conn, &self.password_for(&conn, cx));
         cx.emit(DbSheetEvent::Save {
             conn: Box::new(conn),
             origin: self.target,
@@ -476,7 +527,7 @@ impl DbSheet {
                 return;
             }
         };
-        let typed = self.typed_password(cx);
+        let typed = self.password_for(&conn, cx);
         let typed = (!typed.is_empty()).then(|| Secret::new(typed));
         let editing = match &self.mode {
             SheetMode::Edit(listed) => Some(listed),
@@ -685,13 +736,19 @@ pub(super) fn prompt_detail(listed: &Listed) -> Option<String> {
     Some(out)
 }
 
-/// Makes a value from a shared file safe to show: no control characters, bounded length.
-fn caption_field(s: &str) -> String {
+/// Makes a value from a repo file safe to show: no control, bidi or invisible characters, bounded length.
+pub(super) fn caption_field(s: &str) -> String {
     const MAX: usize = 64;
     let mut out: String = s
         .chars()
         .take(MAX)
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            let hidden = matches!(
+                c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+            );
+            if c.is_control() || hidden { '\u{FFFD}' } else { c }
+        })
         .collect();
     if s.chars().nth(MAX).is_some() {
         out.push('…');
@@ -890,6 +947,12 @@ impl DbSheet {
                     .text_color(t.color.content)
                     .child(title),
             )
+            .children(self.found.as_ref().map(|f| {
+                div()
+                    .text_size(t.typography.caption)
+                    .text_color(t.color.content_muted)
+                    .child(f.note.clone())
+            }))
             .children((!editing && self.root.is_some()).then(|| {
                 labelled(
                     "Save to",
@@ -966,6 +1029,45 @@ impl DbSheet {
                 .child(labelled("Database", boxed(&self.database, t), t))
                 .child(labelled("User", boxed(&self.user, t), t))
                 .child(labelled("Password", boxed(&self.password, t), t))
+                .children(
+                    self.found
+                        .as_ref()
+                        .filter(|f| f.password.is_some())
+                        .map(|f| {
+                            div()
+                                .text_size(t.typography.caption)
+                                .text_color(t.color.content_muted)
+                                .child(f.password_note.clone())
+                        }),
+                )
+                .children(
+                    self.found
+                        .as_ref()
+                        .filter(|f| f.password.is_some())
+                        .map(|_| {
+                            checkbox(
+                                "db-use-found",
+                                "Use it".into(),
+                                self.use_found,
+                                t,
+                                |this, _| this.use_found = !this.use_found,
+                                cx,
+                            )
+                        }),
+                )
+                .children(
+                    self.found
+                        .as_ref()
+                        .filter(|f| self.use_found && f.password.is_some())
+                        .zip(built.as_ref().ok())
+                        .filter(|(f, conn)| !same_target(&f.conn, conn))
+                        .map(|_| {
+                            div()
+                                .text_size(t.typography.caption)
+                                .text_color(t.color.warning)
+                                .child("The target changed, so the found password is not used.")
+                        }),
+                )
                 .child(checkbox(
                     "db-keychain",
                     "Save in Keychain".into(),
@@ -1440,6 +1542,49 @@ mod tests {
         assert_eq!(cut.chars().count(), 65);
         assert!(cut.ends_with('…'));
         assert_eq!(caption_field(&"y".repeat(64)).chars().count(), 64);
+        assert_eq!(caption_field("a\u{202E}b\u{200B}c"), "a\u{FFFD}b\u{FFFD}c");
+    }
+
+    fn found_with(password: &str) -> Found {
+        Found {
+            conn: base(),
+            password: Some(Secret::new(password)),
+            note: String::new(),
+            password_note: String::new(),
+        }
+    }
+
+    #[test]
+    fn typed_password_wins_over_a_found_one() {
+        let found = found_with("from-env");
+        let out = effective_password("typed", Some(&found), true, &base());
+        assert_eq!(out, "typed");
+    }
+
+    #[test]
+    fn found_password_needs_the_tick() {
+        let found = found_with("from-env");
+        assert_eq!(effective_password("", Some(&found), false, &base()), "");
+    }
+
+    #[test]
+    fn found_password_is_dropped_when_the_target_changes() {
+        let found = found_with("from-env");
+        let mut other_host = base();
+        other_host.host = "elsewhere.example".into();
+        assert_eq!(effective_password("", Some(&found), true, &other_host), "");
+        let mut other_tls = base();
+        other_tls.tls = Tls::Require;
+        assert_eq!(effective_password("", Some(&found), true, &other_tls), "");
+    }
+
+    #[test]
+    fn found_password_is_used_for_its_own_target() {
+        let found = found_with("from-env");
+        assert_eq!(
+            effective_password("", Some(&found), true, &base()),
+            "from-env"
+        );
     }
 
     #[test]

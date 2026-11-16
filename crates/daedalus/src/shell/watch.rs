@@ -25,6 +25,14 @@ pub(super) struct WatchState {
     _git_task: Task<()>,
 }
 
+fn names_env_file(root: &Path, path: &Path) -> bool {
+    path.parent() == Some(root)
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| daedalus_db::detect::ENV_FILES.contains(&n))
+}
+
 impl Shell {
     pub(super) fn start_watching(window: &mut Window, cx: &mut Context<Self>) -> WatchState {
         let (changes, batches) = async_channel::unbounded::<(PathBuf, Vec<PathBuf>)>();
@@ -228,6 +236,9 @@ impl Shell {
         if everything || paths.iter().any(|p| in_root(p).starts_with(&shared_dir)) {
             self.db_shared_changed(root, cx);
         }
+        if everything || paths.iter().any(|p| names_env_file(root, &in_root(p))) {
+            self.db_env_changed(root, cx);
+        }
         cx.notify();
     }
 }
@@ -347,5 +358,20 @@ mod tests {
         assert!(!affects("/p/target"));
         assert!(affects("/p/notes/new.md"));
         assert!(affects("/p/src/main.rs"));
+    }
+
+    #[test]
+    fn names_env_file_matches_only_known_root_files() {
+        let root = Path::new("/p");
+        assert!(names_env_file(root, Path::new("/p/.env")));
+        assert!(names_env_file(root, Path::new("/p/.env.local")));
+        for other in [
+            "/p/sub/.env",
+            "/p/.env.example",
+            "/p/.env.production",
+            "/p/.envrc",
+        ] {
+            assert!(!names_env_file(root, Path::new(other)), "{other}");
+        }
     }
 }
