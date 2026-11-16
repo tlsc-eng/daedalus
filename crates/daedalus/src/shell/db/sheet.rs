@@ -290,6 +290,7 @@ fn target_fields(f: Fields, target: Origin) -> Fields {
         Origin::Project => Fields {
             claude: false,
             only_here: false,
+            ssh_key: String::new(),
             ..f
         },
     }
@@ -1249,14 +1250,16 @@ impl DbSheet {
                             ))),
                     )
                     .child(labelled("SSH user", boxed(&self.ssh_user, t), t))
-                    .child(labelled("Identity file", boxed(&self.ssh_key, t), t))
+                    .when(self.target != Origin::Project, |el| {
+                        el.child(labelled("Identity file", boxed(&self.ssh_key, t), t))
+                    })
                     .child(muted_caption(
                         "Host and port above are as the SSH server sees them. Keys come from ssh-agent or ~/.ssh/config.",
                         t,
                     ))
                     .when(self.target == Origin::Project, |el| {
                         el.child(muted_caption(
-                            "Identity file stays on this machine; it is not written to the project file.",
+                            "Identity files are not saved in the project file; set IdentityFile in ~/.ssh/config or use a personal copy.",
                             t,
                         ))
                     })
@@ -1926,6 +1929,13 @@ mod tests {
         let out = target_fields(f, Origin::Project);
         let conn = build(&out, None, Some(Path::new("/a"))).unwrap();
         assert!(!conn.claude && conn.projects.is_empty());
+    }
+
+    #[test]
+    fn project_target_drops_the_identity_file() {
+        let out = target_fields(ssh_fields(), Origin::Project);
+        let conn = build(&out, None, Some(Path::new("/a"))).unwrap();
+        assert_eq!(conn.ssh.unwrap().identity_file, None);
     }
 
     #[test]
