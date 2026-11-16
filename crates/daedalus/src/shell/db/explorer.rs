@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use daedalus_db::catalog::TableKind;
@@ -11,9 +13,10 @@ use daedalus_ui::{
 use daedalus_workspace::FolderColor;
 use gpui::{
     AnyElement, ClickEvent, ClipboardItem, Context, FontWeight, MouseButton, MouseDownEvent,
-    Window, div, prelude::*, px,
+    Window, div, prelude::*, px, uniform_list,
 };
 
+use super::detected::DetectedRow;
 use super::sheet::SheetMode;
 use super::{Meta, NodeKey, Phase, SharedFile, conn_key};
 use crate::shell::Shell;
@@ -74,6 +77,31 @@ pub(super) enum Row {
 pub(super) enum Tone {
     Muted,
     Danger,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Line {
+    Tree(Row, f32),
+    DetectedHeader,
+    Detected(DetectedRow),
+    LookInDocker,
+}
+
+/// The explorer's flat list: the tree with each row's fade, then the Detected group.
+fn lines(rows: Vec<Row>, fades: Vec<f32>, detected: Vec<DetectedRow>, look: bool) -> Vec<Line> {
+    let mut out: Vec<Line> = rows
+        .into_iter()
+        .zip(fades)
+        .map(|(row, fade)| Line::Tree(row, fade))
+        .collect();
+    if !detected.is_empty() {
+        out.push(Line::DetectedHeader);
+        out.extend(detected.into_iter().map(Line::Detected));
+    }
+    if look {
+        out.push(Line::LookInDocker);
+    }
+    out
 }
 
 /// Each row's opacity: the smallest chevron turn among its ancestors, so a whole subtree fades in together.
@@ -318,27 +346,43 @@ impl Shell {
                 let delay = t.motion.indicator_delay;
                 let rows = rows(&listed, &self.db.meta, &self.db.expanded, delay);
                 let fade = fades(&rows, |n| self.db.turn_of(n, t.motion.fast));
-                div()
-                    .id("data-explorer-rows")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().zip(fade).map(|(row, fade)| {
-                        let el = match row {
-                            Row::Conn { .. } => self.render_conn_row(row, &listed, cx),
-                            Row::Error { key, message } => self.render_error_row(key, message, cx),
-                            row => self.render_node_row(row, cx),
-                        };
-                        match fade < 1. {
-                            true => div().opacity(fade).child(el).into_any_element(),
-                            false => el,
-                        }
-                    }))
-                    .when(
-                        !detected.is_empty() || (self.db.loaded && self.db_can_look_in_docker()),
-                        |el| el.child(self.render_detected(detected, cx)),
-                    )
-                    .into_any_element()
+                let look = self.db.loaded && self.db_can_look_in_docker();
+                let lines = Rc::new(lines(rows, fade, detected, look));
+                let listed = Rc::new(listed);
+                uniform_list(
+                    "data-explorer-rows",
+                    lines.len(),
+                    cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        range
+                            .map(|i| match lines[i].clone() {
+                                Line::Tree(row, fade) => {
+                                    let el = match row {
+                                        Row::Conn { .. } => this.render_conn_row(row, &listed, cx),
+                                        Row::Error { key, message } => {
+                                            this.render_error_row(key, message, cx)
+                                        }
+                                        row => this.render_node_row(row, cx),
+                                    };
+                                    match fade < 1. {
+                                        true => div()
+                                            .w_full()
+                                            .opacity(fade)
+                                            .child(el)
+                                            .into_any_element(),
+                                        false => el,
+                                    }
+                                }
+                                Line::DetectedHeader => this.render_detected_header(cx),
+                                Line::Detected(row) => this.render_detected_row(row, cx),
+                                Line::LookInDocker => this.render_look_in_docker(false, cx),
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(self.db.scroll.clone())
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
             };
             div()
                 .flex_1()
@@ -1166,5 +1210,55 @@ mod tests {
         assert_eq!(lines.len(), 9);
         assert_eq!(lines[0].chars().count(), 200);
         assert_eq!(lines[8], "…and 2 more");
+    }
+
+    fn err(key: &str) -> Row {
+        Row::Error {
+            key: key.into(),
+            message: "x".into(),
+        }
+    }
+
+    fn found(key: &str) -> DetectedRow {
+        DetectedRow {
+            key: key.into(),
+            name: key.into(),
+            engine: Engine::Postgres,
+            source: ".env".into(),
+            tip: String::new(),
+        }
+    }
+
+    #[test]
+    fn lines_put_the_detected_group_after_the_tree() {
+        let got = lines(
+            vec![err("a"), err("b")],
+            vec![1., 0.5],
+            vec![found("d0"), found("d1")],
+            true,
+        );
+        assert_eq!(
+            got,
+            vec![
+                Line::Tree(err("a"), 1.),
+                Line::Tree(err("b"), 0.5),
+                Line::DetectedHeader,
+                Line::Detected(found("d0")),
+                Line::Detected(found("d1")),
+                Line::LookInDocker,
+            ]
+        );
+    }
+
+    #[test]
+    fn lines_have_no_detected_header_without_suggestions() {
+        let got = lines(vec![err("a")], vec![1.], vec![], true);
+        assert_eq!(got, vec![Line::Tree(err("a"), 1.), Line::LookInDocker]);
+    }
+
+    #[test]
+    fn lines_are_only_the_tree_when_nothing_is_detected_and_docker_is_running() {
+        let got = lines(vec![err("a")], vec![1.], vec![], false);
+        assert_eq!(got, vec![Line::Tree(err("a"), 1.)]);
     }
 }

@@ -253,13 +253,9 @@ impl Shell {
         self.open_context_menu(event.position, items, window, cx);
     }
 
-    pub(super) fn render_detected(
-        &self,
-        rows: Vec<DetectedRow>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn render_detected_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
-        let header = div()
+        div()
             .flex()
             .items_center()
             .px(t.space(Space::Lg))
@@ -267,58 +263,54 @@ impl Shell {
             .text_size(t.typography.caption)
             .font_weight(FontWeight::MEDIUM)
             .text_color(t.color.content_secondary)
-            .child("Detected");
-        let header = (!rows.is_empty()).then_some(header);
-        let items = rows
-            .into_iter()
-            .map(|row| {
-                let key = row.key.clone();
-                let tip = row.tip.clone();
-                div()
-                    .id(gpui::ElementId::Name(format!("db-detected:{key}").into()))
-                    .w_full()
-                    .h(t.ui(ROW_HEIGHT))
-                    .pl(px(t.ui_scale * 12.))
-                    .pr(t.space(Space::Md))
-                    .flex()
-                    .items_center()
-                    .gap(t.space(Space::Sm))
-                    .cursor_pointer()
-                    .text_size(t.typography.caption)
-                    .text_color(t.color.content_muted)
-                    .hover(|s| s.bg(t.color.surface_hover))
-                    .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener({
-                            let key = key.clone();
-                            move |this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.open_detected_menu(key.clone(), event, window, cx);
-                            }
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.db_open_detected(&key, window, cx);
-                    }))
-                    .child(div().min_w_0().flex_1().ellipsis().child(row.name))
-                    .child(div().flex_none().child(engine_label(row.engine)))
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(gpui::relative(0.45))
-                            .ellipsis()
-                            .child(row.source),
-                    )
-            })
-            .collect::<Vec<_>>();
-        let look = self
-            .db_can_look_in_docker()
-            .then(|| self.render_look_in_docker(false, cx));
+            .child("Detected")
+            .into_any_element()
+    }
+
+    pub(super) fn render_detected_row(
+        &self,
+        row: DetectedRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme().clone();
+        let key = row.key.clone();
+        let tip = row.tip.clone();
         div()
-            .children(header)
-            .children(items)
-            .children(look)
+            .id(gpui::ElementId::Name(format!("db-detected:{key}").into()))
+            .w_full()
+            .h(t.ui(ROW_HEIGHT))
+            .pl(px(t.ui_scale * 12.))
+            .pr(t.space(Space::Md))
+            .flex()
+            .items_center()
+            .gap(t.space(Space::Sm))
+            .cursor_pointer()
+            .text_size(t.typography.caption)
+            .text_color(t.color.content_muted)
+            .hover(|s| s.bg(t.color.surface_hover))
+            .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let key = key.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_detected_menu(key.clone(), event, window, cx);
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.db_open_detected(&key, window, cx);
+            }))
+            .child(div().min_w_0().flex_1().ellipsis().child(row.name))
+            .child(div().flex_none().child(engine_label(row.engine)))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(gpui::relative(0.45))
+                    .ellipsis()
+                    .child(row.source),
+            )
             .into_any_element()
     }
 }
