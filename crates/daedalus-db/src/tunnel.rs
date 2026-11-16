@@ -65,9 +65,9 @@ pub async fn acquire(ssh: &SshTunnel, host: &str, port: u16) -> Result<Lease, St
 
 /// Kills every live tunnel now; for app quit.
 pub fn kill_all() {
-    let pids: Vec<i32> = lock(&LIVE).drain().collect();
+    let mut live = lock(&LIVE);
     let dir = pid_dir();
-    for pid in pids {
+    for pid in live.drain() {
         // SAFETY: a pid stays listed only while its child is unreaped, so the group id is still ours.
         unsafe { libc::killpg(pid, libc::SIGKILL) };
         if let Some(dir) = &dir {
@@ -224,24 +224,33 @@ fn spawn(program: &Path, extra: &[&str], key: &Key, port: u16) -> io::Result<(Pr
     };
     let (tx, rx) = oneshot::channel();
     match stderr {
-        Some(stderr) => watch(stderr, tx)?,
+        Some(stderr) => watch(stderr, port, tx)?,
         None => return Err(io::Error::other("no stderr")),
     }
     Ok((process, rx))
 }
 
 /// Owns ssh's stderr; the thread never logs or stores debug lines because they hold paths and key fingerprints.
-fn watch(stderr: ChildStderr, tx: oneshot::Sender<Result<(), String>>) -> io::Result<()> {
+fn watch(
+    stderr: ChildStderr,
+    port: u16,
+    tx: oneshot::Sender<Result<(), String>>,
+) -> io::Result<()> {
     std::thread::Builder::new()
         .name("db-tunnel".into())
         .spawn(move || {
             let mut tx = Some(tx);
             let mut last: Option<String> = None;
+            // A ProxyJump ssh shares our stderr and prints its own interactive-session line first.
+            let forwarded = format!("debug1: Local connections to 127.0.0.1:{port} forwarded");
+            let mut bound = false;
             for line in BufReader::new(stderr).split(b'\n') {
                 let Ok(bytes) = line else { break };
                 let text = String::from_utf8_lossy(&bytes);
                 let line = text.trim();
-                if line.starts_with("debug1: Entering interactive session") {
+                if line.starts_with(&forwarded) {
+                    bound = true;
+                } else if bound && line.starts_with("debug1: Entering interactive session") {
                     if let Some(tx) = tx.take() {
                         let _ = tx.send(Ok(()));
                     }
@@ -275,7 +284,8 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        lock(&LIVE).remove(&self.pid);
+        let mut live = lock(&LIVE);
+        live.remove(&self.pid);
         let mut child = lock(&self.child);
         // Only an unreaped child still owns its group id; after a reap the pid may belong to someone else.
         if matches!(child.try_wait(), Ok(None)) {
@@ -457,7 +467,7 @@ mod tests {
         }
     }
 
-    const READY: &str = "echo 'debug1: Entering interactive session.' >&2\nexec sleep 30\n";
+    const READY: &str = "while [ $# -gt 0 ]; do [ \"$1\" = -L ] && fwd=$2; shift; done\nport=${fwd#127.0.0.1:}\nport=${port%%:*}\necho \"debug1: Local connections to 127.0.0.1:$port forwarded to remote address db:5432\" >&2\necho 'debug1: Entering interactive session.' >&2\nexec sleep 30\n";
     const SECS: Duration = Duration::from_secs(10);
 
     fn lines(path: &Path) -> usize {
@@ -563,6 +573,25 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
         drop(b);
         assert!(gone(pid));
+    }
+
+    #[test]
+    fn a_jump_hosts_session_line_is_not_readiness() {
+        let (_dir, program) = script(
+            "jump",
+            "echo 'debug1: Entering interactive session.' >&2\necho 'me@h: Permission denied (publickey).' >&2\nexit 255\n",
+        );
+        let err = run(acquire_with(
+            &program,
+            &[],
+            &tunnel("t-jump"),
+            "db",
+            5432,
+            SECS,
+        ))
+        .err()
+        .unwrap();
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]
