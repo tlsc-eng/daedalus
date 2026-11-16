@@ -16,9 +16,9 @@ use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, ContextMenu, DataGrid, DotState, GridEvent, Space, StatusDot,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Pixels, Point, PromptLevel, Render, Subscription, Task, Window, div, prelude::*,
-    relative,
+    AnyElement, ClickEvent, Context, DismissEvent, Entity, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, FontWeight, Pixels, Point, PromptLevel, Render, Subscription, Task,
+    Window, div, prelude::*, relative,
 };
 
 use super::explorer::{data_color, dot_shape, engine_label, tag};
@@ -28,10 +28,12 @@ use crate::shell::lsp::{CONFIRMED, confirm_buttons};
 use crate::shell::sidebar::folder_color;
 use batch::{Batch, Effect, Piece};
 use gate::{Gate, Target};
+use history::{HistoryEvent, HistoryPopover};
 
 mod batch;
 mod complete;
 mod gate;
+mod history;
 mod text;
 
 pub(super) use batch::grid_columns;
@@ -117,6 +119,9 @@ pub(in crate::shell) struct DbConsoleView {
     spin: Option<Task<()>>,
     export: Option<Export>,
     menu: Option<(Entity<ContextMenu>, Subscription)>,
+    history_path: Option<PathBuf>,
+    history: Option<(Entity<HistoryPopover>, Subscription)>,
+    history_closed: Option<std::time::Instant>,
     grid_sub: Option<Subscription>,
     _release: Subscription,
     _subs: Vec<Subscription>,
@@ -148,8 +153,10 @@ fn prepare(path: &Path) -> std::io::Result<()> {
 
 impl DbConsoleView {
     pub fn new(root: PathBuf, key: String, cx: &mut Context<Self>) -> Self {
+        let mut history_path = None;
         let (path, setup_error) = match daedalus_proto::data_dir() {
             Ok(dir) => {
+                history_path = Some(daedalus_db::history::path(&dir, &root, &key));
                 let path = text::console_path(&dir, &root, &key);
                 let error = prepare(&path)
                     .err()
@@ -206,6 +213,9 @@ impl DbConsoleView {
             spin: None,
             export: None,
             menu: None,
+            history_path,
+            history: None,
+            history_closed: None,
             grid_sub: None,
             _release: cx.on_release(|this, cx| {
                 this.save_text(cx);
@@ -610,10 +620,59 @@ impl DbConsoleView {
         }
     }
 
+    fn record_history(&self, pieces: &[Piece], cx: &mut Context<Self>) {
+        let Some(path) = self.history_path.clone() else {
+            return;
+        };
+        let sqls = history_sqls(pieces);
+        let at = history::now_ms();
+        cx.background_executor()
+            .spawn(async move {
+                let refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+                let _ = daedalus_db::history::append(&path, &refs, at);
+            })
+            .detach();
+    }
+
+    fn toggle_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // The outside click that just closed the popover must not reopen it through the button.
+        let just_closed = self
+            .history_closed
+            .take()
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+        if just_closed {
+            return;
+        }
+        let popover = cx.new(|cx| HistoryPopover::new(self.history_path.clone(), window, cx));
+        let sub = cx.subscribe_in(
+            &popover,
+            window,
+            |this, _, event: &HistoryEvent, window, cx| {
+                this.history = None;
+                if let HistoryEvent::Insert(sql) = event {
+                    let text = format!("{sql}\n");
+                    this.editor
+                        .update(cx, |e, cx| e.replace_text_in_range(None, &text, window, cx));
+                } else {
+                    this.history_closed = Some(std::time::Instant::now());
+                }
+                window.focus(&this.editor.focus_handle(cx));
+                cx.notify();
+            },
+        );
+        self.history = Some((popover, sub));
+        cx.notify();
+    }
+
     fn begin(&mut self, pieces: Vec<Piece>, cx: &mut Context<Self>) {
         let (Some(session), Some(info)) = (self.session, self.info.clone()) else {
             return;
         };
+        self.record_history(&pieces, cx);
         self.error = None;
         self.editor
             .update(cx, |e, cx| e.set_markers(Vec::new(), cx));
@@ -652,7 +711,12 @@ impl Render for DbConsoleView {
             )
             .child(results)
             .children(self.menu.as_ref().map(|(menu, _)| menu.clone()))
+            .children(self.history.as_ref().map(|(popover, _)| popover.clone()))
     }
+}
+
+fn history_sqls(pieces: &[Piece]) -> Vec<String> {
+    pieces.iter().map(|p| p.sql.clone()).collect()
 }
 
 fn run_mode(read_only: bool, manual: bool) -> RunMode {
@@ -861,6 +925,11 @@ impl DbConsoleView {
             .child(
                 Button::new("db-console-run-all", "Run All", ButtonKind::Secondary).on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.run(true, window, cx)),
+                ),
+            )
+            .child(
+                Button::new("db-console-history", "History", ButtonKind::Ghost).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_history(window, cx)),
                 ),
             )
             .children(mode)
@@ -1162,6 +1231,17 @@ impl DbConsoleView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_records_each_piece_sql() {
+        let piece = |sql: &str| Piece {
+            sql: sql.into(),
+            start: 0,
+            kind: classify::Kind::Read,
+        };
+        let pieces = [piece("select 1"), piece("select 2")];
+        assert_eq!(history_sqls(&pieces), ["select 1", "select 2"]);
+    }
 
     #[test]
     fn run_mode_prefers_read_only() {
