@@ -94,8 +94,8 @@ pub(crate) fn init(cx: &mut App) {
 pub enum GridEvent {
     /// The viewport is near the last loaded row and more rows exist.
     FetchMore,
-    /// The user asked to edit a cell; only emitted while the grid is editable.
-    EditRequested { row: usize, col: usize },
+    /// The user asked to edit a cell; `panel` asks for the multi-line editor in the value panel.
+    EditRequested { row: usize, col: usize, panel: bool },
     /// The in-cell editor closed with text that differs from where it started.
     Edited {
         row: usize,
@@ -114,6 +114,7 @@ struct Editing {
     row: usize,
     col: usize,
     initial: String,
+    panel: bool,
     input: Entity<TextInput>,
     _subs: Vec<Subscription>,
 }
@@ -282,15 +283,50 @@ impl DataGrid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_editor(row, col, initial, null, false, window, cx);
+    }
+
+    /// Opens a multi-line editor for the cell in the value panel; `null` shows a NULL placeholder over empty text.
+    pub fn begin_value_edit(
+        &mut self,
+        row: usize,
+        col: usize,
+        initial: String,
+        null: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_editor(row, col, initial, null, true, window, cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_editor(
+        &mut self,
+        row: usize,
+        col: usize,
+        initial: String,
+        null: bool,
+        panel: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.model.has_cell(row, col) {
             return;
         }
         self.commit_edit(window, cx);
         self.reveal(CellPos { row, col });
-        let input = cx.new(|cx| TextInput::new(if null { "NULL" } else { "" }, cx));
+        if panel && self.model.active != Some(CellPos { row, col }) {
+            self.model.select(CellPos { row, col }, false);
+        }
+        let input = cx.new(|cx| {
+            let input = TextInput::new(if null { "NULL" } else { "" }, cx);
+            if panel { input.fill_height() } else { input }
+        });
         input.update(cx, |i, cx| {
             i.set_text(initial.clone(), cx);
-            i.select_all(cx);
+            if !panel {
+                i.select_all(cx);
+            }
         });
         let handle = input.focus_handle(cx);
         let subs = vec![
@@ -298,7 +334,7 @@ impl DataGrid {
                 &input,
                 window,
                 |this, _, e: &InputEvent, window, cx| match e {
-                    InputEvent::Submit => this.commit_edit(window, cx),
+                    InputEvent::Submit | InputEvent::SubmitBeside => this.commit_edit(window, cx),
                     InputEvent::Cancel => this.cancel_edit(window, cx),
                     _ => {}
                 },
@@ -311,9 +347,13 @@ impl DataGrid {
             row,
             col,
             initial,
+            panel,
             input,
             _subs: subs,
         });
+        if panel {
+            self.show_value(cx);
+        }
         window.focus(&handle);
         cx.notify();
     }
@@ -347,11 +387,12 @@ impl DataGrid {
         }
     }
 
-    fn request_edit(&mut self, pos: CellPos, cx: &mut Context<Self>) {
+    fn request_edit(&mut self, pos: CellPos, panel: bool, cx: &mut Context<Self>) {
         if self.editable && self.editing.is_none() {
             cx.emit(GridEvent::EditRequested {
                 row: pos.row,
                 col: pos.col,
+                panel,
             });
         } else if !self.editable && self.editing.is_none() {
             self.show_value(cx);
@@ -367,7 +408,10 @@ impl DataGrid {
         cx.notify();
     }
 
-    fn close_value(&mut self, cx: &mut Context<Self>) {
+    fn close_value(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.as_ref().is_some_and(|e| e.panel) {
+            self.commit_edit(window, cx);
+        }
         if self.value_open {
             self.value_open = false;
             cx.notify();
@@ -416,6 +460,11 @@ impl DataGrid {
             Some((_, i)) => div().child(i.body.clone()),
         };
         let summary = shown.as_ref().map(|(_, i)| i.summary.clone());
+        let editing_input = self
+            .editing
+            .as_ref()
+            .filter(|e| e.panel)
+            .map(|e| e.input.clone());
         let button = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
@@ -451,33 +500,66 @@ impl DataGrid {
                             .min_w_0()
                             .ellipsis()
                             .text_color(t.color.content_muted)
-                            .child(match summary {
-                                Some(s) => format!("{name} · {s}"),
-                                None => name.to_string(),
+                            .child(match (&editing_input, summary) {
+                                (Some(_), _) => format!("{name} · ⌘↩ save · esc cancel"),
+                                (None, Some(s)) => format!("{name} · {s}"),
+                                (None, None) => name.to_string(),
                             }),
                     )
-                    .child(button("grid-value-copy", "Copy").on_click(cx.listener(
-                        move |_, _: &gpui::ClickEvent, _, cx| {
-                            let text = raw.as_ref().map_or(String::new(), |v| v.to_string());
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        },
-                    )))
+                    .child(
+                        button("grid-value-copy", "Copy")
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.prevent_default()
+                            })
+                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                                let text = match this.editing.as_ref().filter(|e| e.panel) {
+                                    Some(e) => e.input.read(cx).text().to_string(),
+                                    None => raw.as_ref().map_or(String::new(), |v| v.to_string()),
+                                };
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            })),
+                    )
                     .child(button("grid-value-close", "×").on_click(cx.listener(
                         |this, _: &gpui::ClickEvent, window, cx| {
-                            this.close_value(cx);
+                            this.close_value(window, cx);
                             window.focus(&this.focus);
                         },
                     ))),
             )
-            .child(
-                body.id(("grid-value-body", key))
+            .child(match editing_input {
+                Some(input) => div()
+                    .id("grid-value-edit")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .p(t.space(Space::Sm))
+                    .font_family(t.typography.mono.clone())
+                    .text_color(t.color.content)
+                    .cursor(CursorStyle::IBeam)
+                    .child(input),
+                None => body
+                    .id(("grid-value-body", key))
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
                     .p(t.space(Space::Sm))
                     .font_family(t.typography.mono.clone())
-                    .text_color(t.color.content),
-            )
+                    .text_color(t.color.content)
+                    .when(self.editable, |d| {
+                        d.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                if e.click_count == 2
+                                    && this.editing.is_none()
+                                    && let Some(pos) = this.model.active
+                                {
+                                    this.request_edit(pos, true, cx);
+                                }
+                            }),
+                        )
+                    }),
+            })
     }
 
     fn right_click(
@@ -620,7 +702,7 @@ impl DataGrid {
         self.model.select(pos, extend);
         self.reveal(pos);
         if clicks >= 2 {
-            self.request_edit(pos, cx);
+            self.request_edit(pos, self.value_open, cx);
         }
         cx.notify();
     }
@@ -1278,7 +1360,11 @@ impl DataGrid {
                 .border_color(t.color.border)
                 .when_some(bg, |d, bg| d.bg(bg))
                 .child(
-                    match self.editing.as_ref().filter(|e| e.row == row && e.col == c) {
+                    match self
+                        .editing
+                        .as_ref()
+                        .filter(|e| e.row == row && e.col == c && !e.panel)
+                    {
                         Some(e) => div()
                             .w_full()
                             .h_full()
@@ -1456,15 +1542,15 @@ impl Render for DataGrid {
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &Edit, _, cx| {
                 if let Some(pos) = this.model.active {
-                    this.request_edit(pos, cx);
+                    this.request_edit(pos, this.value_open, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleValue, _, cx| {
-                if this.editing.is_some() {
+            .on_action(cx.listener(|this, _: &ToggleValue, window, cx| {
+                if this.editing.as_ref().is_some_and(|e| !e.panel) {
                     return cx.propagate();
                 }
                 if this.value_open {
-                    this.close_value(cx);
+                    this.close_value(window, cx);
                 } else {
                     this.show_value(cx);
                 }
@@ -1473,7 +1559,7 @@ impl Render for DataGrid {
                 if this.editing.is_some() || !this.value_open {
                     return cx.propagate();
                 }
-                this.close_value(cx);
+                this.close_value(window, cx);
                 window.focus(&this.focus);
             }));
         if self.model.columns.is_empty() {
