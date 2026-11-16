@@ -1097,3 +1097,40 @@ fn count_star_exports_as_a_json_number() {
         "INSERT INTO \"result\" (\"n\", \"r\", \"b\") VALUES (1, 1.5, X'00ff');\n"
     );
 }
+
+#[test]
+fn an_error_during_the_read_ahead_still_delivers_the_rows_before_it() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with recursive c(x) as (select 1 union all select x+1 from c where x < 10) \
+         select null as z, abs(case when x < 5 then x else -9223372036854775807 - 1 end) as v from c",
+        500,
+    );
+    let mut columns = false;
+    let mut rows = 0;
+    loop {
+        match rig.next() {
+            Update::Columns { .. } => columns = true,
+            Update::Rows { rows: r, .. } => rows += r.len(),
+            Update::RunError { .. } => break,
+            Update::Done { .. } => panic!("expected an error"),
+            _ => {}
+        }
+    }
+    assert_eq!((columns, rows), (true, 4));
+}
+
+#[test]
+fn the_read_ahead_stops_at_the_byte_bound() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with recursive c(x) as (select 1 union all select x+1 from c where x < 20) \
+         select case when x >= 15 then 1 end as z, zeroblob(1048576) as b from c",
+        500,
+    );
+    let (columns, rows) = rig.result(1);
+    assert_eq!(types(&columns), ["", "blob"]);
+    assert_eq!(rows.len(), 20);
+}

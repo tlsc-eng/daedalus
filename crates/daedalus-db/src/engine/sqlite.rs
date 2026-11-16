@@ -247,6 +247,7 @@ fn run_catalog(db: &Db, tx: &Tx, cancelled: &AtomicBool) {
 }
 
 const TYPE_LOOKAHEAD: usize = 100;
+const TYPE_LOOKAHEAD_BYTES: usize = 4 << 20;
 
 /// SQLite's name for a value's storage class, as typeof() spells it; None for NULL.
 fn storage_class(value: ValueRef<'_>) -> Option<&'static str> {
@@ -320,10 +321,16 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
         };
         let mut ahead: Vec<Vec<Cell>> = Vec::new();
         // Expression columns have no declared type, so the first non-NULL value's storage class stands in.
-        while ahead.len() < TYPE_LOOKAHEAD && columns.iter().any(|c| c.type_name.is_empty()) {
+        let mut ahead_bytes = 0usize;
+        // An error here must not drop the rows already read, so it is sent after them.
+        let mut stopped = None;
+        while ahead.len() < TYPE_LOOKAHEAD
+            && ahead_bytes < TYPE_LOOKAHEAD_BYTES
+            && columns.iter().any(|c| c.type_name.is_empty())
+        {
             if cancelled.load(Ordering::Relaxed) {
-                send(tx, Err(interrupted()));
-                return;
+                stopped = Some(interrupted());
+                break;
             }
             match rows.next() {
                 Ok(Some(row)) => {
@@ -334,12 +341,14 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
                             c.type_name = class.to_owned();
                         }
                     }
-                    ahead.push(row_cells(row, width));
+                    let cells = row_cells(row, width);
+                    ahead_bytes += cells.iter().flatten().map(String::len).sum::<usize>();
+                    ahead.push(cells);
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    send(tx, Err(failure(&e, sql)));
-                    return;
+                    stopped = Some(failure(&e, sql));
+                    break;
                 }
             }
         }
@@ -352,6 +361,10 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
                 return;
             }
             count += 1;
+        }
+        if let Some(e) = stopped {
+            send(tx, Err(e));
+            return;
         }
         loop {
             if cancelled.load(Ordering::Relaxed) {
