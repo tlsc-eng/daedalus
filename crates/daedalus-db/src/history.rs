@@ -37,28 +37,75 @@ pub fn path(data_dir: &Path, root: &Path, key: &str) -> PathBuf {
 /// Whether the statement may set or reveal a credential, so it is never recorded.
 pub fn has_secret(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-        .filter(|w| !w.is_empty())
-        .collect();
-    let secret_word = words
-        .iter()
-        .any(|w| matches!(*w, "password" | "passwd") || w.ends_with("_password"));
-    let pair = |first: &str, seconds: &[&str]| {
-        words
-            .windows(2)
-            .any(|w| w[0] == first && seconds.contains(&w[1]))
-    };
-    secret_word
-        || pair("identified", &["by", "with"])
-        || pair("pragma", &["key", "rekey", "hexkey", "hexrekey"])
+    if words(&lower).any(|w| matches!(w, "password" | "passwd") || w.ends_with("_password"))
         || url_with_password(&lower)
+    {
+        return true;
+    }
+    // Backslash escaping differs per engine, so a misjudged quote must not hide a keyword.
+    [true, false].into_iter().any(|escapes| {
+        let stripped = strip_comments(&lower, escapes);
+        let tokens: Vec<&str> = words(&stripped).collect();
+        follows(&tokens, "identified", &["by", "with"])
+            || follows(&tokens, "pragma", &["key", "rekey", "hexkey", "hexrekey"])
+    })
+}
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .filter(|w| !w.is_empty())
+}
+
+fn follows(tokens: &[&str], first: &str, later: &[&str]) -> bool {
+    tokens
+        .iter()
+        .position(|t| *t == first)
+        .is_some_and(|i| tokens[i + 1..].iter().any(|t| later.contains(t)))
+}
+
+/// Replaces comments outside quoted text with a space so they cannot split a keyword pair.
+fn strip_comments(text: &str, backslash_escapes: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if backslash_escapes && c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 1;
+            } else if c == q {
+                quote = None;
+            }
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            out.push(c);
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 1;
+            out.push(' ');
+        } else if c == '#' || (c == '-' && chars.get(i + 1) == Some(&'-')) {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
 }
 
 fn url_with_password(text: &str) -> bool {
     text.match_indices("://").any(|(i, _)| {
         let authority: &str = text[i + 3..]
-            .split(|c: char| c.is_whitespace() || c == '/')
+            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
             .next()
             .unwrap_or("");
         authority
@@ -76,8 +123,9 @@ pub fn append(path: &Path, sqls: &[&str], at: u64) -> Result<usize> {
             .create(parent)
             .with_context(|| format!("create {}", parent.display()))?;
     }
-    let mut entries = load(path)?;
-    let torn = ends_mid_line(path)?;
+    let bytes = read_all(path)?;
+    let torn = bytes.last().is_some_and(|b| *b != b'\n');
+    let mut entries = parse(&bytes);
     let mut new = Vec::new();
     for sql in sqls {
         let sql = sql.trim();
@@ -113,26 +161,33 @@ pub fn append(path: &Path, sqls: &[&str], at: u64) -> Result<usize> {
             .mode(0o600)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        file.write_all(buf.as_bytes())
-            .with_context(|| format!("write {}", path.display()))?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod {}", path.display()))?;
+        file.write_all(buf.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
     }
     Ok(new.len())
 }
 
 /// Entries oldest first; a missing file is empty and unreadable lines are skipped.
 pub fn load(path: &Path) -> Result<Vec<Entry>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(bytes
+    Ok(parse(&read_all(path)?))
+}
+
+fn read_all(path: &Path) -> Result<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn parse(bytes: &[u8]) -> Vec<Entry> {
+    bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_slice::<Entry>(line).ok())
-        .collect())
+        .collect()
 }
 
 /// Newest-first matches, each SQL text once, at most `limit`.
@@ -159,14 +214,6 @@ fn lines(entries: &[Entry]) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
-}
-
-fn ends_mid_line(path: &Path) -> Result<bool> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(bytes.last().is_some_and(|b| *b != b'\n')),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
 }
 
 fn rewrite(path: &Path, entries: &[Entry]) -> Result<()> {
@@ -269,6 +316,14 @@ mod tests {
             "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD='x'",
             "PRAGMA key = 'x'",
             "SELECT dblink_connect('postgres://u:x@h/db')",
+            "SELECT dblink_connect('postgres://u:hun/ter2@h/db')",
+            "create user u identified by 'x'",
+            "CREATE USER u\nIDENTIFIED\nBY 'x'",
+            "CREATE USER u IDENTIFIED /* c */ BY 'x'",
+            "ALTER USER u IDENTIFIED -- c\n BY 'x'",
+            "ALTER USER u IDENTIFIED # c\n BY 'x'",
+            "select 1; ALTER ROLE r PASSWORD 'x'",
+            "PRAGMA main.key = 'x'",
         ];
         let file = temp("secret").join("a.jsonl");
         for sql in secrets {
@@ -291,7 +346,7 @@ mod tests {
             "SELECT password_hash FROM users",
             "SELECT 'identified' AS by_name",
             "select * from users where id = 1",
-            "select 'http://example.com/a:b@c'",
+            "select 'http://example.com/a/b'",
         ];
         for sql in ok {
             assert!(!has_secret(sql));
