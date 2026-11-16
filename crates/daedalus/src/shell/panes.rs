@@ -873,69 +873,75 @@ impl Shell {
                 });
             }
         }
-        let open_tx = self
-            .active_root()
-            .and_then(|root| self.items.get(&(root, item)).cloned())
-            .is_some_and(|view| matches!(&view, ItemView::DbConsole(c) if c.read(cx).tx_open()));
-        if let (true, Some(root)) = (open_tx, self.active_root()) {
+        let Some(root) = self.active_root() else {
+            return self.close_pane_item(pane, item, window, cx);
+        };
+        let started = self.settle_close(root.clone(), item, window, cx, move |this, window, cx| {
+            this.close_after_prompt(&root, pane, item, window, cx);
+        });
+        if !started {
+            self.close_pane_item(pane, item, window, cx);
+        }
+    }
+
+    /// Asks what closing a tab would lose (open transaction, pending edits, unsaved text) and runs `then`
+    /// only once the user agrees. Returns false when there was nothing to ask and `then` was not run.
+    fn settle_close(
+        &mut self,
+        root: PathBuf,
+        item: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        let Some(view) = self.items.get(&(root, item)).cloned() else {
+            return false;
+        };
+        let prompt = match &view {
+            ItemView::DbConsole(c) if c.read(cx).tx_open() => Some((
+                "Roll back the open transaction?".to_string(),
+                "Closing the console ends its session, and changes that aren't committed are lost. Commit from the toolbar first to keep them.",
+                "Roll Back and Close",
+            )),
+            ItemView::DbTable(t) => Some(t.read(cx).pending_count())
+                .filter(|n| *n > 0)
+                .map(|n| {
+                    (
+                        format!("Discard {n} pending changes?"),
+                        "Closing the table drops edits that were not submitted.",
+                        "Discard and Close",
+                    )
+                }),
+            _ => None,
+        };
+        if let Some((title, detail, confirm)) = prompt {
             let answer = window.prompt(
                 PromptLevel::Warning,
-                "Roll back the open transaction?",
-                Some("Closing the console ends its session, and changes that aren't committed are lost. Commit from the toolbar first to keep them."),
-                &super::lsp::confirm_buttons("Cancel", "Roll Back and Close"),
+                &title,
+                Some(detail),
+                &super::lsp::confirm_buttons("Cancel", confirm),
                 cx,
             );
-            return cx
-                .spawn_in(window, async move |this, cx| {
-                    if answer.await.ok() != Some(super::lsp::CONFIRMED) {
-                        return;
-                    }
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.close_after_prompt(&root, pane, item, window, cx);
-                    });
-                })
-                .detach();
-        }
-        let pending = self
-            .active_root()
-            .and_then(|root| self.items.get(&(root, item)).cloned())
-            .and_then(|view| match view {
-                ItemView::DbTable(t) => Some(t.read(cx).pending_count()),
-                _ => None,
-            })
-            .filter(|n| *n > 0);
-        if let (Some(n), Some(root)) = (pending, self.active_root()) {
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                &format!("Discard {n} pending changes?"),
-                Some("Closing the table drops edits that were not submitted."),
-                &super::lsp::confirm_buttons("Cancel", "Discard and Close"),
-                cx,
-            );
-            return cx
-                .spawn_in(window, async move |this, cx| {
-                    if answer.await.ok() != Some(super::lsp::CONFIRMED) {
-                        return;
-                    }
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.close_after_prompt(&root, pane, item, window, cx);
-                    });
-                })
-                .detach();
-        }
-        let dirty = self
-            .active_root()
-            .and_then(|root| self.items.get(&(root, item)).cloned())
-            .filter(|view| view.is_dirty(cx));
-        if let (Some(ItemView::Editor(editor)), Some(root)) = (dirty, self.active_root()) {
-            return self.settle_dirty(editor, window, cx, move |this, close, window, cx| {
-                if !close {
+            cx.spawn_in(window, async move |this, cx| {
+                if answer.await.ok() != Some(super::lsp::CONFIRMED) {
                     return;
                 }
-                this.close_after_prompt(&root, pane, item, window, cx);
-            });
+                let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
+            })
+            .detach();
+            return true;
         }
-        self.close_pane_item(pane, item, window, cx);
+        if let ItemView::Editor(editor) = view.clone()
+            && view.is_dirty(cx)
+        {
+            self.settle_dirty(editor, window, cx, move |this, close, window, cx| {
+                if close {
+                    then(this, window, cx);
+                }
+            });
+            return true;
+        }
+        false
     }
 
     /// The project may have changed, or the phone closed the tab, while the prompt was up; ids repeat across projects.
@@ -1023,19 +1029,14 @@ impl Shell {
     ) {
         while !items.is_empty() {
             let item = items.remove(0);
-            let dirty = self
-                .items
-                .get(&(root.clone(), item))
-                .cloned()
-                .filter(|v| v.is_dirty(cx));
-            if let Some(ItemView::Editor(editor)) = dirty {
-                let root = root.clone();
-                return self.settle_dirty(editor, window, cx, move |this, close, window, cx| {
-                    if close {
-                        this.remove_item_from(&root, item, window, cx);
-                        this.close_items_in(root, items, window, cx);
-                    }
+            let (next_root, rest) = (root.clone(), items.clone());
+            let started =
+                self.settle_close(root.clone(), item, window, cx, move |this, window, cx| {
+                    this.remove_item_from(&next_root, item, window, cx);
+                    this.close_items_in(next_root, rest, window, cx);
                 });
+            if started {
+                return;
             }
             self.remove_item_from(&root, item, window, cx);
         }
