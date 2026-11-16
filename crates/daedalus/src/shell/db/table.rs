@@ -18,7 +18,7 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, Pixels, Point, PromptLevel, Render, SharedString,
     Subscription, Task, Window, div, prelude::*,
 };
-use pending::{Pending, Slot, can_edit_value, locate};
+use pending::{Pending, Slot, can_edit_in_panel, can_edit_value, locate};
 
 use super::console::{Info, grid_columns};
 use super::explorer::{data_color, dot_shape, engine_label, tag};
@@ -519,7 +519,9 @@ impl DbTableView {
 
     fn on_grid(&mut self, event: &GridEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            GridEvent::EditRequested { row, col } => self.request_edit(*row, *col, window, cx),
+            GridEvent::EditRequested { row, col, panel } => {
+                self.request_edit(*row, *col, *panel, window, cx)
+            }
             GridEvent::Edited { row, col, text } => {
                 self.set_value(*row, *col, Some(text.clone()), cx)
             }
@@ -534,26 +536,31 @@ impl DbTableView {
         &mut self,
         row: usize,
         col: usize,
+        panel: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let value = self.current(row, col);
         let deleted =
             matches!(locate(row, self.rows.len()), Slot::Page(r) if self.edits.is_deleted(r));
-        let too_big = !can_edit_value(value.as_deref());
-        if deleted || self.cell_target(col).is_none() || too_big {
+        if deleted || self.cell_target(col).is_none() {
             self.note = Some("This cell can't be edited here");
-            if too_big && !deleted && self.cell_target(col).is_some() {
-                self.grid.update(cx, |g, cx| g.show_value(cx));
-            }
+            cx.notify();
+            return;
+        }
+        let inline = !panel && can_edit_value(value.as_deref());
+        if !inline && !can_edit_in_panel(value.as_deref()) {
+            self.note = Some("This value is too large to edit here");
+            self.grid.update(cx, |g, cx| g.show_value(cx));
             cx.notify();
             return;
         }
         self.note = None;
         let null = value.is_none();
         let initial = value.unwrap_or_default();
-        self.grid.update(cx, |g, cx| {
-            g.begin_edit(row, col, initial, null, window, cx)
+        self.grid.update(cx, |g, cx| match inline {
+            true => g.begin_edit(row, col, initial, null, window, cx),
+            false => g.begin_value_edit(row, col, initial, null, window, cx),
         });
         cx.notify();
     }
@@ -663,7 +670,9 @@ impl DbTableView {
         if self.submitting.is_some() || self.preview.is_some() || self.export.is_some() {
             return;
         }
-        self.grid.update(cx, |g, cx| g.cancel_edit(window, cx));
+        if let Some((row, col, text)) = self.grid.update(cx, |g, cx| g.take_edit(window, cx)) {
+            self.set_value(row, col, Some(text), cx);
+        }
         let n = self.edits.count();
         if n == 0 {
             return self.run_discarded(then, cx);

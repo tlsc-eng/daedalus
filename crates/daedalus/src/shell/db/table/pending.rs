@@ -5,6 +5,7 @@ use daedalus_db::value::Cell;
 use daedalus_ui::{GridMarks, RowMark};
 
 const MAX_EDIT_BYTES: usize = 4096;
+const MAX_PANEL_EDIT_BYTES: usize = 64 * 1024;
 
 /// Unsubmitted edits keyed by grid row; page rows are `0..page_len`, inserted rows follow.
 #[derive(Default)]
@@ -30,6 +31,11 @@ pub(super) fn locate(row: usize, page_len: usize) -> Slot {
 /// Multi-line and long values stay read-only so the single-line cell editor never mangles them.
 pub(super) fn can_edit_value(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.len() <= MAX_EDIT_BYTES && !v.contains(['\n', '\r']))
+}
+
+/// Values the value panel shows in full can be edited there, line breaks included.
+pub(super) fn can_edit_in_panel(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.len() <= MAX_PANEL_EDIT_BYTES)
 }
 
 impl Pending {
@@ -368,5 +374,17 @@ mod tests {
         assert!(!can_edit_value(Some(&long)));
         let exact = String::from_utf8(vec![b'x'; 4096]).unwrap_or_default();
         assert!(can_edit_value(Some(&exact)));
+    }
+
+    #[test]
+    fn panel_edit_takes_line_breaks_and_long_values_up_to_the_cap() {
+        assert!(can_edit_in_panel(None));
+        assert!(can_edit_in_panel(Some("a\nb")));
+        assert!(can_edit_in_panel(Some("a\r\nb")));
+        let bytes = |n: usize| String::from_utf8(vec![b'x'; n]).unwrap_or_default();
+        assert!(can_edit_in_panel(Some(&bytes(4097))));
+        assert!(can_edit_in_panel(Some(&bytes(65536))));
+        assert!(!can_edit_in_panel(Some(&bytes(65537))));
+        assert!(!can_edit_value(Some("a\nb")));
     }
 }
