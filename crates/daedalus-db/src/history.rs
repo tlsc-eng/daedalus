@@ -42,13 +42,10 @@ pub fn has_secret(sql: &str) -> bool {
     {
         return true;
     }
-    // Backslash escaping differs per engine, so a misjudged quote must not hide a keyword.
-    [true, false].into_iter().any(|escapes| {
-        let stripped = strip_comments(&lower, escapes);
-        let tokens: Vec<&str> = words(&stripped).collect();
-        follows(&tokens, "identified", &["by", "with"])
-            || follows(&tokens, "pragma", &["key", "rekey", "hexkey", "hexrekey"])
-    })
+    // Raw tokens, not comment-stripped: MySQL executes the inside of /*! ... */.
+    let tokens: Vec<&str> = words(&lower).collect();
+    follows(&tokens, "identified", &["by", "with"])
+        || follows(&tokens, "pragma", &["key", "rekey", "hexkey", "hexrekey"])
 }
 
 fn words(text: &str) -> impl Iterator<Item = &str> {
@@ -61,45 +58,6 @@ fn follows(tokens: &[&str], first: &str, later: &[&str]) -> bool {
         .iter()
         .position(|t| *t == first)
         .is_some_and(|i| tokens[i + 1..].iter().any(|t| later.contains(t)))
-}
-
-/// Replaces comments outside quoted text with a space so they cannot split a keyword pair.
-fn strip_comments(text: &str, backslash_escapes: bool) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut quote: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if let Some(q) = quote {
-            out.push(c);
-            if backslash_escapes && c == '\\' && i + 1 < chars.len() {
-                out.push(chars[i + 1]);
-                i += 1;
-            } else if c == q {
-                quote = None;
-            }
-        } else if matches!(c, '\'' | '"' | '`') {
-            quote = Some(c);
-            out.push(c);
-        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                i += 1;
-            }
-            i += 1;
-            out.push(' ');
-        } else if c == '#' || (c == '-' && chars.get(i + 1) == Some(&'-')) {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            out.push('\n');
-        } else {
-            out.push(c);
-        }
-        i += 1;
-    }
-    out
 }
 
 fn url_with_password(text: &str) -> bool {
@@ -324,6 +282,8 @@ mod tests {
             "ALTER USER u IDENTIFIED # c\n BY 'x'",
             "select 1; ALTER ROLE r PASSWORD 'x'",
             "PRAGMA main.key = 'x'",
+            "CREATE USER u IDENTIFIED /*!50700 BY 'hunter2' */",
+            "ALTER USER u IDENTIFIED /*! BY */ 'hunter2'",
         ];
         let file = temp("secret").join("a.jsonl");
         for sql in secrets {
