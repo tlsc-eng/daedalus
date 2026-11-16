@@ -153,6 +153,11 @@ pub fn load(path: &Path) -> Result<Store> {
 
 /// Writes via temp file and rename so a crash never leaves a half-written file.
 pub fn save(path: &Path, store: &Store) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(store)?, 0o600)
+}
+
+/// Replaces `path` with `bytes` through a temp file in the same directory, created with `mode`.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     // A stale temp may be world-readable or held open by another process.
     match fs::remove_file(&tmp) {
@@ -163,20 +168,20 @@ pub fn save(path: &Path, store: &Store) -> Result<()> {
     let mut out = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
-    out.write_all(&serde_json::to_vec_pretty(store)?)
+    out.write_all(bytes)
         .with_context(|| format!("write {}", tmp.display()))?;
     // Without this, a power loss after the rename can leave an empty file under the real name.
     out.sync_all()?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 
-/// Connections that apply to `root`, sorted by name.
-pub fn for_project(store: &Store, root: Option<&Path>) -> Vec<Listed> {
+/// Connections that apply to `root`, sorted by name; a personal entry hides a shared one with the same id.
+pub fn for_project(store: &Store, shared: &[Connection], root: Option<&Path>) -> Vec<Listed> {
     let mut out: Vec<Listed> = store
         .connections
         .iter()
@@ -188,6 +193,18 @@ pub fn for_project(store: &Store, root: Option<&Path>) -> Vec<Listed> {
             origin: Origin::Global,
         })
         .collect();
+    if root.is_some() {
+        let hidden: Vec<String> = out.iter().map(|l| l.conn.id.clone()).collect();
+        out.extend(
+            shared
+                .iter()
+                .filter(|c| !hidden.contains(&c.id))
+                .map(|c| Listed {
+                    conn: c.clone(),
+                    origin: Origin::Project,
+                }),
+        );
+    }
     out.sort_by_key(|l| l.conn.name.to_lowercase());
     out
 }
@@ -201,7 +218,13 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
             let root = root
                 .map(|r| r.as_os_str().as_encoded_bytes())
                 .unwrap_or_default();
-            let parts: [&[u8]; 7] = [
+            let tls = format!("{:?}", conn.tls);
+            let ca = conn
+                .ca_file
+                .as_deref()
+                .map(|p| p.as_os_str().as_encoded_bytes())
+                .unwrap_or_default();
+            let parts: [&[u8]; 9] = [
                 root,
                 conn.id.as_bytes(),
                 conn.engine.name().as_bytes(),
@@ -209,6 +232,8 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
                 port.as_bytes(),
                 conn.database.as_bytes(),
                 conn.user.as_bytes(),
+                tls.as_bytes(),
+                ca,
             ];
             let mut hasher = Sha256::new();
             for part in parts {
@@ -484,7 +509,7 @@ mod tests {
             connections: vec![a, everywhere],
         };
         let ids = |root: Option<&str>| -> Vec<String> {
-            for_project(&store, root.map(Path::new))
+            for_project(&store, &[], root.map(Path::new))
                 .into_iter()
                 .map(|l| l.conn.id)
                 .collect()
@@ -492,6 +517,51 @@ mod tests {
         assert_eq!(ids(Some("/work/a")), ["a", "e"]);
         assert_eq!(ids(Some("/work/b")), ["e"]);
         assert_eq!(ids(None), ["e"]);
+    }
+
+    #[test]
+    fn shared_entries_list_as_project_origin() {
+        let store = Store {
+            version: 1,
+            connections: vec![conn("g", "Mid")],
+        };
+        let shared = [conn("a", "Alpha"), conn("z", "Zed")];
+        let listed = for_project(&store, &shared, Some(Path::new("/work/a")));
+        let got: Vec<(&str, Origin)> = listed
+            .iter()
+            .map(|l| (l.conn.id.as_str(), l.origin))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", Origin::Project),
+                ("g", Origin::Global),
+                ("z", Origin::Project)
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_entries_need_a_root() {
+        let shared = [conn("a", "Alpha")];
+        assert!(for_project(&Store::empty(), &shared, None).is_empty());
+    }
+
+    #[test]
+    fn personal_entry_hides_shared_with_same_id() {
+        let mut mine = conn("x", "Mine");
+        mine.projects = vec!["/work/a".into()];
+        let store = Store {
+            version: 1,
+            connections: vec![mine],
+        };
+        let shared = [conn("x", "Shared")];
+        let hit = for_project(&store, &shared, Some(Path::new("/work/a")));
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].origin, Origin::Global);
+        let other = for_project(&store, &shared, Some(Path::new("/work/b")));
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].origin, Origin::Project);
     }
 
     #[test]
@@ -503,6 +573,12 @@ mod tests {
         let after = keychain_account(Origin::Project, Some(root), &c);
         assert!(before.starts_with("p-"));
         assert_ne!(before, after);
+        let mut t = conn("a", "A");
+        t.tls = Tls::Disable;
+        assert_ne!(before, keychain_account(Origin::Project, Some(root), &t));
+        let mut ca = conn("a", "A");
+        ca.ca_file = Some("/other/ca.pem".into());
+        assert_ne!(before, keychain_account(Origin::Project, Some(root), &ca));
     }
 
     #[test]

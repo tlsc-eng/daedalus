@@ -10,6 +10,7 @@ pub mod engine;
 pub mod export;
 pub mod history;
 pub mod secret;
+pub mod shared;
 pub mod value;
 pub mod worker;
 
