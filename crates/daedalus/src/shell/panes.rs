@@ -1004,7 +1004,7 @@ impl Shell {
         .detach();
     }
 
-    /// Closes several tabs of the active project in order, stopping if the user cancels a save prompt.
+    /// Closes several tabs of the active project in order, stopping if the user cancels any close prompt.
     pub(super) fn close_items(
         &mut self,
         items: Vec<ItemId>,
