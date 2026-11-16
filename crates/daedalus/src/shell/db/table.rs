@@ -18,7 +18,7 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, Pixels, Point, PromptLevel, Render, SharedString,
     Subscription, Task, Window, div, prelude::*,
 };
-use pending::{Pending, Slot, can_edit_in_panel, can_edit_value, locate};
+use pending::{Pending, Slot, can_edit_in_panel, can_edit_value, locate, may_be_lossy};
 
 use super::console::{Info, grid_columns};
 use super::explorer::{data_color, dot_shape, engine_label, tag};
@@ -545,6 +545,12 @@ impl DbTableView {
             matches!(locate(row, self.rows.len()), Slot::Page(r) if self.edits.is_deleted(r));
         if deleted || self.cell_target(col).is_none() {
             self.note = Some("This cell can't be edited here");
+            cx.notify();
+            return;
+        }
+        let engine = self.info.as_ref().map(|i| i.engine);
+        if engine.is_some_and(|e| may_be_lossy(e, value.as_deref())) {
+            self.note = Some("This value isn't valid UTF-8, so it can't be edited here");
             cx.notify();
             return;
         }
