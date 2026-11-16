@@ -230,6 +230,7 @@ impl Shell {
     ) -> AnyElement {
         self.db_ensure_loaded(cx);
         self.db_ensure_shared(cx);
+        self.db_ensure_detected(cx);
         let t = cx.theme().clone();
         let header = div()
             .flex()
@@ -272,6 +273,7 @@ impl Shell {
         } else {
             let root = self.active_root();
             let listed = self.db_listed();
+            let detected = self.db_detected_rows();
             let notice = self
                 .db
                 .shared
@@ -287,7 +289,7 @@ impl Shell {
                         cx,
                     ))
                 });
-            let list = if self.db.loaded && listed.is_empty() {
+            let list = if self.db.loaded && listed.is_empty() && detected.is_empty() {
                 let new = Button::new("db-new-empty", "New connection", ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.db_open_sheet(SheetMode::New, window, cx)
@@ -320,6 +322,9 @@ impl Shell {
                             false => el,
                         }
                     }))
+                    .when(!detected.is_empty(), |el| {
+                        el.child(self.render_detected(detected, cx))
+                    })
                     .into_any_element()
             };
             div()

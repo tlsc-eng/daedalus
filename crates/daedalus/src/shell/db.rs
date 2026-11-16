@@ -23,6 +23,7 @@ use sheet::{
 };
 
 mod console;
+mod detected;
 mod explorer;
 mod exporting;
 mod mcp;
@@ -87,6 +88,8 @@ pub(super) struct DbState {
     claude: mcp::ClaudeDb,
     shared: Option<SharedFile>,
     shared_task: Option<(PathBuf, Task<()>)>,
+    detected: Option<detected::Detected>,
+    detect_task: Option<(PathBuf, Task<()>)>,
 }
 
 #[derive(Clone, Default)]
@@ -551,6 +554,7 @@ impl Shell {
         self.db.load_error = None;
         self.db.load_task = None;
         if let Some(root) = self.active_root() {
+            self.db_detect(root.clone(), cx);
             self.db_load_shared(root, cx);
         }
         cx.notify();
