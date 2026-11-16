@@ -68,6 +68,8 @@ pub(super) struct Batch {
     next_run: u64,
     pending: VecDeque<Piece>,
     current: Option<Current>,
+    /// The statement behind the grid on screen, which an export re-runs.
+    shown: Option<String>,
 }
 
 pub(in crate::shell::db) fn grid_columns(columns: &[Column]) -> Vec<GridColumn> {
@@ -157,6 +159,7 @@ impl Batch {
                     true => out.push(Effect::Append { rows, more }),
                     false => {
                         let columns = current.columns.as_deref().unwrap_or_default();
+                        self.shown = Some(current.piece.sql.clone());
                         out.push(Effect::Show {
                             columns: grid_columns(columns),
                             rows,
@@ -185,11 +188,14 @@ impl Batch {
                 let ms = elapsed.as_millis();
                 let name = excerpt(&done.piece.sql, 80);
                 match (&done.columns, done.shown) {
-                    (Some(columns), false) => out.push(Effect::Show {
-                        columns: grid_columns(columns),
-                        rows: Vec::new(),
-                        more: false,
-                    }),
+                    (Some(columns), false) => {
+                        self.shown = Some(done.piece.sql.clone());
+                        out.push(Effect::Show {
+                            columns: grid_columns(columns),
+                            rows: Vec::new(),
+                            more: false,
+                        })
+                    }
                     (_, true) => out.push(Effect::Finish { truncated }),
                     (None, false) => out.push(Effect::Affected(affected)),
                 }
@@ -271,10 +277,22 @@ impl Batch {
         self.current.is_none()
     }
 
+    pub fn shown_sql(&self) -> Option<&str> {
+        self.shown.as_deref()
+    }
+
+    /// Hands out a run id from the batch's own counter so an export never collides with a batch run.
+    pub fn take_run_id(&mut self) -> RunId {
+        let run = RunId(self.next_run);
+        self.next_run += 1;
+        run
+    }
+
     pub fn reset(&mut self) {
         self.session = None;
         self.pending.clear();
         self.current = None;
+        self.shown = None;
     }
 }
 
@@ -516,5 +534,44 @@ mod tests {
         assert!(b.paused());
         assert!(!b.running());
         assert!(!b.idle());
+    }
+
+    #[test]
+    fn shown_sql_is_the_piece_that_showed_rows() {
+        let mut b = Batch::default();
+        b.start(
+            S,
+            vec![piece("select 1", 0), piece("select 2", 9)],
+            RunMode::Auto,
+        );
+        assert_eq!(b.shown_sql(), None);
+        b.on(columns(0));
+        b.on(rows(0, 1, false));
+        assert_eq!(b.shown_sql(), Some("select 1"));
+        b.on(done(0, None, false));
+        b.on(columns(1));
+        b.on(done(1, None, false));
+        assert_eq!(b.shown_sql(), Some("select 2"));
+    }
+
+    #[test]
+    fn take_run_id_does_not_collide_with_batch_runs() {
+        let mut b = Batch::default();
+        let first = b.take_run_id();
+        b.start(S, vec![piece("select 1", 0)], RunMode::Auto);
+        let batch_run = b.current.as_ref().map(|c| c.run);
+        assert_ne!(Some(first), batch_run);
+        assert_ne!(b.take_run_id(), first);
+        assert_ne!(Some(b.take_run_id()), batch_run);
+    }
+
+    #[test]
+    fn reset_clears_shown_sql() {
+        let mut b = Batch::default();
+        b.start(S, vec![piece("select 1", 0)], RunMode::Auto);
+        b.on(columns(0));
+        b.on(rows(0, 1, false));
+        b.reset();
+        assert_eq!(b.shown_sql(), None);
     }
 }

@@ -22,6 +22,7 @@ use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
 
 mod console;
 mod explorer;
+mod exporting;
 mod mcp;
 mod sheet;
 mod tab;

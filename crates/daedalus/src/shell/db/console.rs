@@ -6,19 +6,23 @@ use std::time::Duration;
 
 use daedalus_db::catalog::Catalog;
 use daedalus_db::classify::{self, Statement};
+use daedalus_db::claude;
+use daedalus_db::export::Format;
 use daedalus_db::worker::{Command, Handle, RunMode, SessionId, TxOp, Update};
 use daedalus_db::{Engine, Listed};
 use daedalus_editor::{EditorEvent, EditorView, Marker, MarkerSeverity};
 use daedalus_ui::motion::{self, Busy};
 use daedalus_ui::{
-    ActiveTheme, Button, ButtonKind, DataGrid, DotState, GridEvent, Space, StatusDot,
+    ActiveTheme, Button, ButtonKind, ContextMenu, DataGrid, DotState, GridEvent, Space, StatusDot,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    PromptLevel, Render, Subscription, Task, Window, div, prelude::*, relative,
+    AnyElement, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Pixels, Point, PromptLevel, Render, Subscription, Task, Window, div, prelude::*,
+    relative,
 };
 
 use super::explorer::{data_color, dot_shape, engine_label, tag};
+use super::exporting::{self, Export, Outcome, Spec};
 use crate::actions::{RunAll, RunStatement, StopRun};
 use crate::shell::lsp::{CONFIRMED, confirm_buttons};
 use crate::shell::sidebar::folder_color;
@@ -111,6 +115,9 @@ pub(in crate::shell) struct DbConsoleView {
     tab: ResultTab,
     busy: Option<Busy>,
     spin: Option<Task<()>>,
+    export: Option<Export>,
+    menu: Option<(Entity<ContextMenu>, Subscription)>,
+    grid_sub: Option<Subscription>,
     _release: Subscription,
     _subs: Vec<Subscription>,
 }
@@ -173,11 +180,6 @@ impl DbConsoleView {
             _ => {}
         });
         let grid = cx.new(DataGrid::new);
-        let fetch = cx.subscribe(&grid, |this, _, e: &GridEvent, cx| {
-            if matches!(e, GridEvent::FetchMore) {
-                this.fetch_more(cx);
-            }
-        });
         Self {
             key,
             info: None,
@@ -202,11 +204,14 @@ impl DbConsoleView {
             tab: ResultTab::Result,
             busy: None,
             spin: None,
+            export: None,
+            menu: None,
+            grid_sub: None,
             _release: cx.on_release(|this, cx| {
                 this.save_text(cx);
                 this.disconnect();
             }),
-            _subs: vec![fetch, autosave],
+            _subs: vec![autosave],
         }
     }
 
@@ -287,6 +292,7 @@ impl DbConsoleView {
         cx: &mut Context<Self>,
     ) {
         self.session = Some(session);
+        self.export = None;
         self.tx_open = false;
         self.catalog = None;
         self.catalog_asked = false;
@@ -306,6 +312,7 @@ impl DbConsoleView {
     pub fn idle(&mut self, cx: &mut Context<Self>) {
         self.phase = ConsolePhase::Idle;
         self.session = None;
+        self.export = None;
         self.tx_open = false;
         cx.notify();
     }
@@ -313,6 +320,7 @@ impl DbConsoleView {
     pub fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.phase = ConsolePhase::Failed(message.into());
         self.session = None;
+        self.export = None;
         self.tx_open = false;
         self.batch.reset();
         self.busy = None;
@@ -327,7 +335,13 @@ impl DbConsoleView {
         }
     }
 
-    pub fn on_update(&mut self, update: Update, cx: &mut Context<Self>) {
+    pub fn on_update(&mut self, mut update: Update, cx: &mut Context<Self>) {
+        if let Some(export) = &self.export {
+            match export.take(update) {
+                None => return,
+                Some(rest) => update = rest,
+            }
+        }
         match update {
             Update::Connected { server, .. } => {
                 self.phase = ConsolePhase::Connected { server };
@@ -343,6 +357,7 @@ impl DbConsoleView {
                 }
                 self.phase = ConsolePhase::Failed(error);
                 self.session = None;
+                self.export = None;
                 self.tx_open = false;
                 self.batch.reset();
                 self.busy = None;
@@ -459,8 +474,9 @@ impl DbConsoleView {
                 let wait = motion::until_next_spin(start.elapsed());
                 cx.background_executor().timer(wait).await;
                 let kept = this.update(cx, |this, cx| {
-                    let kept =
-                        this.busy.is_some() || matches!(this.phase, ConsolePhase::Connecting(_));
+                    let kept = this.busy.is_some()
+                        || this.export.is_some()
+                        || matches!(this.phase, ConsolePhase::Connecting(_));
                     match kept {
                         true => cx.notify(),
                         false => this.spin = None,
@@ -493,6 +509,10 @@ impl DbConsoleView {
     }
 
     fn stop_run(&mut self, _: &StopRun, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(export) = &self.export {
+            export.stop();
+            return;
+        }
         let effects = self.batch.stop();
         self.apply(effects, cx);
     }
@@ -502,6 +522,15 @@ impl DbConsoleView {
             return;
         };
         if !matches!(self.phase, ConsolePhase::Connected { .. }) || self.batch.running() {
+            return;
+        }
+        if self.export.is_some() {
+            self.error = Some(ErrorBanner {
+                message: "An export is running; stop it first.".into(),
+                at: None,
+            });
+            self.tab = ResultTab::Result;
+            cx.notify();
             return;
         }
         self.editor.update(cx, |e, cx| {
@@ -598,12 +627,14 @@ impl DbConsoleView {
 }
 
 impl Render for DbConsoleView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_subs(window, cx);
         let t = cx.theme().clone();
         let toolbar = self.render_toolbar(cx);
         let results = self.render_results(cx);
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(t.color.surface)
@@ -620,6 +651,7 @@ impl Render for DbConsoleView {
                     .child(div().size_full().child(self.editor.clone())),
             )
             .child(results)
+            .children(self.menu.as_ref().map(|(menu, _)| menu.clone()))
     }
 }
 
@@ -636,10 +668,11 @@ impl DbConsoleView {
         if self.manual == manual {
             return;
         }
-        let refusal = match (self.tx_open, self.batch.idle()) {
-            (true, _) => Some("Commit or roll back the open transaction first."),
-            (false, false) => Some("Wait for the run to finish or stop it first."),
-            (false, true) => None,
+        let refusal = match (self.export.is_some(), self.tx_open, self.batch.idle()) {
+            (true, _, _) => Some("Wait for the export to finish or stop it first."),
+            (_, true, _) => Some("Commit or roll back the open transaction first."),
+            (_, false, false) => Some("Wait for the run to finish or stop it first."),
+            (_, false, true) => None,
         };
         if let Some(message) = refusal {
             self.error = Some(ErrorBanner {
@@ -856,6 +889,26 @@ impl DbConsoleView {
                     }))
                     .child(label)
             };
+        let exporting = self.export.as_ref().map(|export| {
+            let shown = export.busy().shows(Duration::from_millis(250));
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space(Space::Sm))
+                .text_color(t.color.content_muted)
+                .when(shown, |el| {
+                    el.child(format!("Exporting {} rows…", export.rows()))
+                })
+                .child(
+                    Button::new("db-console-export-stop", "Stop", ButtonKind::Danger).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, _| {
+                            if let Some(export) = &this.export {
+                                export.stop();
+                            }
+                        }),
+                    ),
+                )
+        });
         let strip = div()
             .h(t.ui(28.))
             .flex_none()
@@ -878,6 +931,7 @@ impl DbConsoleView {
                 cx,
             ))
             .child(div().flex_1())
+            .children(exporting)
             .child(
                 div()
                     .text_color(t.color.content_muted)
@@ -953,6 +1007,155 @@ impl DbConsoleView {
             .children(banner)
             .child(body)
             .into_any_element()
+    }
+}
+
+impl DbConsoleView {
+    fn ensure_subs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.grid_sub.is_some() {
+            return;
+        }
+        self.grid_sub = Some(cx.subscribe_in(
+            &self.grid,
+            window,
+            |this, _, event: &GridEvent, window, cx| match event {
+                GridEvent::FetchMore => this.fetch_more(cx),
+                GridEvent::ContextMenu { position, .. } => this.open_menu(*position, window, cx),
+                _ => {}
+            },
+        ));
+    }
+
+    fn connected(&self) -> bool {
+        matches!(self.phase, ConsolePhase::Connected { .. })
+    }
+
+    /// The statement to re-run for an export, only when it is safe to run again as is.
+    fn rerun_sql(&self) -> Option<String> {
+        let engine = self.info.as_ref()?.engine;
+        if !self.connected() || self.tx_open || self.batch.running() {
+            return None;
+        }
+        claude::gate(self.batch.shown_sql()?, engine).ok()
+    }
+
+    fn open_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.result, Shown::Grid) {
+            return;
+        }
+        let enabled = self.connected() && self.export.is_none() && !self.batch.running();
+        let note = self
+            .rerun_sql()
+            .is_none()
+            .then_some("Export: loaded rows only");
+        let items = exporting::menu_block(
+            cx.weak_entity(),
+            Self::copy_result,
+            Self::export_result,
+            enabled,
+            note,
+        );
+        let menu = ContextMenu::build(position, items, window, cx);
+        let sub = cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, _, cx| {
+            if this.menu.as_ref().is_some_and(|(m, _)| m == menu) {
+                this.menu = None;
+                cx.notify();
+            }
+        });
+        self.menu = Some((menu, sub));
+        cx.notify();
+    }
+
+    fn copy_result(&mut self, format: Format, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = self.info.as_ref().map(|i| i.engine) else {
+            return;
+        };
+        exporting::copy_as(&self.grid, format, engine, None, cx);
+    }
+
+    fn export_result(&mut self, format: Format, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session;
+        let suggested = format!("result.{}", format.extension());
+        exporting::ask_path(cx, window, suggested, move |this, dest, _, cx| {
+            this.start_export(session, dest, format, cx)
+        });
+    }
+
+    fn start_export(
+        &mut self,
+        asked: Option<SessionId>,
+        dest: PathBuf,
+        format: Format,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(session), Some(handle), Some(info)) =
+            (self.session, self.handle.clone(), self.info.clone())
+        else {
+            return;
+        };
+        if asked != Some(session)
+            || !self.connected()
+            || self.export.is_some()
+            || self.batch.running()
+        {
+            return;
+        }
+        let spec = Spec {
+            dest,
+            format,
+            engine: info.engine,
+            table: None,
+        };
+        let sql = self.rerun_sql();
+        if self.batch.paused() {
+            let effects = self.batch.stop();
+            self.apply(effects, cx);
+        }
+        match sql {
+            Some(sql) => {
+                let run = self.batch.take_run_id();
+                self.export = Some(exporting::start(
+                    cx,
+                    handle,
+                    session,
+                    run,
+                    sql,
+                    spec,
+                    Self::on_export_end,
+                ));
+            }
+            None => {
+                let (columns, rows) = exporting::loaded(self.grid.read(cx));
+                exporting::write_loaded(cx, spec, columns, rows, Self::on_loaded_end);
+            }
+        }
+        self.footer = None;
+        self.error = None;
+        self.start_spin(cx);
+        cx.notify();
+    }
+
+    fn on_export_end(&mut self, outcome: Outcome, cx: &mut Context<Self>) {
+        self.export = None;
+        self.on_loaded_end(outcome, cx);
+    }
+
+    /// Reports an export's end without touching `export`, which a loaded-rows write never owns.
+    fn on_loaded_end(&mut self, outcome: Outcome, cx: &mut Context<Self>) {
+        match outcome {
+            Outcome::Done { rows, name } => {
+                let text = format!("Exported {rows} rows to {name}");
+                self.log(text.clone(), false);
+                self.footer = Some(text);
+            }
+            Outcome::Stopped => self.footer = Some("Export stopped".into()),
+            Outcome::Failed(message) => {
+                self.log(message.clone(), true);
+                self.error = Some(ErrorBanner { message, at: None });
+                self.tab = ResultTab::Result;
+            }
+        }
+        cx.notify();
     }
 }
 

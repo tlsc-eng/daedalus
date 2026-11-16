@@ -5,6 +5,7 @@ use std::sync::Arc;
 use daedalus_db::Engine;
 use daedalus_db::catalog::{Catalog, Table};
 use daedalus_db::edit::{self, PAGE_ROWS, Plan, Shape};
+use daedalus_db::export::Format;
 use daedalus_db::value::{Cell, Column};
 use daedalus_db::worker::{Command, Handle, RunId, RunMode, SessionId, Update};
 use daedalus_ui::motion::{self, Busy};
@@ -21,6 +22,7 @@ use pending::{Pending, Slot, can_edit_value, locate};
 
 use super::console::{Info, grid_columns};
 use super::explorer::{data_color, dot_shape, engine_label, tag};
+use super::exporting::{self, Export, Outcome, Spec};
 use crate::shell::lsp::{CONFIRMED, confirm_buttons};
 use crate::shell::sidebar::folder_color;
 
@@ -87,6 +89,8 @@ pub(in crate::shell) struct DbTableView {
     stale: bool,
     note: Option<&'static str>,
     menu: Option<(Entity<ContextMenu>, Subscription)>,
+    export: Option<Export>,
+    export_note: Option<String>,
     error: Option<String>,
     busy: Option<Busy>,
     spin: Option<Task<()>>,
@@ -144,6 +148,8 @@ impl DbTableView {
             stale: false,
             note: None,
             menu: None,
+            export: None,
+            export_note: None,
             error: None,
             busy: None,
             spin: None,
@@ -202,12 +208,14 @@ impl DbTableView {
     pub fn idle(&mut self, cx: &mut Context<Self>) {
         self.phase = TablePhase::Idle;
         self.session = None;
+        self.export = None;
         cx.notify();
     }
 
     pub fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.disconnect();
         self.phase = TablePhase::Failed(message.into());
+        self.export = None;
         self.run = None;
         self.busy = None;
         self.submitting = None;
@@ -224,7 +232,13 @@ impl DbTableView {
         }
     }
 
-    pub fn on_update(&mut self, update: Update, cx: &mut Context<Self>) {
+    pub fn on_update(&mut self, mut update: Update, cx: &mut Context<Self>) {
+        if let Some(export) = &self.export {
+            match export.take(update) {
+                None => return,
+                Some(rest) => update = rest,
+            }
+        }
         match update {
             Update::Connected { .. } => {
                 self.phase = TablePhase::Connected;
@@ -243,6 +257,7 @@ impl DbTableView {
                 }
                 self.phase = TablePhase::Failed(error);
                 self.session = None;
+                self.export = None;
                 self.run = None;
                 self.busy = None;
                 self.submitting = None;
@@ -357,7 +372,7 @@ impl DbTableView {
         ) else {
             return;
         };
-        if !matches!(self.phase, TablePhase::Connected) {
+        if !matches!(self.phase, TablePhase::Connected) || self.export.is_some() {
             return;
         }
         let sql = edit::select_page(
@@ -384,6 +399,7 @@ impl DbTableView {
         self.run = Some(run);
         self.want = offset;
         self.error = None;
+        self.export_note = None;
         self.pending.clear();
         self.buffer.clear();
         handle.send(Command::Run {
@@ -454,7 +470,7 @@ impl DbTableView {
             self.shape_ok().is_some(),
             matches!(self.phase, TablePhase::Connected),
             self.run.is_none(),
-            self.submitting.is_none() && self.preview.is_none(),
+            self.submitting.is_none() && self.preview.is_none() && self.export.is_none(),
             self.stale,
         )
     }
@@ -644,7 +660,7 @@ impl DbTableView {
 
     /// Runs `then` now, or after the user agrees to drop the pending edits.
     fn guard(&mut self, then: Discard, window: &mut Window, cx: &mut Context<Self>) {
-        if self.submitting.is_some() || self.preview.is_some() {
+        if self.submitting.is_some() || self.preview.is_some() || self.export.is_some() {
             return;
         }
         self.grid.update(cx, |g, cx| g.cancel_edit(window, cx));
@@ -664,6 +680,9 @@ impl DbTableView {
                 return;
             }
             this.update_in(cx, |this, window, cx| {
+                if this.export.is_some() {
+                    return;
+                }
                 this.drop_edits(window, cx);
                 this.run_discarded(then, cx);
             })
@@ -790,6 +809,132 @@ impl DbTableView {
     }
 
     fn menu_items(&self, row: usize, col: usize, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        let mut items = self.edit_items(row, col, cx);
+        if self.columns.is_empty() {
+            return items;
+        }
+        let enabled = matches!(self.phase, TablePhase::Connected)
+            && self.spec.is_some()
+            && self.run.is_none()
+            && self.submitting.is_none()
+            && self.export.is_none();
+        if !items.is_empty() {
+            items.push(MenuItem::separator());
+        }
+        items.extend(exporting::menu_block(
+            cx.weak_entity(),
+            Self::copy_result,
+            Self::export_result,
+            enabled,
+            None,
+        ));
+        items
+    }
+
+    fn insert_target(&self) -> Option<String> {
+        let engine = self.info.as_ref()?.engine;
+        Some(edit::qualified(
+            engine,
+            &self.schema,
+            &self.spec.as_ref()?.name,
+        ))
+    }
+
+    fn copy_result(&mut self, format: Format, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = self.info.as_ref().map(|i| i.engine) else {
+            return;
+        };
+        exporting::copy_as(&self.grid, format, engine, self.insert_target(), cx);
+    }
+
+    fn export_result(&mut self, format: Format, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session;
+        let suggested = format!(
+            "{}.{}",
+            exporting::file_stem(&self.table),
+            format.extension()
+        );
+        exporting::ask_path(cx, window, suggested, move |this, dest, _, cx| {
+            this.start_export(session, dest, format, cx)
+        });
+    }
+
+    fn start_export(
+        &mut self,
+        asked: Option<SessionId>,
+        dest: std::path::PathBuf,
+        format: Format,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(session), Some(handle), Some(info), Some(spec)) = (
+            self.session,
+            self.handle.clone(),
+            self.info.clone(),
+            self.spec.clone(),
+        ) else {
+            return;
+        };
+        if asked != Some(session)
+            || !matches!(self.phase, TablePhase::Connected)
+            || self.run.is_some()
+            || self.submitting.is_some()
+            || self.export.is_some()
+        {
+            return;
+        }
+        let sql = edit::select_all(
+            info.engine,
+            &self.schema,
+            &spec,
+            &self.applied.0,
+            &self.applied.1,
+        );
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(e) => {
+                self.error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        let run = RunId(self.next_run);
+        self.next_run += 1;
+        let spec = Spec {
+            dest,
+            format,
+            engine: info.engine,
+            table: self.insert_target(),
+        };
+        self.export = Some(exporting::start(
+            cx,
+            handle,
+            session,
+            run,
+            sql,
+            spec,
+            Self::on_export_end,
+        ));
+        self.export_note = None;
+        self.error = None;
+        self.start_spin(cx);
+        self.sync_editable(cx);
+        cx.notify();
+    }
+
+    fn on_export_end(&mut self, outcome: Outcome, cx: &mut Context<Self>) {
+        self.export = None;
+        match outcome {
+            Outcome::Done { rows, name } => {
+                self.export_note = Some(format!("Exported {rows} rows to {name}"))
+            }
+            Outcome::Stopped => self.export_note = Some("Export stopped".into()),
+            Outcome::Failed(message) => self.error = Some(message),
+        }
+        self.sync_editable(cx);
+        cx.notify();
+    }
+
+    fn edit_items(&self, row: usize, col: usize, cx: &mut Context<Self>) -> Vec<MenuItem> {
         match &self.shape {
             Some(Err(reason)) => return vec![MenuItem::new(*reason, |_, _| {}).disabled(true)],
             Some(Ok(_)) if self.can_edit() => {}
@@ -857,6 +1002,7 @@ impl DbTableView {
                 let kept = this.update(cx, |this, cx| {
                     let kept = this.busy.is_some()
                         || this.submitting.is_some()
+                        || this.export.is_some()
                         || matches!(this.phase, TablePhase::Connecting(_));
                     match kept {
                         true => cx.notify(),
@@ -1009,7 +1155,7 @@ impl DbTableView {
                     .into_any_element()
             }
             TablePhase::Connected => {
-                let ready = self.run.is_none();
+                let ready = self.run.is_none() && self.export.is_none();
                 Button::new("db-table-reload", "Reload", ButtonKind::Secondary)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         if ready {
@@ -1067,7 +1213,9 @@ impl DbTableView {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
-        let idle = self.run.is_none() && matches!(self.phase, TablePhase::Connected);
+        let idle = self.run.is_none()
+            && self.export.is_none()
+            && matches!(self.phase, TablePhase::Connected);
         let step = |id: &'static str,
                     label: &'static str,
                     on: bool,
@@ -1116,6 +1264,25 @@ impl DbTableView {
             Button::new("db-table-stop", "Stop", ButtonKind::Danger)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
         });
+        let exporting = self.export.as_ref().map(|export| {
+            let shown = export.busy().shows(std::time::Duration::from_millis(250));
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space(Space::Sm))
+                .when(shown, |el| {
+                    el.child(format!("Exporting {} rows…", export.rows()))
+                })
+                .child(
+                    Button::new("db-table-export-stop", "Stop", ButtonKind::Danger).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, _| {
+                            if let Some(export) = &this.export {
+                                export.stop();
+                            }
+                        }),
+                    ),
+                )
+        });
         div()
             .h(t.ui(28.))
             .flex_none()
@@ -1132,7 +1299,9 @@ impl DbTableView {
             .child(next)
             .child(div().flex_1())
             .children(note)
+            .children(self.export_note.clone())
             .children(submitting)
+            .children(exporting)
             .children(editing)
             .children(stop)
             .into_any_element()
