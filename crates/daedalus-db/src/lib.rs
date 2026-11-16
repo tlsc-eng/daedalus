@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod classify;
 pub mod claude;
 pub mod config;
+pub mod detect;
 pub mod edit;
 pub mod engine;
 pub mod secret;
