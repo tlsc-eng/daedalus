@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use daedalus_db::Engine;
 use daedalus_db::edit::{Change, Shape};
 use daedalus_db::value::Cell;
 use daedalus_ui::{GridMarks, RowMark};
@@ -31,6 +32,11 @@ pub(super) fn locate(row: usize, page_len: usize) -> Slot {
 /// Multi-line and long values stay read-only so the single-line cell editor never mangles them.
 pub(super) fn can_edit_value(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.len() <= MAX_EDIT_BYTES && !v.contains(['\n', '\r']))
+}
+
+/// SQLite text with U+FFFD may hide invalid UTF-8 bytes that an edit would overwrite.
+pub(super) fn may_be_lossy(engine: Engine, value: Option<&str>) -> bool {
+    engine == Engine::Sqlite && value.is_some_and(|v| v.contains('\u{FFFD}'))
 }
 
 /// Values the value panel shows in full can be edited there, line breaks included.
@@ -374,6 +380,15 @@ mod tests {
         assert!(!can_edit_value(Some(&long)));
         let exact = String::from_utf8(vec![b'x'; 4096]).unwrap_or_default();
         assert!(can_edit_value(Some(&exact)));
+    }
+
+    #[test]
+    fn lossy_sqlite_text_is_not_editable() {
+        assert!(may_be_lossy(Engine::Sqlite, Some("a\u{FFFD}b")));
+        assert!(!may_be_lossy(Engine::Sqlite, Some("abc")));
+        assert!(!may_be_lossy(Engine::Sqlite, None));
+        assert!(!may_be_lossy(Engine::Postgres, Some("a\u{FFFD}b")));
+        assert!(!may_be_lossy(Engine::Mysql, Some("a\u{FFFD}b")));
     }
 
     #[test]

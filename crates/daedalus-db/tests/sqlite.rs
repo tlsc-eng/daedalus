@@ -327,6 +327,17 @@ fn null_is_not_empty_string() {
 }
 
 #[test]
+fn invalid_utf8_text_reads_with_replacement_char() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "create table t(x); insert into t values (cast(x'61ff62' as text)); select x from t",
+        100,
+    );
+    assert_eq!(rig.collect(1), Ok(vec![vec![Some("a\u{FFFD}b".into())]]));
+}
+
+#[test]
 fn multi_statement_script() {
     let rig = rig(false);
     rig.run(
