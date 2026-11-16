@@ -638,12 +638,6 @@ impl Element for InputElement {
             false => line.x_for_index(input.shown_len(start, input.cursor)),
         };
         let scroll_x = match lines.get(cursor_line) {
-            Some((_, line)) if !input.text.is_empty() && !follow => scrolled_x(
-                input.scroll_x,
-                input.scroll_x,
-                line.width,
-                bounds.size.width,
-            ),
             Some((start, line)) if !input.text.is_empty() => scrolled_x(
                 input.scroll_x,
                 cursor_x(line, *start),
