@@ -103,6 +103,10 @@ impl Rig {
     }
 
     fn run_mode(&self, run: u64, sql: &str, page: usize, mode: RunMode) {
+        self.run_capped(run, sql, page, mode, true);
+    }
+
+    fn run_capped(&self, run: u64, sql: &str, page: usize, mode: RunMode, capped: bool) {
         self.handle.send(Command::Run {
             session: S,
             run: RunId(run),
@@ -110,6 +114,7 @@ impl Rig {
             page,
             timeout: None,
             mode,
+            capped,
         });
     }
 
@@ -122,6 +127,30 @@ impl Rig {
             session: S,
             run: RunId(run),
         });
+    }
+
+    /// Like `collect`, but pages in `fetch` rows and also reports whether the run was truncated.
+    fn collect_done(&self, run: u64, fetch: usize) -> (usize, bool) {
+        let mut count = 0;
+        loop {
+            match self.next() {
+                Update::Rows { rows, more, .. } => {
+                    count += rows.len();
+                    if more {
+                        self.handle.send(Command::FetchMore {
+                            session: S,
+                            run: RunId(run),
+                            rows: fetch,
+                        });
+                    }
+                }
+                Update::Done {
+                    run: r, truncated, ..
+                } if r == RunId(run) => return (count, truncated),
+                Update::RunError { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
     }
 
     /// Collects every row until the run ends; a run error is returned as `Err`.
@@ -363,6 +392,7 @@ fn timeout_stops_multi_statement_script() {
         page: 100,
         timeout: Some(Duration::from_millis(50)),
         mode: RunMode::Auto,
+        capped: true,
     });
     match rig.collect(2) {
         Err(message) => assert!(message.contains("timed out"), "{message}"),
@@ -684,6 +714,7 @@ fn cancel_queued_during_connect_never_executes() {
             page: 100,
             timeout: None,
             mode: RunMode::Auto,
+            capped: true,
         });
         handle.send(Command::Cancel {
             session: S,
@@ -941,4 +972,20 @@ fn disconnect_during_apply_changes_nothing() {
         scalar(&second, 3, "select x from t"),
         vec![Some("7".into())]
     );
+}
+
+const COUNT_PAST_CAP: &str = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 100005) SELECT x FROM n";
+
+#[test]
+fn uncapped_run_streams_past_the_row_cap() {
+    let rig = rig(false);
+    rig.run_capped(1, COUNT_PAST_CAP, 5000, RunMode::Auto, false);
+    assert_eq!(rig.collect_done(1, 5000), (100_005, false));
+}
+
+#[test]
+fn capped_run_truncates_at_the_row_cap() {
+    let rig = rig(false);
+    rig.run_capped(1, COUNT_PAST_CAP, 5000, RunMode::Auto, true);
+    assert_eq!(rig.collect_done(1, 5000), (100_000, true));
 }

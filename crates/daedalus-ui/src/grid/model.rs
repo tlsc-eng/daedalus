@@ -232,6 +232,36 @@ impl GridModel {
         ))
     }
 
+    pub fn loaded_cells(&self) -> Vec<Vec<Option<String>>> {
+        self.rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| c.as_ref().map(|v| v.to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn export_cells(&self) -> (Range<usize>, Vec<Vec<Option<String>>>) {
+        match self.selection() {
+            Some((rows, cols)) if rows.len() > 1 || cols.len() > 1 => {
+                let end = rows.end.min(self.rows.len());
+                let start = rows.start.min(end);
+                let picked = self.rows[start..end]
+                    .iter()
+                    .map(|r| {
+                        cols.clone()
+                            .map(|c| r.get(c).and_then(|v| v.as_ref()).map(|v| v.to_string()))
+                            .collect()
+                    })
+                    .collect();
+                (cols, picked)
+            }
+            _ => (0..self.columns.len(), self.loaded_cells()),
+        }
+    }
+
     pub fn copy_text(&self) -> Option<String> {
         let (rows, cols) = self.selection()?;
         let cell = |r: usize, c: usize| {
@@ -469,6 +499,46 @@ mod tests {
 
     fn pos(row: usize, col: usize) -> CellPos {
         CellPos { row, col }
+    }
+
+    #[test]
+    fn export_cells_uses_a_multi_cell_selection() {
+        let mut m = grid(4, 3, false);
+        m.select(pos(1, 1), false);
+        m.select(pos(2, 2), true);
+        let (cols, rows) = m.export_cells();
+        assert_eq!(cols, 1..3);
+        assert_eq!(
+            rows,
+            vec![
+                vec![cell("1-1"), cell("1-2")],
+                vec![cell("2-1"), cell("2-2")]
+            ]
+        );
+    }
+
+    #[test]
+    fn export_cells_single_cell_means_all_rows() {
+        let mut m = grid(3, 2, false);
+        m.select(pos(1, 1), false);
+        let (cols, rows) = m.export_cells();
+        assert_eq!((cols, rows.len()), (0..2, 3));
+    }
+
+    #[test]
+    fn export_cells_without_selection_is_all_rows() {
+        let m = grid(3, 2, false);
+        let (cols, rows) = m.export_cells();
+        assert_eq!((cols, rows), (0..2, m.loaded_cells()));
+    }
+
+    #[test]
+    fn loaded_cells_ignores_the_selection() {
+        let mut m = grid(3, 2, false);
+        m.select(pos(0, 0), false);
+        m.select(pos(1, 1), true);
+        assert_eq!(m.loaded_cells().len(), 3);
+        assert_eq!(m.loaded_cells()[2], vec![cell("2-0"), cell("2-1")]);
     }
 
     #[test]

@@ -38,6 +38,28 @@ pub fn select_page(
     order: &str,
     offset: usize,
 ) -> Result<String, String> {
+    select(engine, schema, table, filter, order, Some(offset))
+}
+
+/// The table's full filtered, ordered select with no LIMIT, for export.
+pub fn select_all(
+    engine: Engine,
+    schema: &str,
+    table: &Table,
+    filter: &str,
+    order: &str,
+) -> Result<String, String> {
+    select(engine, schema, table, filter, order, None)
+}
+
+fn select(
+    engine: Engine,
+    schema: &str,
+    table: &Table,
+    filter: &str,
+    order: &str,
+    offset: Option<usize>,
+) -> Result<String, String> {
     let filter = filter.trim();
     let order = order.trim();
     if filter.contains(';') {
@@ -72,7 +94,12 @@ pub fn select_page(
     if !order.is_empty() {
         sql.push_str(&format!("ORDER BY\n{order}\n"));
     }
-    sql.push_str(&format!("LIMIT {} OFFSET {offset}", PAGE_ROWS + 1));
+    if let Some(offset) = offset {
+        sql.push_str(&format!("LIMIT {} OFFSET {offset}", PAGE_ROWS + 1));
+    } else if sql.ends_with('\n') {
+        // The classifier needs the statement to end at the last clause, as the LIMIT line does for a page.
+        sql.pop();
+    }
     let stmts = classify::split(&sql, engine);
     if stmts.len() != 1 || stmts[0].kind != Kind::Read || stmts[0].range.end != sql.len() {
         return Err("The filter and order must be expressions, not statements.".to_string());
@@ -382,6 +409,20 @@ mod tests {
             sql,
             "SELECT * FROM \"public\".\"t\"\nORDER BY\n\"a\", \"b\"\nLIMIT 501 OFFSET 0"
         );
+    }
+
+    #[test]
+    fn select_all_has_no_limit_and_keeps_filter_and_order() {
+        let paged =
+            select_page(Engine::Mysql, "d", &users(), " id > 1 ", " name DESC ", 0).unwrap();
+        let all = select_all(Engine::Mysql, "d", &users(), " id > 1 ", " name DESC ").unwrap();
+        assert_eq!(all, paged.strip_suffix("\nLIMIT 501 OFFSET 0").unwrap());
+    }
+
+    #[test]
+    fn select_all_refuses_semicolon_filter() {
+        let r = select_all(Engine::Postgres, "p", &users(), "1=1; DROP TABLE t", "");
+        assert_eq!(r, Err("Remove the ; from the filter.".to_string()));
     }
 
     #[test]

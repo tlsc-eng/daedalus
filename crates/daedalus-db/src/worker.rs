@@ -61,6 +61,8 @@ pub enum Command {
         page: usize,
         timeout: Option<Duration>,
         mode: RunMode,
+        /// False lifts the result cap, for a consumer that writes each page out before asking for more.
+        capped: bool,
     },
     Transaction {
         session: SessionId,
@@ -343,6 +345,7 @@ async fn session_task(
                 page,
                 timeout,
                 mode,
+                capped,
                 ..
             } => {
                 let early = queued
@@ -443,6 +446,7 @@ async fn session_task(
                     sql,
                     page: page.max(1),
                     timeout,
+                    capped,
                 };
                 if !run_job(&driver, &mut rx, &mut queued, &updates, job).await {
                     return;
@@ -880,6 +884,7 @@ struct Job {
     sql: String,
     page: usize,
     timeout: Option<Duration>,
+    capped: bool,
 }
 
 fn timeout_message(timeout: Duration) -> String {
@@ -993,6 +998,7 @@ async fn run_job(
         sql,
         page,
         timeout,
+        capped,
     } = job;
     let started = Instant::now();
     let canceller = driver.canceller();
@@ -1139,7 +1145,7 @@ async fn run_job(
                 });
             }
             Some(Ok(Item::Row(row))) => {
-                if !budget.admit(&row) {
+                if capped && !budget.admit(&row) {
                     truncated = true;
                     cancel().await;
                     break;
@@ -1255,6 +1261,7 @@ mod tests {
             page: 500,
             timeout: None,
             mode: RunMode::Auto,
+            capped: true,
         });
         assert!(
             matches!(update, Update::RunError { ref message, .. } if message == "not connected")

@@ -1,6 +1,9 @@
 //! Row-at-a-time writers that turn a result into CSV, TSV, JSON or SQL INSERT text.
 
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Engine;
 use crate::edit::quote_ident;
@@ -13,6 +16,26 @@ pub enum Format {
     Tsv,
     Json,
     Insert,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Csv => "csv",
+            Format::Tsv => "tsv",
+            Format::Json => "json",
+            Format::Insert => "sql",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Csv => "CSV",
+            Format::Tsv => "TSV",
+            Format::Json => "JSON",
+            Format::Insert => "SQL INSERT",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +191,94 @@ impl<W: Write> Exporter<W> {
         }
         self.out.flush()?;
         Ok(self.out)
+    }
+}
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Streams an export into a hidden temp file that replaces the destination only on commit.
+pub struct FileExport {
+    exporter: Option<Exporter<BufWriter<File>>>,
+    temp: PathBuf,
+    dest: PathBuf,
+    rows: u64,
+    committed: bool,
+}
+
+impl FileExport {
+    pub fn create(
+        dest: &Path,
+        format: Format,
+        engine: Engine,
+        table: Option<String>,
+        columns: &[Column],
+    ) -> io::Result<Self> {
+        let name = dest.file_name().map(|n| n.to_string_lossy().into_owned());
+        let name = name.unwrap_or_else(|| "export".to_string());
+        // Beside the destination, because rename is only atomic within one filesystem.
+        // The sequence keeps two exports to one destination from deleting each other's temp.
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp = dest.with_file_name(format!(".{name}.{}.{seq}.part", std::process::id()));
+        let _ = fs::remove_file(&temp);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&temp)?;
+        let writer = BufWriter::with_capacity(1 << 16, file);
+        let exporter = match Exporter::new(format, engine, table, columns, writer) {
+            Ok(exporter) => exporter,
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            exporter: Some(exporter),
+            temp,
+            dest: dest.to_path_buf(),
+            rows: 0,
+            committed: false,
+        })
+    }
+
+    pub fn write(&mut self, rows: &[Vec<Cell>]) -> io::Result<()> {
+        let Some(exporter) = self.exporter.as_mut() else {
+            return Ok(());
+        };
+        for row in rows {
+            exporter.row(row)?;
+            self.rows += 1;
+        }
+        Ok(())
+    }
+
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Finishes the file and moves it over the destination, returning the row count.
+    pub fn commit(mut self) -> io::Result<u64> {
+        let Some(exporter) = self.exporter.take() else {
+            return Ok(self.rows);
+        };
+        let file = exporter
+            .finish()?
+            .into_inner()
+            .map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.temp, &self.dest)?;
+        self.committed = true;
+        Ok(self.rows)
+    }
+}
+
+impl Drop for FileExport {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp);
+        }
     }
 }
 
@@ -347,6 +458,113 @@ mod tests {
 
     fn s(v: &str) -> Cell {
         Some(v.into())
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("daedalus-export-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn file_export_commit_replaces_destination() {
+        let dir = scratch("commit");
+        let dest = dir.join("out.csv");
+        fs::write(&dest, "old").unwrap();
+        let mut f = FileExport::create(
+            &dest,
+            Format::Csv,
+            Engine::Sqlite,
+            None,
+            &[col("a", "text")],
+        )
+        .unwrap();
+        f.write(&[vec![s("x")], vec![s("y")]]).unwrap();
+        assert_eq!(f.rows(), 2);
+        assert_eq!(f.commit().unwrap(), 2);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "a\r\nx\r\ny\r\n");
+        assert_eq!(leftovers(&dir), ["out.csv"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_export_drop_without_commit_keeps_old_file() {
+        let dir = scratch("drop");
+        let dest = dir.join("out.csv");
+        fs::write(&dest, "old").unwrap();
+        let mut f = FileExport::create(
+            &dest,
+            Format::Csv,
+            Engine::Sqlite,
+            None,
+            &[col("a", "text")],
+        )
+        .unwrap();
+        f.write(&[vec![s("x")]]).unwrap();
+        drop(f);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old");
+        assert_eq!(leftovers(&dir), ["out.csv"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_exports_to_one_destination_do_not_share_a_temp() {
+        let dir = scratch("concurrent");
+        let dest = dir.join("out.csv");
+        let cols = [col("a", "text")];
+        let mut a = FileExport::create(&dest, Format::Csv, Engine::Sqlite, None, &cols).unwrap();
+        let mut b = FileExport::create(&dest, Format::Csv, Engine::Sqlite, None, &cols).unwrap();
+        a.write(&[vec![s("from-a")]]).unwrap();
+        b.write(&[vec![s("from-b")]]).unwrap();
+        a.commit().unwrap();
+        drop(b);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "a\r\nfrom-a\r\n");
+        assert_eq!(leftovers(&dir), ["out.csv"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_export_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let dest = dir.join("out.csv");
+        let f = FileExport::create(
+            &dest,
+            Format::Csv,
+            Engine::Sqlite,
+            None,
+            &[col("a", "text")],
+        )
+        .unwrap();
+        f.commit().unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extension_and_label_cover_every_format() {
+        let all = [
+            (Format::Csv, "csv", "CSV"),
+            (Format::Tsv, "tsv", "TSV"),
+            (Format::Json, "json", "JSON"),
+            (Format::Insert, "sql", "SQL INSERT"),
+        ];
+        for (format, ext, label) in all {
+            assert_eq!((format.extension(), format.label()), (ext, label));
+        }
     }
 
     fn run(format: Format, engine: Engine, cols: &[Column], rows: &[Vec<Cell>]) -> String {

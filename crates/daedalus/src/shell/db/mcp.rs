@@ -399,14 +399,7 @@ impl Shell {
             meta.claude_runs += 1;
         }
         tracing::debug!(connection = %listed.conn.id, run = run.0, rows, "claude query started");
-        self.db.send(Command::Run {
-            session,
-            run,
-            sql: gated,
-            page: rows as usize,
-            timeout: Some(QUERY_TIMEOUT),
-            mode: RunMode::ReadOnly,
-        });
+        self.db.send(claude_run(session, run, gated, rows));
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEADLINE).await;
             let _ = this.update(cx, |shell, cx| shell.db_claude_expire(session, run, cx));
@@ -484,6 +477,19 @@ impl Shell {
     }
 }
 
+/// Claude's results are never allowed past the row cap, whatever else changes about export runs.
+fn claude_run(session: SessionId, run: RunId, sql: String, rows: u32) -> Command {
+    Command::Run {
+        session,
+        run,
+        sql,
+        page: rows as usize,
+        timeout: Some(QUERY_TIMEOUT),
+        mode: RunMode::ReadOnly,
+        capped: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::{Receiver, sync_channel};
@@ -509,6 +515,19 @@ mod tests {
             run,
             columns,
         }
+    }
+
+    #[test]
+    fn claude_runs_keep_the_result_cap() {
+        let cmd = claude_run(S, RunId(1), "select 1".into(), 10);
+        assert!(matches!(
+            cmd,
+            Command::Run {
+                capped: true,
+                mode: RunMode::ReadOnly,
+                ..
+            }
+        ));
     }
 
     #[test]

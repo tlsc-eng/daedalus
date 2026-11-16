@@ -518,6 +518,17 @@ impl DataGrid {
         }));
     }
 
+    /// The cells Copy as works on: a multi-cell selection, or every loaded row.
+    pub fn export_cells(&self) -> (Vec<GridColumn>, Vec<Vec<Option<String>>>) {
+        let (cols, rows) = self.model.export_cells();
+        (self.model.columns[cols].to_vec(), rows)
+    }
+
+    /// Every column and loaded row, for exporting what the grid holds.
+    pub fn loaded_cells(&self) -> (Vec<GridColumn>, Vec<Vec<Option<String>>>) {
+        (self.model.columns.clone(), self.model.loaded_cells())
+    }
+
     pub fn row_count(&self) -> usize {
         self.model.rows.len()
     }
