@@ -1575,6 +1575,7 @@ mod tests {
             conn: Connection {
                 host: "localhost".into(),
                 port: Some(5432),
+                ca_file: None,
                 ..base()
             },
             password: None,
