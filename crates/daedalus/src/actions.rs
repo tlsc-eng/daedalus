@@ -107,6 +107,22 @@ actions!(daedalus, [GitOpenTimeline, GitToggleFileBlame]);
 actions!(daedalus, [RunStatement, RunAll, StopRun]);
 
 actions!(
+    data_explorer,
+    [
+        SelectPrev,
+        SelectNext,
+        SelectFirst,
+        SelectLast,
+        SelectPageUp,
+        SelectPageDown,
+        CollapseOrParent,
+        ExpandOrChild,
+        OpenSelected,
+        Leave
+    ]
+);
+
+actions!(
     daedalus,
     [
         ShowSessions,
@@ -237,6 +253,18 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", NextGroup, Some("Spotlight")),
         KeyBinding::new("shift-tab", PrevGroup, Some("Spotlight")),
         KeyBinding::new("cmd-shift-f", OpenInSearchPanel, Some("Spotlight")),
+        KeyBinding::new("up", SelectPrev, Some("DataExplorer")),
+        KeyBinding::new("down", SelectNext, Some("DataExplorer")),
+        KeyBinding::new("home", SelectFirst, Some("DataExplorer")),
+        KeyBinding::new("end", SelectLast, Some("DataExplorer")),
+        KeyBinding::new("cmd-up", SelectFirst, Some("DataExplorer")),
+        KeyBinding::new("cmd-down", SelectLast, Some("DataExplorer")),
+        KeyBinding::new("pageup", SelectPageUp, Some("DataExplorer")),
+        KeyBinding::new("pagedown", SelectPageDown, Some("DataExplorer")),
+        KeyBinding::new("left", CollapseOrParent, Some("DataExplorer")),
+        KeyBinding::new("right", ExpandOrChild, Some("DataExplorer")),
+        KeyBinding::new("enter", OpenSelected, Some("DataExplorer")),
+        KeyBinding::new("escape", Leave, Some("DataExplorer")),
         KeyBinding::new("cmd-alt-shift-g", ToggleBlame, None),
         KeyBinding::new("ctrl--", NavigateBack, None),
         // macOS reports ⌃⇧- as ⌃_, so that is the binding that matches; the other is for the menu.
@@ -529,6 +557,21 @@ mod tests {
         }
         assert_eq!(Keystroke::parse("ctrl--").unwrap().key, "-");
         assert_eq!(Keystroke::parse("ctrl-_").unwrap().key, "_");
+    }
+
+    #[test]
+    fn explorer_keystrokes_parse() {
+        for source in ["cmd-up", "cmd-down"] {
+            assert!(
+                Keystroke::parse(source).unwrap().modifiers.platform,
+                "{source}"
+            );
+        }
+        for key in [
+            "pageup", "pagedown", "home", "end", "enter", "escape", "left", "right",
+        ] {
+            assert_eq!(Keystroke::parse(key).unwrap().key, key);
+        }
     }
 
     #[test]
