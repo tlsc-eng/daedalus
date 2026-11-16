@@ -442,11 +442,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("ssh");
         let text = format!(
-            "#!/bin/sh\n{}",
+            "#!/bin/sh\n[ \"$1\" = --probe-noop ] && exit 0\n{}",
             body.replace("{dir}", &dir.to_string_lossy())
         );
         std::fs::write(&program, text).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A concurrent fork can briefly hold the write fd, making exec fail with ETXTBSY.
+        for _ in 0..50 {
+            match std::process::Command::new(&program)
+                .arg("--probe-noop")
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
         (dir, program)
     }
 
