@@ -6,6 +6,7 @@ use crate::config::Engine;
 use crate::edit::quote_ident;
 use crate::value::{Cell, Column};
 
+/// Output format of an export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Csv,
@@ -40,9 +41,8 @@ impl Kind {
             "real" | "float4" | "float8" | "double" | "double precision" | "float" => Kind::Float,
             "numeric" | "decimal" | "newdecimal" => Kind::Decimal,
             "bool" | "boolean" => Kind::Bool,
-            "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => {
-                Kind::Binary
-            }
+            "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary"
+            | "bit" => Kind::Binary,
             _ if engine == Engine::Sqlite => {
                 if base.contains("int") {
                     Kind::Int
@@ -64,6 +64,7 @@ pub struct Exporter<W: Write> {
     format: Format,
     engine: Engine,
     names: Vec<String>,
+    json_keys: Vec<String>,
     kinds: Vec<Kind>,
     insert_head: String,
     rows: usize,
@@ -94,6 +95,7 @@ impl<W: Write> Exporter<W> {
         let mut exporter = Exporter {
             format,
             engine,
+            json_keys: unique_keys(&names),
             names,
             kinds,
             insert_head,
@@ -114,6 +116,7 @@ impl<W: Write> Exporter<W> {
         Ok(exporter)
     }
 
+    /// Writes one row; cells beyond the row's length count as NULL.
     pub fn row(&mut self, row: &[Cell]) -> io::Result<()> {
         let cell = |i: usize| row.get(i).and_then(|c| c.as_deref());
         let count = self.names.len();
@@ -140,7 +143,7 @@ impl<W: Write> Exporter<W> {
                     write!(
                         self.out,
                         "{}: {}",
-                        json_string(&self.names[i]),
+                        json_string(&self.json_keys[i]),
                         json_value(self.kinds[i], cell(i))
                     )?;
                 }
@@ -184,6 +187,25 @@ pub fn to_string(
         exporter.finish()
     };
     String::from_utf8(run().unwrap_or_default()).unwrap_or_default()
+}
+
+fn unique_keys(names: &[String]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = names.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    names
+        .iter()
+        .map(|name| {
+            if seen.insert(name.clone()) {
+                return name.clone();
+            }
+            let key = (2..)
+                .map(|n| format!("{name}_{n}"))
+                .find(|k| !taken.contains(k))
+                .unwrap_or_default();
+            taken.insert(key.clone());
+            key
+        })
+        .collect()
 }
 
 fn csv_field(value: &str) -> String {
@@ -272,12 +294,16 @@ fn json_value(kind: Kind, cell: Option<&str>) -> String {
 }
 
 fn sql_string(engine: Engine, s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let escaped = engine == Engine::Postgres && s.contains('\\');
+    let mut out = String::with_capacity(s.len() + 3);
+    if escaped {
+        out.push('E');
+    }
     out.push('\'');
     for c in s.chars() {
         match c {
             '\'' => out.push_str("''"),
-            '\\' if engine == Engine::Mysql => out.push_str("\\\\"),
+            '\\' if escaped || engine == Engine::Mysql => out.push_str("\\\\"),
             _ => out.push(c),
         }
     }
@@ -299,7 +325,7 @@ fn sql_value(engine: Engine, kind: Kind, cell: Option<&str>) -> String {
             (None, _) => sql_string(engine, text),
         },
         Kind::Binary => match hex_body(text) {
-            Some(body) if engine == Engine::Postgres => format!("'\\x{body}'::bytea"),
+            Some(body) if engine == Engine::Postgres => format!("decode('{body}', 'hex')"),
             Some(body) => format!("X'{body}'"),
             None => sql_string(engine, text),
         },
@@ -384,7 +410,42 @@ mod tests {
         let rows = vec![vec![s("1"), s("x")], vec![s("01"), s("y\"")]];
         assert_eq!(
             run(Format::Json, Engine::Postgres, &cols, &rows),
-            "[\n  {\"a\": 1, \"a\": \"x\"},\n  {\"a\": \"01\", \"a\": \"y\\\"\"}\n]\n"
+            "[\n  {\"a\": 1, \"a_2\": \"x\"},\n  {\"a\": \"01\", \"a_2\": \"y\\\"\"}\n]\n"
+        );
+    }
+
+    #[test]
+    fn json_duplicate_keys_skip_taken_suffixes() {
+        let cols = [
+            col("id", "text"),
+            col("id", "text"),
+            col("id_2", "text"),
+            col("id", "text"),
+        ];
+        let rows = vec![vec![s("a"), s("b"), s("c"), s("d")]];
+        assert_eq!(
+            run(Format::Json, Engine::Postgres, &cols, &rows),
+            "[\n  {\"id\": \"a\", \"id_3\": \"b\", \"id_2\": \"c\", \"id_4\": \"d\"}\n]\n"
+        );
+    }
+
+    #[test]
+    fn postgres_backslash_uses_escape_string() {
+        let cols = [col("t", "text"), col("b", "bytea")];
+        let rows = vec![vec![s("a\\b'c"), s("\\xdead")]];
+        assert_eq!(
+            run(Format::Insert, Engine::Postgres, &cols, &rows),
+            "INSERT INTO \"result\" (\"t\", \"b\") VALUES (E'a\\\\b''c', decode('dead', 'hex'));\n"
+        );
+    }
+
+    #[test]
+    fn mysql_text_bit_and_varbinary() {
+        let cols = [col("t", "text"), col("v", "varbinary"), col("b", "bit")];
+        let rows = vec![vec![s("\\x41"), s("\\xff00"), s("\\x01")]];
+        assert_eq!(
+            run(Format::Insert, Engine::Mysql, &cols, &rows),
+            "INSERT INTO `result` (`t`, `v`, `b`) VALUES ('\\\\x41', X'ff00', X'01');\n"
         );
     }
 
@@ -394,7 +455,7 @@ mod tests {
         let rows = vec![vec![s("1"), s("o'k\\")]];
         assert_eq!(
             run(Format::Insert, Engine::Postgres, &cols, &rows),
-            "INSERT INTO \"result\" (\"id\", \"n\"\"x\") VALUES (1, 'o''k\\');\n"
+            "INSERT INTO \"result\" (\"id\", \"n\"\"x\") VALUES (1, E'o''k\\\\');\n"
         );
         assert_eq!(
             run(Format::Insert, Engine::Sqlite, &cols, &rows),
@@ -422,7 +483,7 @@ mod tests {
             ));
         }
         let q = |c: &str| format!("INSERT INTO t ({c}) VALUES ");
-        let pg = q("\"b\", \"x\", \"n\"") + "(TRUE, '\\xdead'::bytea, '1; DROP TABLE t');\n";
+        let pg = q("\"b\", \"x\", \"n\"") + "(TRUE, decode('dead', 'hex'), '1; DROP TABLE t');\n";
         let my = q("`b`, `x`, `n`") + "(TRUE, X'dead', '1; DROP TABLE t');\n";
         let lite = q("\"b\", \"x\", \"n\"") + "(1, X'dead', '1; DROP TABLE t');\n";
         assert_eq!(out, format!("{pg}{my}{lite}"));
