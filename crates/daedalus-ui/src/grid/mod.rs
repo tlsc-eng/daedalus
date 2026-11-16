@@ -3,7 +3,7 @@ mod value;
 
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
@@ -18,10 +18,12 @@ use crate::components::Tooltip;
 use crate::motion::{self, Busy, Glide, Opening};
 use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
+const MAX_UNDRAWN_TICKS: u8 = 6;
+
 use model::{
-    CellPos, GridModel, Kind, MAX_COL_W, bar_offset, cell_at, column_lefts, column_width,
-    display_text, drag_width, gutter_chars, page_rows, reveal_x, scroll_strategy, scrollable,
-    style_for, thumb, visible_columns, visible_rows,
+    CellPos, GridModel, Kind, MAX_COL_W, autoscroll_speed, autoscroll_step, bar_offset, cell_at,
+    column_lefts, column_width, display_text, drag_width, edge_overshoot, gutter_chars, page_rows,
+    reveal_x, scroll_strategy, scrollable, style_for, thumb, visible_columns, visible_rows,
 };
 pub use model::{GridColumn, GridMarks, RowMark};
 use value::Inspected;
@@ -139,6 +141,10 @@ pub struct DataGrid {
     char_w: f32,
     pad_w: f32,
     drag: Option<Drag>,
+    drag_pos: Option<Point<Pixels>>,
+    autoscroll: Option<Task<()>>,
+    autoscroll_at: Option<Instant>,
+    undrawn_ticks: u8,
     editable: bool,
     marks: GridMarks,
     editing: Option<Editing>,
@@ -180,6 +186,10 @@ impl DataGrid {
             char_w: 0.,
             pad_w: 0.,
             drag: None,
+            drag_pos: None,
+            autoscroll: None,
+            autoscroll_at: None,
+            undrawn_ticks: 0,
             editable: false,
             marks: GridMarks::default(),
             editing: None,
@@ -199,6 +209,9 @@ impl DataGrid {
         cx: &mut Context<Self>,
     ) {
         self.model.show(columns, rows, more);
+        self.drag = None;
+        self.drag_pos = None;
+        self.stop_autoscroll();
         if let Some(editing) = self.editing.take() {
             self.refocus_pending = Some(editing.input.focus_handle(cx));
         }
@@ -786,6 +799,7 @@ impl DataGrid {
         &mut self,
         pos: Point<Pixels>,
         pressed: Option<MouseButton>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if pressed != Some(MouseButton::Left) {
@@ -805,25 +819,16 @@ impl DataGrid {
                 }
             }
             Some(Drag::Select { rows }) => {
-                let base = self.scroll.0.borrow().base_handle.clone();
-                let b = base.bounds();
-                let offset = base.offset();
-                let x = f32::from(pos.x - b.origin.x - offset.x) - self.gutter_w;
-                let y = f32::from(pos.y - b.origin.y - offset.y);
-                let Some((row, col)) =
-                    cell_at(x, y, &self.lefts, self.row_h, self.model.rows.len())
-                else {
-                    return;
-                };
-                if rows {
-                    self.model.select_row(row, true);
+                self.drag_pos = Some(pos);
+                if self.drag_overshoot(pos, rows) == (0., 0.) {
+                    self.autoscroll = None;
+                    self.autoscroll_at = None;
+                    self.select_at(pos, rows, true);
                 } else {
-                    self.model.select(CellPos { row, col }, true);
-                }
-                if rows {
-                    self.reveal_row(row);
-                } else {
-                    self.reveal(CellPos { row, col });
+                    self.select_at(pos, rows, false);
+                    if self.autoscroll.is_none() && window.is_window_active() {
+                        self.start_autoscroll(window, cx);
+                    }
                 }
                 cx.notify();
             }
@@ -831,6 +836,110 @@ impl DataGrid {
             Some(Drag::HBar) => self.bar_to(pos, false, cx),
             None => {}
         }
+    }
+
+    /// Pointer overshoot past the body in px (x, y); a gutter drag never overshoots sideways.
+    fn drag_overshoot(&self, pos: Point<Pixels>, rows: bool) -> (f32, f32) {
+        let b = self.scroll.0.borrow().base_handle.bounds();
+        let over_y = edge_overshoot(f32::from(pos.y), f32::from(b.top()), f32::from(b.bottom()));
+        let over_x = if rows {
+            0.
+        } else {
+            edge_overshoot(
+                f32::from(pos.x),
+                f32::from(b.left()) + self.gutter_w,
+                f32::from(b.right()),
+            )
+        };
+        (over_x, over_y)
+    }
+
+    /// Reveal stays off while the pointer is outside so only the ticker scrolls.
+    fn select_at(&mut self, pos: Point<Pixels>, rows: bool, reveal: bool) {
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let b = base.bounds();
+        let offset = base.offset();
+        let left = f32::from(b.left()) + self.gutter_w;
+        let px_x = f32::from(pos.x).clamp(left, (f32::from(b.right()) - 1.).max(left));
+        let top = f32::from(b.top());
+        let px_y = f32::from(pos.y).clamp(top, (f32::from(b.bottom()) - 1.).max(top));
+        let x = px_x - f32::from(b.origin.x) - f32::from(offset.x) - self.gutter_w;
+        let y = px_y - f32::from(b.origin.y) - f32::from(offset.y);
+        let Some((row, col)) = cell_at(x, y, &self.lefts, self.row_h, self.model.rows.len()) else {
+            return;
+        };
+        if rows {
+            self.model.select_row(row, true);
+        } else {
+            self.model.select(CellPos { row, col }, true);
+        }
+        if reveal {
+            if rows {
+                self.reveal_row(row);
+            } else {
+                self.reveal(CellPos { row, col });
+            }
+        }
+    }
+
+    fn start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.autoscroll_at = Some(Instant::now());
+        self.undrawn_ticks = 0;
+        self.autoscroll = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let kept = this.update_in(cx, |this, window, cx| this.autoscroll_tick(window, cx));
+                if !kept.unwrap_or(false) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let rows = match self.drag {
+            Some(Drag::Select { rows }) => Some(rows),
+            _ => None,
+        };
+        let pos = self.drag_pos;
+        let (Some(rows), Some(pos)) = (rows, pos) else {
+            return self.stop_autoscroll();
+        };
+        // The drag hook repaints every frame; if it stops, mouse-up can no longer reach us.
+        self.undrawn_ticks = self.undrawn_ticks.saturating_add(1);
+        if !window.is_window_active() || self.undrawn_ticks > MAX_UNDRAWN_TICKS {
+            self.drag = None;
+            self.drag_pos = None;
+            return self.stop_autoscroll();
+        }
+        let now = Instant::now();
+        let dt = self
+            .autoscroll_at
+            .replace(now)
+            .map_or(0., |t| now.duration_since(t).as_secs_f32());
+        let (over_x, over_y) = self.drag_overshoot(pos, rows);
+        if (over_x, over_y) == (0., 0.) {
+            return self.stop_autoscroll();
+        }
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let offset = base.offset();
+        let max = base.max_offset();
+        let dy = autoscroll_step(autoscroll_speed(over_y, self.row_h), dt);
+        let dx = autoscroll_step(autoscroll_speed(over_x, self.row_h), dt);
+        let y = (-f32::from(offset.y) + dy).clamp(0., f32::from(max.height));
+        let x = (-f32::from(offset.x) + dx).clamp(0., f32::from(max.width));
+        base.set_offset(point(px(-x), px(-y)));
+        self.select_at(pos, rows, false);
+        cx.notify();
+        true
+    }
+
+    fn stop_autoscroll(&mut self) -> bool {
+        self.autoscroll = None;
+        self.autoscroll_at = None;
+        false
     }
 
     fn bar_to(&mut self, pos: Point<Pixels>, vertical: bool, cx: &mut Context<Self>) {
@@ -870,6 +979,9 @@ impl DataGrid {
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
+        self.drag_pos = None;
+        self.autoscroll = None;
+        self.autoscroll_at = None;
         cx.notify();
     }
 
@@ -880,12 +992,13 @@ impl DataGrid {
         Some(
             gpui::canvas(
                 |_, _, _| {},
-                move |_, _, window, _| {
+                move |_, _, window, cx| {
+                    grid.update(cx, |this, _| this.undrawn_ticks = 0).ok();
                     let g = grid.clone();
-                    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                    window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
                             g.update(cx, |this, cx| {
-                                this.drag_move(e.position, e.pressed_button, cx)
+                                this.drag_move(e.position, e.pressed_button, window, cx)
                             })
                             .ok();
                         }

@@ -347,6 +347,37 @@ pub(crate) fn drag_width(start_w: f32, start_x: f32, x: f32, min: f32) -> f32 {
     (start_w + x - start_x).clamp(min, MAX_COL_W.max(min))
 }
 
+const AUTOSCROLL_GAIN: f32 = 10.;
+const AUTOSCROLL_MIN_UNITS: f32 = 2.;
+const AUTOSCROLL_MAX_UNITS: f32 = 40.;
+const AUTOSCROLL_MAX_DT: f32 = 0.05;
+
+/// How far `p` is past `lo..=hi`: negative before it, positive after it, zero inside.
+pub(crate) fn edge_overshoot(p: f32, lo: f32, hi: f32) -> f32 {
+    if p < lo {
+        p - lo
+    } else if p > hi {
+        p - hi
+    } else {
+        0.
+    }
+}
+
+/// Autoscroll speed in px/s for an overshoot in px; `unit` is one row height.
+pub(crate) fn autoscroll_speed(over: f32, unit: f32) -> f32 {
+    if over == 0. || unit <= 0. || !over.is_finite() || !unit.is_finite() {
+        return 0.;
+    }
+    over.signum()
+        * (over.abs() * AUTOSCROLL_GAIN)
+            .clamp(AUTOSCROLL_MIN_UNITS * unit, AUTOSCROLL_MAX_UNITS * unit)
+}
+
+/// Pixels to scroll this tick; a stalled frame never jumps more than `AUTOSCROLL_MAX_DT` of travel.
+pub(crate) fn autoscroll_step(speed: f32, dt: f32) -> f32 {
+    speed * dt.clamp(0., AUTOSCROLL_MAX_DT)
+}
+
 /// Rows moved by one page key: a screen minus one row of overlap, never fewer than one.
 pub(crate) fn page_rows(body_h: f32, row_h: f32) -> usize {
     if row_h <= 0. || !body_h.is_finite() || !row_h.is_finite() {
@@ -472,6 +503,33 @@ pub(crate) fn reveal_x(scroll_x: f32, left: f32, right: f32, width: f32) -> f32 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edge_overshoot_is_signed_and_zero_inside() {
+        assert_eq!(edge_overshoot(5., 10., 100.), -5.);
+        assert_eq!(edge_overshoot(50., 10., 100.), 0.);
+        assert_eq!(edge_overshoot(130., 10., 100.), 30.);
+        assert_eq!(edge_overshoot(10., 10., 100.), 0.);
+        assert_eq!(edge_overshoot(100., 10., 100.), 0.);
+    }
+
+    #[test]
+    fn autoscroll_speed_grows_with_distance_and_is_clamped() {
+        assert_eq!(autoscroll_speed(1., 20.), 40.);
+        assert_eq!(autoscroll_speed(30., 20.), 300.);
+        assert_eq!(autoscroll_speed(1000., 20.), 800.);
+        assert_eq!(autoscroll_speed(-30., 20.), -300.);
+        assert_eq!(autoscroll_speed(0., 20.), 0.);
+        assert_eq!(autoscroll_speed(30., 0.), 0.);
+        assert_eq!(autoscroll_speed(f32::NAN, 20.), 0.);
+    }
+
+    #[test]
+    fn autoscroll_step_caps_a_long_frame() {
+        assert!((autoscroll_step(300., 0.016) - 4.8).abs() < 1e-4);
+        assert!((autoscroll_step(300., 1.0) - 15.).abs() < 1e-4);
+        assert_eq!(autoscroll_step(300., -1.0), 0.);
+    }
+
     use super::*;
 
     fn cols(n: usize) -> Vec<GridColumn> {
