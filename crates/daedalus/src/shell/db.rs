@@ -10,8 +10,8 @@ use daedalus_ui::motion::{self, Busy, Closing};
 use daedalus_ui::{ActiveTheme, Theme};
 use daedalus_workspace::ItemKind;
 use gpui::{
-    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, Subscription, Task, Window,
-    div, prelude::*, px,
+    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, Subscription, Task,
+    UniformListScrollHandle, Window, div, prelude::*, px,
 };
 
 use super::Shell;
@@ -67,6 +67,7 @@ enum Keychain {
 
 #[derive(Default)]
 pub(super) struct DbState {
+    pub(super) scroll: UniformListScrollHandle,
     handle: Option<Handle>,
     _updates: Option<Task<()>>,
     store: Option<Store>,
