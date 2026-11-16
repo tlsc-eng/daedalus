@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::future::ready;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,7 +37,8 @@ use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column, TableRef};
 
-const DEFAULT_PORT: u16 = 5432;
+const NO_TUNNEL: &str = "SSH tunnels are not supported in this build yet.";
+pub(crate) const DEFAULT_PORT: u16 = 5432;
 
 pub struct Pg {
     client: Arc<Client>,
@@ -245,8 +247,12 @@ impl ToSql for TextParam<'_> {
 impl Pg {
     pub async fn connect(
         conn: &Connection,
+        via: Option<SocketAddr>,
         password: Option<&Secret>,
     ) -> Result<(Pg, String), String> {
+        if via.is_some() {
+            return Err(NO_TUNNEL.into());
+        }
         let plan = plan(conn.tls);
         let tls = MakeRustlsConnect::new(client_config(plan.verify, conn.ca_file.as_deref())?);
         let config = pg_config(conn, password, plan.ssl_mode);
@@ -436,6 +442,7 @@ mod tests {
             user: "u".into(),
             tls,
             ca_file: None,
+            ssh: None,
             read_only: false,
             production: false,
             color: None,

@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,7 +16,8 @@ use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column};
 
-const DEFAULT_PORT: u16 = 3306;
+const NO_TUNNEL: &str = "SSH tunnels are not supported in this build yet.";
+pub(crate) const DEFAULT_PORT: u16 = 3306;
 
 /// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
 pub const CATALOG_SQL: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, \
@@ -199,8 +201,12 @@ async fn open_with_fallback(
 impl Mysql {
     pub async fn connect(
         conn: &Connection,
+        via: Option<SocketAddr>,
         password: Option<&Secret>,
     ) -> Result<(Mysql, String), String> {
+        if via.is_some() {
+            return Err(NO_TUNNEL.into());
+        }
         check_ca_file(conn)?;
         let (mut live, opts) = open_with_fallback(conn, password)
             .await

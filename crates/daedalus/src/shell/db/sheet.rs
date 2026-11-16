@@ -132,6 +132,7 @@ pub(super) fn build(
         user,
         tls,
         ca_file: base.and_then(|b| b.ca_file.clone()),
+        ssh: base.and_then(|b| b.ssh.clone()),
         read_only: f.read_only,
         production: f.production,
         color: f.color.clone(),

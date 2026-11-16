@@ -21,7 +21,7 @@ const PERSONAL: [(&str, &str); 4] = [
     ("projects", "this file applies to its own project"),
     ("save_password", "saving a password is your own choice"),
 ];
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 13] = [
     "id",
     "name",
     "engine",
@@ -31,10 +31,14 @@ const KNOWN: [&str; 12] = [
     "user",
     "tls",
     "ca_file",
+    "ssh",
     "read_only",
     "production",
     "color",
 ];
+
+const IDENTITY_WHY: &str =
+    "identity file is a path on your Mac; set it in your own connection or ~/.ssh/config";
 
 type Parsed = (Vec<Connection>, Vec<String>);
 
@@ -166,6 +170,15 @@ pub fn parse(text: &str, root: &Path) -> Result<Parsed, String> {
                 problems.push(format!("{label}: \"{key}\" is ignored here: {why}"));
             }
         }
+        let key_dropped = map
+            .get_mut("ssh")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|ssh| ssh.remove("identity_file").is_some());
+        if key_dropped {
+            problems.push(format!(
+                "{label}: \"ssh.identity_file\" is ignored here: {IDENTITY_WHY}"
+            ));
+        }
         for key in map.keys() {
             if !KNOWN.contains(&key.as_str()) {
                 problems.push(format!("{label}: has no field \"{key}\""));
@@ -267,6 +280,9 @@ pub fn upsert(root: &Path, conn: &Connection) -> anyhow::Result<()> {
         for key in ["claude", "projects", "save_password"] {
             map.remove(key);
         }
+        if let Some(ssh) = map.get_mut("ssh").and_then(Value::as_object_mut) {
+            ssh.remove("identity_file");
+        }
     }
     let list = entries(&mut doc);
     match list.iter_mut().find(|e| has_id(e, &conn.id)) {
@@ -296,7 +312,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::config::{Engine, Tls};
+    use crate::config::{Engine, SshTunnel, Tls};
 
     fn temp(name: &str) -> PathBuf {
         let dir =
@@ -321,6 +337,7 @@ mod tests {
             user: "me".into(),
             tls: Tls::Require,
             ca_file: None,
+            ssh: None,
             read_only: false,
             production: false,
             color: None,
@@ -357,6 +374,34 @@ mod tests {
         assert_eq!(conns.len(), 1);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("\"password\""));
+    }
+
+    #[test]
+    fn ssh_identity_file_is_reported_and_dropped_but_host_is_kept() {
+        let e = r#"{"id":"pg","name":"Main","engine":"postgres","ssh":{"host":"bastion","port":22,"user":"me","identity_file":"/Users/x/key"}}"#;
+        let (conns, problems) = parse(&doc(e), Path::new("/r")).unwrap();
+        let ssh = conns[0].ssh.as_ref().unwrap();
+        assert_eq!(ssh.host, "bastion");
+        assert_eq!(ssh.port, Some(22));
+        assert_eq!(ssh.identity_file, None);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("ssh.identity_file"));
+    }
+
+    #[test]
+    fn upsert_never_writes_the_identity_file() {
+        let root = temp("ssh-upsert");
+        let mut c = conn("a");
+        c.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            port: None,
+            user: String::new(),
+            identity_file: Some("/Users/x/key".into()),
+        });
+        upsert(&root, &c).unwrap();
+        let text = fs::read_to_string(path(&root)).unwrap();
+        assert!(text.contains("bastion"));
+        assert!(!text.contains("identity_file"));
     }
 
     #[test]

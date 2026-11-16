@@ -12,8 +12,9 @@ use crate::catalog::{self, Catalog};
 use crate::config::{Connection, Engine};
 use crate::edit;
 pub use crate::engine::ApplyError;
-use crate::engine::{Driver, Item};
+use crate::engine::{Driver, Item, mysql, pg};
 use crate::secret::Secret;
+use crate::tunnel;
 use crate::value::{Budget, Cell, Column};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,6 +45,8 @@ pub enum RunMode {
     ReadOnly,
 }
 
+// Connect is sent once per session, so boxing Connection would only add churn at every call site.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     Connect {
         session: SessionId,
@@ -290,10 +293,24 @@ async fn session_task(
 ) {
     let mut queued: VecDeque<Command> = VecDeque::new();
     let connected = {
-        let connect = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            Driver::connect(&conn, password.as_ref(), root.as_deref()),
-        );
+        let connect = async {
+            let lease = match (&conn.ssh, conn.engine) {
+                (Some(ssh), Engine::Postgres | Engine::Mysql) => {
+                    let default = match conn.engine {
+                        Engine::Postgres => pg::DEFAULT_PORT,
+                        _ => mysql::DEFAULT_PORT,
+                    };
+                    Some(tunnel::acquire(ssh, &conn.host, conn.port.unwrap_or(default)).await?)
+                }
+                _ => None,
+            };
+            let via = lease.as_ref().map(tunnel::Lease::addr);
+            let dial = Driver::connect(&conn, via, password.as_ref(), root.as_deref());
+            match tokio::time::timeout(CONNECT_TIMEOUT, dial).await {
+                Ok(connected) => connected.map(|(driver, server)| (lease, driver, server)),
+                Err(_) => Err("connection timed out after 10s".to_owned()),
+            }
+        };
         tokio::pin!(connect);
         loop {
             tokio::select! {
@@ -308,8 +325,8 @@ async fn session_task(
         }
     };
     drop(password);
-    let driver = match connected {
-        Ok(Ok((driver, server))) => {
+    let (_tunnel, driver) = match connected {
+        Ok((lease, driver, server)) => {
             if updates
                 .send(Update::Connected { session, server })
                 .await
@@ -317,14 +334,9 @@ async fn session_task(
             {
                 return;
             }
-            driver
+            (lease, driver)
         }
-        Ok(Err(error)) => {
-            let _ = updates.send(Update::Failed { session, error }).await;
-            return;
-        }
-        Err(_) => {
-            let error = "connection timed out after 10s".to_owned();
+        Err(error) => {
             let _ = updates.send(Update::Failed { session, error }).await;
             return;
         }
@@ -1219,6 +1231,7 @@ mod tests {
             user: "u".into(),
             tls: Tls::Disable,
             ca_file: None,
+            ssh: None,
             read_only: false,
             production: false,
             color: None,
@@ -1250,6 +1263,27 @@ mod tests {
             assert!(!error.is_empty());
             assert!(!error.contains("s3cret"));
         }
+    }
+
+    #[test]
+    fn ssh_with_bad_host_fails_without_dialing() {
+        let mut c = conn(Engine::Postgres, "db.invalid", 5432);
+        c.ssh = Some(crate::config::SshTunnel {
+            host: "-x".into(),
+            port: None,
+            user: String::new(),
+            identity_file: None,
+        });
+        let update = first_update(Command::Connect {
+            session: SessionId(1),
+            conn: c,
+            password: None,
+            root: None,
+        });
+        let Update::Failed { error, .. } = update else {
+            panic!("expected a failure");
+        };
+        assert_eq!(error, "SSH host is not valid");
     }
 
     #[test]

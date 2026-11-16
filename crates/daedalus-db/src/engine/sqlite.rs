@@ -459,6 +459,7 @@ mod tests {
             user: String::new(),
             tls: crate::config::Tls::Prefer,
             ca_file: None,
+            ssh: None,
             read_only: false,
             production: false,
             color: None,

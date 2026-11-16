@@ -52,6 +52,7 @@ fn conn(database: &str, read_only: bool) -> Connection {
         user: String::new(),
         tls: Tls::Prefer,
         ca_file: None,
+        ssh: None,
         read_only,
         production: false,
         color: None,
