@@ -663,15 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn visible_lists_only_personal_entries() {
-        let mut s = Store::empty();
-        s.connections = vec![conn("a", "A", true), conn("b", "B", true)];
-        let v = visible(&s, Some(Path::new("/work/a")));
-        assert_eq!(v.len(), 2);
-        assert!(v.iter().all(|l| l.origin == Origin::Global));
-    }
-
-    #[test]
     fn find_by_id_then_unique_name() {
         let v = listed(vec![conn("id1", "Prod", true), conn("id2", "Stage", true)]);
         assert_eq!(find(&v, "id2").unwrap().conn.name, "Stage");

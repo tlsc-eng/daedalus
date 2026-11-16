@@ -3,10 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use serde_json::{Value, json};
 
-use crate::config::{self, Connection};
+use crate::config::{self, Connection, Engine};
 
 /// Location of the shared file relative to the project root.
 pub const FILE: &str = ".daedalus/databases.json";
@@ -48,6 +48,43 @@ fn valid_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn escapes_root(db: &str) -> bool {
+    let p = Path::new(db);
+    p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Reads the file's text, refusing links, non-regular files and anything over the size cap.
+fn read_text(root: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    for dir in [root.join(".daedalus"), path(root)] {
+        match fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("{FILE} must not be reached through a symlink"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read {FILE}: {e}")),
+        }
+    }
+    let file = fs::File::open(path(root)).map_err(|e| format!("read {FILE}: {e}"))?;
+    match file.metadata() {
+        Ok(m) if m.is_file() => {}
+        _ => return Err(format!("{FILE} is not a regular file")),
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {FILE}: {e}"))?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(format!("{FILE} is larger than 1 MiB"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("{FILE} is not UTF-8"))
 }
 
 /// Parses the shared file; personal and unknown keys are reported and left out.
@@ -121,6 +158,12 @@ pub fn parse(text: &str, root: &Path) -> Result<Parsed, String> {
         {
             *ca = root.join(&*ca);
         }
+        if conn.engine == Engine::Sqlite && escapes_root(&conn.database) {
+            conn.read_only = true;
+            problems.push(format!(
+                "{label}: database path leaves the project, opened read-only"
+            ));
+        }
         conn.claude = false;
         conn.projects = vec![];
         conn.save_password = false;
@@ -131,31 +174,18 @@ pub fn parse(text: &str, root: &Path) -> Result<Parsed, String> {
 
 /// Reads and parses the file; a missing file is an empty list with no problems.
 pub fn load(root: &Path) -> Result<Parsed, String> {
-    let file = path(root);
-    let meta = match fs::metadata(&file) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], vec![])),
-        Err(e) => return Err(format!("read {FILE}: {e}")),
-    };
-    if meta.len() > MAX_BYTES {
-        return Err(format!("{FILE} is larger than 1 MiB"));
+    match read_text(root) {
+        Ok(Some(text)) => parse(&text, root),
+        Ok(None) => Ok((vec![], vec![])),
+        Err(e) if e.ends_with("symlink") => Ok((vec![], vec![e])),
+        Err(e) => Err(e),
     }
-    let text = fs::read_to_string(&file).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::InvalidData {
-            format!("{FILE} is not UTF-8")
-        } else {
-            format!("read {FILE}: {e}")
-        }
-    })?;
-    parse(&text, root)
 }
 
 /// Reads the raw document, or `None` when the file does not exist; a broken file is an error.
 fn read_raw(root: &Path) -> anyhow::Result<Option<Value>> {
-    let text = match fs::read_to_string(path(root)) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {FILE}")),
+    let Some(text) = read_text(root).map_err(anyhow::Error::msg)? else {
+        return Ok(None);
     };
     match serde_json::from_str::<Value>(&text) {
         Ok(v) if v.get("connections").is_some_and(Value::is_array) => Ok(Some(v)),
@@ -448,6 +478,45 @@ mod tests {
         write(&root, not_list);
         assert!(upsert(&root, &conn("a")).is_err());
         assert_eq!(fs::read_to_string(path(&root)).unwrap(), not_list);
+    }
+
+    #[test]
+    fn symlinked_file_is_not_followed_for_size() {
+        let root = temp("zero");
+        fs::create_dir_all(root.join(".daedalus")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", path(&root)).unwrap();
+        assert!(load(&root).is_ok_and(|(c, p)| c.is_empty() && p.len() == 1));
+        assert!(upsert(&root, &conn("a")).is_err());
+    }
+
+    #[test]
+    fn symlinked_dir_is_refused_on_load_and_write() {
+        let root = temp("linkdir");
+        let target = temp("linktarget");
+        std::os::unix::fs::symlink(&target, root.join(".daedalus")).unwrap();
+        let (conns, problems) = load(&root).unwrap();
+        assert!(conns.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(upsert(&root, &conn("a")).is_err());
+        assert!(!target.join("databases.json").exists());
+    }
+
+    #[test]
+    fn non_regular_file_is_an_error() {
+        let root = temp("fifo");
+        fs::create_dir_all(path(&root)).unwrap();
+        assert!(load(&root).unwrap_err().contains("not a regular file"));
+    }
+
+    #[test]
+    fn sqlite_path_leaving_the_root_is_forced_read_only() {
+        let abs = r#"{"id":"a","name":"A","engine":"sqlite","database":"/etc/x.db"}"#;
+        let up = r#"{"id":"b","name":"B","engine":"sqlite","database":"../x.db"}"#;
+        let ok = r#"{"id":"c","name":"C","engine":"sqlite","database":"data/x.db"}"#;
+        let (conns, problems) = parse(&doc(&format!("{abs},{up},{ok}")), Path::new("/r")).unwrap();
+        assert_eq!(problems.len(), 2);
+        assert!(conns[0].read_only && conns[1].read_only);
+        assert!(!conns[2].read_only);
     }
 
     #[test]

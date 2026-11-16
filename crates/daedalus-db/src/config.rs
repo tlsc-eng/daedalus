@@ -218,7 +218,13 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
             let root = root
                 .map(|r| r.as_os_str().as_encoded_bytes())
                 .unwrap_or_default();
-            let parts: [&[u8]; 7] = [
+            let tls = format!("{:?}", conn.tls);
+            let ca = conn
+                .ca_file
+                .as_deref()
+                .map(|p| p.as_os_str().as_encoded_bytes())
+                .unwrap_or_default();
+            let parts: [&[u8]; 9] = [
                 root,
                 conn.id.as_bytes(),
                 conn.engine.name().as_bytes(),
@@ -226,6 +232,8 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
                 port.as_bytes(),
                 conn.database.as_bytes(),
                 conn.user.as_bytes(),
+                tls.as_bytes(),
+                ca,
             ];
             let mut hasher = Sha256::new();
             for part in parts {
@@ -565,6 +573,12 @@ mod tests {
         let after = keychain_account(Origin::Project, Some(root), &c);
         assert!(before.starts_with("p-"));
         assert_ne!(before, after);
+        let mut t = conn("a", "A");
+        t.tls = Tls::Disable;
+        assert_ne!(before, keychain_account(Origin::Project, Some(root), &t));
+        let mut ca = conn("a", "A");
+        ca.ca_file = Some("/other/ca.pem".into());
+        assert_ne!(before, keychain_account(Origin::Project, Some(root), &ca));
     }
 
     #[test]
