@@ -3,8 +3,9 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
-    IntoElement, KeyBinding, LayoutId, PaintQuad, Pixels, Render, ShapedLine, SharedString, Style,
-    TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative, size,
+    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point,
+    Render, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
+    actions, div, fill, point, prelude::*, px, relative, size,
 };
 
 use crate::ActiveTheme;
@@ -79,6 +80,14 @@ pub struct TextInput {
     scroll_row: usize,
     /// How far the text is scrolled left so the cursor stays inside the box.
     scroll_x: Pixels,
+    /// Takes the parent's full height instead of growing with its lines.
+    fill: bool,
+    line_h: Pixels,
+    rows_shown: usize,
+    /// The cursor and text length the box last scrolled to, so a wheel scroll is not undone.
+    followed: (usize, usize),
+    /// The part of a wheel scroll that is less than a row.
+    wheel: Pixels,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -104,6 +113,11 @@ impl TextInput {
             max_rows: None,
             scroll_row: 0,
             scroll_x: px(0.),
+            fill: false,
+            line_h: px(0.),
+            rows_shown: 1,
+            followed: (usize::MAX, 0),
+            wheel: px(0.),
         }
     }
 
@@ -111,6 +125,13 @@ impl TextInput {
     /// grows to `max_rows` rows before it scrolls.
     pub fn multiline(mut self, max_rows: usize) -> Self {
         self.max_rows = Some(max_rows.max(1));
+        self
+    }
+
+    /// A multi-line box that takes its parent's full height; the parent must have a definite height.
+    pub fn fill_height(mut self) -> Self {
+        self.fill = true;
+        self.max_rows.get_or_insert(1);
         self
     }
 
@@ -234,6 +255,47 @@ impl TextInput {
     }
 }
 
+impl TextInput {
+    fn click_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.bounds else { return };
+        if self.masked || self.marked.is_some() || self.line_h <= px(0.) {
+            return;
+        }
+        self.deselect(cx);
+        if self.text.is_empty() {
+            self.cursor = 0;
+            cx.notify();
+            return;
+        }
+        let row = row_at(
+            f32::from(pos.y - bounds.top()),
+            f32::from(self.line_h),
+            self.scroll_row,
+            self.layout.len(),
+        );
+        let Some((start, line)) = self.layout.get(row) else {
+            return;
+        };
+        let at = start + line.closest_index_for_x(pos.x - bounds.left() + self.scroll_x);
+        if at <= self.text.len() && self.text.is_char_boundary(at) {
+            self.cursor = at;
+            cx.notify();
+        }
+    }
+
+    fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        let (rows, rest) = wheel_rows(
+            f32::from(self.wheel),
+            f32::from(delta),
+            f32::from(self.line_h),
+        );
+        self.wheel = px(rest);
+        let max = max_scroll(self.layout.len(), self.rows_shown) as isize;
+        self.scroll_row = (self.scroll_row as isize - rows).clamp(0, max) as usize;
+        cx.notify();
+    }
+}
+
 impl Render for TextInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -310,6 +372,18 @@ impl Render for TextInput {
                 None => cx.emit(InputEvent::Down),
             }))
             .w_full()
+            .when(self.fill, |d| d.h_full())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| this.click_at(e.position, cx)),
+            )
+            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+                if this.max_rows.is_none() || this.layout.len() <= this.rows_shown {
+                    return;
+                }
+                this.scroll_by(e.delta.pixel_delta(this.line_h).y, cx);
+                cx.stop_propagation();
+            }))
             .child(InputElement { input: cx.entity() })
     }
 }
@@ -324,6 +398,8 @@ struct InputFrame {
     selection: Vec<PaintQuad>,
     scroll_row: usize,
     scroll_x: Pixels,
+    rows: usize,
+    follow: bool,
 }
 
 const BULLET: char = '\u{2022}';
@@ -383,6 +459,37 @@ fn scrolled_to(scroll: usize, line: usize, rows: usize) -> usize {
     }
 }
 
+/// Rows a box of `height` shows, at least one.
+fn fill_rows(height: f32, line_h: f32) -> usize {
+    if !height.is_finite() || !line_h.is_finite() || line_h <= 0. {
+        return 1;
+    }
+    ((height / line_h).floor() as usize).max(1)
+}
+
+/// The line under `y` pixels below the box top, clamped to the last line.
+fn row_at(y: f32, line_h: f32, scroll_row: usize, lines: usize) -> usize {
+    let last = lines.saturating_sub(1);
+    if line_h <= 0. {
+        return scroll_row.min(last);
+    }
+    (scroll_row + (y.max(0.) / line_h).floor() as usize).min(last)
+}
+
+/// Whole rows in the wheel travel plus the remainder; a positive delta moves the content down.
+fn wheel_rows(acc: f32, delta: f32, line_h: f32) -> (isize, f32) {
+    if line_h <= 0. {
+        return (0, 0.);
+    }
+    let total = acc + delta;
+    let rows = (total / line_h).trunc();
+    (rows as isize, total - rows * line_h)
+}
+
+fn max_scroll(lines: usize, rows: usize) -> usize {
+    lines.saturating_sub(rows)
+}
+
 /// The left offset of the visible window that keeps the one-pixel caret in view without scrolling past the end of the line.
 fn scrolled_x(scroll: Pixels, cursor_x: Pixels, line_width: Pixels, width: Pixels) -> Pixels {
     let caret = px(1.);
@@ -431,7 +538,10 @@ impl Element for InputElement {
         };
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (window.line_height() * rows as f32).into();
+        style.size.height = match input.fill {
+            true => relative(1.).into(),
+            false => (window.line_height() * rows as f32).into(),
+        };
         (window.request_layout(style, [], cx), ())
     }
 
@@ -454,9 +564,17 @@ impl Element for InputElement {
             true => std::iter::once(0..0).collect(),
             false => input.lines(),
         };
-        let rows = input.max_rows.unwrap_or(1);
+        let rows = match input.fill {
+            true => fill_rows(f32::from(bounds.size.height), f32::from(lh)),
+            false => input.max_rows.unwrap_or(1),
+        };
         let (cursor_line, _) = input.line_at(input.cursor);
-        let scroll_row = scrolled_to(input.scroll_row, cursor_line, rows);
+        let follow = (input.cursor, input.text.len()) != input.followed;
+        let wanted_row = match follow {
+            true => scrolled_to(input.scroll_row, cursor_line, rows),
+            false => input.scroll_row,
+        };
+        let scroll_row = wanted_row.min(max_scroll(ranges.len(), rows));
         let mut lines = Vec::new();
         for range in ranges.iter() {
             let (text, color) = if input.text.is_empty() {
@@ -557,6 +675,8 @@ impl Element for InputElement {
             selection,
             scroll_row,
             scroll_x,
+            rows,
+            follow,
         }
     }
 
@@ -582,6 +702,9 @@ impl Element for InputElement {
                 window.paint_quad(quad);
             }
             for (i, (_, line)) in frame.lines.iter().enumerate() {
+                if !(frame.scroll_row..frame.scroll_row + frame.rows).contains(&i) {
+                    continue;
+                }
                 let top = bounds.top() + lh * (i as f32 - frame.scroll_row as f32);
                 let _ = line.paint(point(bounds.left() - frame.scroll_x, top), lh, window, cx);
             }
@@ -594,7 +717,13 @@ impl Element for InputElement {
             frame.scroll_row,
             frame.scroll_x,
         );
+        let (rows, follow) = (frame.rows, frame.follow);
         self.input.update(cx, |input, _| {
+            input.line_h = lh;
+            input.rows_shown = rows;
+            if follow {
+                input.followed = (input.cursor, input.text.len());
+            }
             input.layout = lines;
             input.scroll_row = scroll_row;
             input.scroll_x = scroll_x;
@@ -684,8 +813,13 @@ impl EntityInputHandler for TextInput {
         );
         let row = self.layout.iter().rposition(|(at, _)| *at <= start)?;
         let (at, line) = &self.layout[row];
-        let rows = self.layout.len().clamp(1, self.max_rows.unwrap_or(1));
-        let lh = bounds.size.height / rows as f32;
+        let lh = match self.line_h > px(0.) {
+            true => self.line_h,
+            false => {
+                let rows = self.layout.len().clamp(1, self.max_rows.unwrap_or(1));
+                bounds.size.height / rows as f32
+            }
+        };
         let top = bounds.top() + lh * (row as f32 - self.scroll_row as f32);
         let x = |b: usize| {
             line.x_for_index(line_offset(&self.text, *at, b, self.masked).min(line.len()))
@@ -709,6 +843,37 @@ impl EntityInputHandler for TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_rows_floors_and_never_returns_zero() {
+        assert_eq!(fill_rows(100., 20.), 5);
+        assert_eq!(fill_rows(19., 20.), 1);
+        assert_eq!(fill_rows(0., 20.), 1);
+        assert_eq!(fill_rows(100., 0.), 1);
+        assert_eq!(fill_rows(f32::NAN, 20.), 1);
+    }
+
+    #[test]
+    fn a_click_maps_to_the_row_under_it() {
+        assert_eq!(row_at(0., 20., 0, 5), 0);
+        assert_eq!(row_at(45., 20., 0, 5), 2);
+        assert_eq!(row_at(45., 20., 3, 10), 5);
+        assert_eq!(row_at(500., 20., 0, 3), 2);
+        assert_eq!(row_at(-5., 20., 2, 5), 2);
+    }
+
+    #[test]
+    fn wheel_rows_keeps_the_remainder() {
+        assert_eq!(wheel_rows(0., 50., 20.), (2, 10.));
+        assert_eq!(wheel_rows(10., -35., 20.), (-1, -5.));
+        assert_eq!(wheel_rows(0., 5., 0.), (0, 0.));
+    }
+
+    #[test]
+    fn scroll_never_passes_the_last_page() {
+        assert_eq!(max_scroll(10, 4), 6);
+        assert_eq!(max_scroll(3, 4), 0);
+    }
 
     #[test]
     fn masked_text_is_bullets_same_length() {
