@@ -16,7 +16,6 @@ use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column};
 
-const NO_TUNNEL: &str = "SSH tunnels are not supported in this build yet.";
 pub(crate) const DEFAULT_PORT: u16 = 3306;
 
 /// Catalog query: schema, table, kind, column, type, nullable, pk as text; up to 5001 tables.
@@ -50,7 +49,11 @@ fn driver_host(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-fn ssl_opts(tls: Tls, ca_file: Option<&std::path::Path>) -> Option<SslOpts> {
+fn ssl_opts(
+    tls: Tls,
+    ca_file: Option<&std::path::Path>,
+    tls_name: Option<&str>,
+) -> Option<SslOpts> {
     match tls {
         Tls::Disable => None,
         Tls::Prefer | Tls::RequireUnverified => Some(
@@ -60,8 +63,13 @@ fn ssl_opts(tls: Tls, ca_file: Option<&std::path::Path>) -> Option<SslOpts> {
         ),
         Tls::Require => {
             let ssl = SslOpts::default();
-            Some(match ca_file {
+            let ssl = match ca_file {
                 Some(path) => ssl.with_root_certs(vec![path.to_path_buf().into()]),
+                None => ssl,
+            };
+            // Despite the name, this keeps verification on the real host while dialing the tunnel.
+            Some(match tls_name {
+                Some(name) => ssl.with_danger_tls_hostname_override(Some(name.to_owned())),
                 None => ssl,
             })
         }
@@ -69,10 +77,22 @@ fn ssl_opts(tls: Tls, ca_file: Option<&std::path::Path>) -> Option<SslOpts> {
 }
 
 /// Built field by field because the Debug output of `Opts` prints the password.
-fn build_opts(conn: &Connection, password: Option<&Secret>, tls: Option<SslOpts>) -> Opts {
+fn build_opts(
+    conn: &Connection,
+    via: Option<SocketAddr>,
+    password: Option<&Secret>,
+    tls: Option<SslOpts>,
+) -> Opts {
+    let (host, port) = match via {
+        Some(addr) => (addr.ip().to_string(), addr.port()),
+        None => (
+            driver_host(&conn.host).to_owned(),
+            conn.port.unwrap_or(DEFAULT_PORT),
+        ),
+    };
     OptsBuilder::default()
-        .ip_or_hostname(driver_host(&conn.host))
-        .tcp_port(conn.port.unwrap_or(DEFAULT_PORT))
+        .ip_or_hostname(host)
+        .tcp_port(port)
         .user((!conn.user.is_empty()).then_some(conn.user.as_str()))
         .db_name((!conn.database.is_empty()).then_some(conn.database.as_str()))
         .pass(password.map(|p| p.expose().to_owned()))
@@ -186,12 +206,18 @@ async fn open(opts: &Opts) -> Result<Conn, mysql_async::Error> {
 
 async fn open_with_fallback(
     conn: &Connection,
+    via: Option<SocketAddr>,
     password: Option<&Secret>,
 ) -> Result<(Conn, Opts), mysql_async::Error> {
-    let opts = build_opts(conn, password, ssl_opts(conn.tls, conn.ca_file.as_deref()));
+    let tls_name = via.map(|_| match driver_host(&conn.host) {
+        "" => "localhost",
+        h => h,
+    });
+    let ssl = ssl_opts(conn.tls, conn.ca_file.as_deref(), tls_name);
+    let opts = build_opts(conn, via, password, ssl);
     match open(&opts).await {
         Err(e) if conn.tls == Tls::Prefer && is_no_tls(&e) => {
-            let plain = build_opts(conn, password, None);
+            let plain = build_opts(conn, via, password, None);
             open(&plain).await.map(|c| (c, plain))
         }
         other => other.map(|c| (c, opts)),
@@ -204,11 +230,8 @@ impl Mysql {
         via: Option<SocketAddr>,
         password: Option<&Secret>,
     ) -> Result<(Mysql, String), String> {
-        if via.is_some() {
-            return Err(NO_TUNNEL.into());
-        }
         check_ca_file(conn)?;
-        let (mut live, opts) = open_with_fallback(conn, password)
+        let (mut live, opts) = open_with_fallback(conn, via, password)
             .await
             .map_err(|e| describe(&e))?;
         if conn.read_only {
@@ -458,18 +481,44 @@ mod tests {
 
     #[test]
     fn tls_modes_map_to_ssl_opts() {
-        assert!(ssl_opts(Tls::Disable, None).is_none());
+        assert!(ssl_opts(Tls::Disable, None, None).is_none());
         for tls in [Tls::Prefer, Tls::RequireUnverified] {
-            let ssl = ssl_opts(tls, None).expect("ssl");
+            let ssl = ssl_opts(tls, None, None).expect("ssl");
             assert!(ssl.accept_invalid_certs() && ssl.skip_domain_validation());
         }
-        let ssl = ssl_opts(Tls::Require, None).expect("ssl");
+        let ssl = ssl_opts(Tls::Require, None, None).expect("ssl");
         assert!(!ssl.accept_invalid_certs() && !ssl.skip_domain_validation());
     }
 
     #[test]
     fn opts_stay_on_tcp() {
         let (conn, _) = crate::from_url("mysql://u@db.example.com/db").expect("url");
-        assert!(!build_opts(&conn, None, None).prefer_socket());
+        assert!(!build_opts(&conn, None, None, None).prefer_socket());
+    }
+
+    #[test]
+    fn opts_through_tunnel_dial_loopback_and_verify_the_real_name() {
+        let (conn, _) = crate::from_url("mysql://u@db.internal/db").expect("url");
+        let via: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let ssl = ssl_opts(Tls::Require, None, Some("db.internal"));
+        let opts = build_opts(&conn, Some(via), None, ssl);
+        assert_eq!(opts.ip_or_hostname(), "127.0.0.1");
+        assert_eq!(opts.tcp_port(), 54321);
+        let ssl = opts.ssl_opts().unwrap();
+        assert_eq!(ssl.tls_hostname_override(), Some("db.internal"));
+        assert!(!ssl.accept_invalid_certs() && !ssl.skip_domain_validation());
+    }
+
+    #[test]
+    fn override_only_for_require() {
+        let ssl = ssl_opts(Tls::Prefer, None, Some("db.internal")).expect("ssl");
+        assert_eq!(ssl.tls_hostname_override(), None);
+    }
+
+    #[test]
+    fn prefer_socket_is_off_through_tunnel_too() {
+        let (conn, _) = crate::from_url("mysql://u@db.internal/db").expect("url");
+        let via: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        assert!(!build_opts(&conn, Some(via), None, None).prefer_socket());
     }
 }

@@ -586,3 +586,31 @@ fn pg_null_and_empty_string_differ() {
         vec![Some("true".into())]
     );
 }
+
+#[test]
+#[ignore = "needs Postgres at DAEDALUS_TEST_PG"]
+fn dials_the_tunnel_address_not_the_host() {
+    let url = std::env::var("DAEDALUS_TEST_PG").expect("DAEDALUS_TEST_PG");
+    let (mut conn, password) = from_url(&url).expect("valid test url");
+    let port = conn.port.unwrap_or(5432);
+    conn.host = "db.invalid".into();
+    conn.tls = daedalus_db::Tls::Disable;
+    let via = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let password = password.or_else(|| Some(Secret::new("")));
+    let (_driver, server) = runtime
+        .block_on(daedalus_db::engine::Driver::connect(
+            &conn,
+            Some(via),
+            password.as_ref(),
+            None,
+        ))
+        .expect("connects through the tunnel address");
+    assert!(
+        ["PostgreSQL"].iter().any(|name| server.starts_with(name)),
+        "{server}"
+    );
+}

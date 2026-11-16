@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use daedalus_db::{Connection, Engine, Listed, Origin, Secret, Tls};
+use daedalus_db::{Connection, Engine, Listed, Origin, Secret, SshTunnel, Tls, check_target};
 use daedalus_ui::motion::Busy;
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, InputEvent, SegmentedControl, Space, TextInput, Theme,
@@ -71,6 +71,11 @@ pub(super) struct Fields {
     pub production: bool,
     pub claude: bool,
     pub only_here: bool,
+    pub ssh: bool,
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_key: String,
 }
 
 /// The form values a connection fills in when it is loaded into the sheet.
@@ -91,6 +96,29 @@ fn form_fields(conn: &Connection, root: Option<&Path>) -> Fields {
         production: conn.production,
         claude: conn.claude,
         only_here: root.is_some_and(|r| conn.projects.iter().any(|p| p == r)),
+        ssh: conn.ssh.is_some(),
+        ssh_host: conn
+            .ssh
+            .as_ref()
+            .map(|s| s.host.clone())
+            .unwrap_or_default(),
+        ssh_port: conn
+            .ssh
+            .as_ref()
+            .and_then(|s| s.port)
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        ssh_user: conn
+            .ssh
+            .as_ref()
+            .map(|s| s.user.clone())
+            .unwrap_or_default(),
+        ssh_key: conn
+            .ssh
+            .as_ref()
+            .and_then(|s| s.identity_file.as_ref())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     }
 }
 
@@ -127,6 +155,34 @@ pub(super) fn build(
         };
         (host.to_owned(), port, f.user.trim().to_owned())
     };
+    let ssh = match (sqlite, f.ssh) {
+        (false, true) => {
+            let ssh_host = f.ssh_host.trim();
+            if ssh_host.is_empty() {
+                return Err("SSH host is required");
+            }
+            let port = match f.ssh_port.trim() {
+                "" => None,
+                p => Some(
+                    p.parse::<u16>()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or("SSH port must be 1-65535")?,
+                ),
+            };
+            let key = f.ssh_key.trim();
+            let tunnel = SshTunnel {
+                host: ssh_host.to_owned(),
+                port,
+                user: f.ssh_user.trim().to_owned(),
+                identity_file: (!key.is_empty()).then(|| PathBuf::from(key)),
+            };
+            tunnel.check()?;
+            check_target(&host)?;
+            Some(tunnel)
+        }
+        _ => None,
+    };
     let tls = match (sqlite, f.tls_touched) {
         (true, _) => base.map_or(Tls::Prefer, |b| b.tls),
         (false, true) => f.tls,
@@ -154,7 +210,7 @@ pub(super) fn build(
         user,
         tls,
         ca_file: base.and_then(|b| b.ca_file.clone()),
-        ssh: base.and_then(|b| b.ssh.clone()),
+        ssh,
         read_only: f.read_only,
         production: f.production,
         color: f.color.clone(),
@@ -234,6 +290,7 @@ fn target_fields(f: Fields, target: Origin) -> Fields {
         Origin::Project => Fields {
             claude: false,
             only_here: false,
+            ssh_key: String::new(),
             ..f
         },
     }
@@ -310,6 +367,11 @@ pub(in crate::shell) struct DbSheet {
     database: Entity<TextInput>,
     user: Entity<TextInput>,
     password: Entity<TextInput>,
+    ssh_host: Entity<TextInput>,
+    ssh_port: Entity<TextInput>,
+    ssh_user: Entity<TextInput>,
+    ssh_key: Entity<TextInput>,
+    ssh: bool,
     engine: Engine,
     color: Option<String>,
     tls: Tls,
@@ -345,8 +407,15 @@ impl DbSheet {
         let database = input("Database", cx);
         let user = input("User", cx);
         let password = cx.new(|cx| TextInput::new("Password", cx).masked());
+        let ssh_host = input("Host or ~/.ssh/config alias", cx);
+        let ssh_port = input("22", cx);
+        let ssh_user = input("User (optional)", cx);
+        let ssh_key = input("Identity file (optional)", cx);
         let mut subscriptions = Vec::new();
-        for field in [&name, &host, &port, &database, &user, &password] {
+        for field in [
+            &name, &host, &port, &database, &user, &password, &ssh_host, &ssh_port, &ssh_user,
+            &ssh_key,
+        ] {
             subscriptions.push(cx.subscribe_in(
                 field,
                 window,
@@ -377,6 +446,11 @@ impl DbSheet {
             database,
             user,
             password,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_key,
+            ssh: false,
             engine: Engine::Postgres,
             color: None,
             tls: Tls::Prefer,
@@ -417,6 +491,11 @@ impl DbSheet {
         set(&self.port, &f.port, cx);
         set(&self.database, &f.database, cx);
         set(&self.user, &f.user, cx);
+        set(&self.ssh_host, &f.ssh_host, cx);
+        set(&self.ssh_port, &f.ssh_port, cx);
+        set(&self.ssh_user, &f.ssh_user, cx);
+        set(&self.ssh_key, &f.ssh_key, cx);
+        self.ssh = f.ssh;
         self.engine = f.engine;
         self.color = f.color;
         self.tls = f.tls;
@@ -481,6 +560,11 @@ impl DbSheet {
                 production: self.production,
                 claude: self.claude,
                 only_here: self.only_here,
+                ssh: self.ssh,
+                ssh_host: text(&self.ssh_host),
+                ssh_port: text(&self.ssh_port),
+                ssh_user: text(&self.ssh_user),
+                ssh_key: text(&self.ssh_key),
             },
             self.target,
         )
@@ -617,6 +701,14 @@ impl DbSheet {
                 self.user.clone(),
                 self.password.clone(),
             ]);
+            if self.ssh {
+                order.extend([
+                    self.ssh_host.clone(),
+                    self.ssh_port.clone(),
+                    self.ssh_user.clone(),
+                    self.ssh_key.clone(),
+                ]);
+            }
         }
         if matches!(self.mode, SheetMode::Password { .. }) {
             order = vec![self.password.clone()];
@@ -659,6 +751,14 @@ fn labelled(label: &'static str, body: impl IntoElement, t: &Theme) -> AnyElemen
                 .child(label),
         )
         .child(body)
+        .into_any_element()
+}
+
+fn muted_caption(text: &'static str, t: &Theme) -> AnyElement {
+    div()
+        .text_size(t.typography.caption)
+        .text_color(t.color.content_muted)
+        .child(text)
         .into_any_element()
 }
 
@@ -1124,7 +1224,46 @@ impl DbSheet {
                         }
                     }),
                     t,
-                ));
+                ))
+                .child(checkbox(
+                    "db-ssh",
+                    "Connect through SSH".into(),
+                    self.ssh,
+                    t,
+                    |this, _| this.ssh = !this.ssh,
+                    cx,
+                ))
+                .when(self.ssh, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .gap(t.space(Space::Md))
+                            .child(div().flex_1().child(labelled(
+                                "SSH host",
+                                boxed(&self.ssh_host, t),
+                                t,
+                            )))
+                            .child(div().w(t.ui(120.)).child(labelled(
+                                "SSH port",
+                                boxed(&self.ssh_port, t),
+                                t,
+                            ))),
+                    )
+                    .child(labelled("SSH user", boxed(&self.ssh_user, t), t))
+                    .when(self.target != Origin::Project, |el| {
+                        el.child(labelled("Identity file", boxed(&self.ssh_key, t), t))
+                    })
+                    .child(muted_caption(
+                        "Host and port above are as the SSH server sees them. Keys come from ssh-agent or ~/.ssh/config.",
+                        t,
+                    ))
+                    .when(self.target == Origin::Project, |el| {
+                        el.child(muted_caption(
+                            "Identity files are not saved in the project file; set IdentityFile in ~/.ssh/config or use a personal copy.",
+                            t,
+                        ))
+                    })
+                });
         }
         form = form.child(
             div()
@@ -1301,6 +1440,23 @@ mod tests {
             production: false,
             claude: false,
             only_here: false,
+            ssh: false,
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_user: String::new(),
+            ssh_key: String::new(),
+        }
+    }
+
+    fn ssh_fields() -> Fields {
+        Fields {
+            host: "db.internal".into(),
+            ssh: true,
+            ssh_host: "bastion".into(),
+            ssh_port: "2222".into(),
+            ssh_user: "deploy".into(),
+            ssh_key: "/home/me/.ssh/id_ed25519".into(),
+            ..fields()
         }
     }
 
@@ -1570,6 +1726,105 @@ mod tests {
     }
 
     #[test]
+    fn build_with_ssh_validates_and_round_trips() {
+        let conn = build(&ssh_fields(), None, None).unwrap();
+        let ssh = conn.ssh.as_ref().expect("ssh");
+        assert_eq!(ssh.host, "bastion");
+        assert_eq!(ssh.port, Some(2222));
+        assert_eq!(ssh.user, "deploy");
+        assert_eq!(
+            ssh.identity_file.as_deref(),
+            Some(Path::new("/home/me/.ssh/id_ed25519"))
+        );
+        let back = form_fields(&conn, None);
+        assert_eq!(build(&back, None, None).unwrap().ssh, conn.ssh);
+        let blank_host = Fields {
+            ssh_host: " ".into(),
+            ..ssh_fields()
+        };
+        assert_eq!(build(&blank_host, None, None), Err("SSH host is required"));
+        let option_like = Fields {
+            ssh_host: "-oProxyCommand=x".into(),
+            ..ssh_fields()
+        };
+        assert!(build(&option_like, None, None).is_err());
+        let socket = Fields {
+            host: "/var/run/pg".into(),
+            ..ssh_fields()
+        };
+        assert!(build(&socket, None, None).is_err());
+    }
+
+    #[test]
+    fn build_drops_ssh_for_sqlite_and_when_unticked() {
+        let mut base = base();
+        base.ssh = build(&ssh_fields(), None, None).unwrap().ssh;
+        let unticked = Fields {
+            ssh: false,
+            ..ssh_fields()
+        };
+        assert!(build(&unticked, Some(&base), None).unwrap().ssh.is_none());
+        let sqlite = Fields {
+            engine: Engine::Sqlite,
+            database: "/tmp/a.db".into(),
+            ..ssh_fields()
+        };
+        assert!(build(&sqlite, Some(&base), None).unwrap().ssh.is_none());
+    }
+
+    #[test]
+    fn ssh_port_rejects_zero_and_text() {
+        for bad in ["0", "abc", "65536"] {
+            let f = Fields {
+                ssh_port: bad.into(),
+                ..ssh_fields()
+            };
+            assert_eq!(build(&f, None, None), Err("SSH port must be 1-65535"));
+        }
+    }
+
+    #[test]
+    fn needs_reconnect_sees_ssh_changes() {
+        let off = build(&fields(), None, None).unwrap();
+        let on = build(&ssh_fields(), None, None).unwrap();
+        let old = Connection {
+            host: "db.internal".into(),
+            ..off
+        };
+        assert!(needs_reconnect(&old, &on));
+        let mut moved = on.clone();
+        moved.ssh.as_mut().unwrap().port = Some(2200);
+        assert!(needs_reconnect(&on, &moved));
+        assert!(!needs_reconnect(&on, &on.clone()));
+    }
+
+    #[test]
+    fn paste_url_keeps_ssh() {
+        let (url, _) = daedalus_db::from_url("postgres://u@db.internal/app").unwrap();
+        let out = url_fields(&ssh_fields(), &url);
+        assert!(out.ssh);
+        assert_eq!(out.ssh_host, "bastion");
+        assert_eq!(out.ssh_key, "/home/me/.ssh/id_ed25519");
+    }
+
+    #[test]
+    fn fill_then_fields_round_trips_ssh() {
+        let conn = build(&ssh_fields(), None, None).unwrap();
+        let f = form_fields(&conn, None);
+        assert!(f.ssh);
+        assert_eq!(
+            (
+                f.ssh_host.as_str(),
+                f.ssh_port.as_str(),
+                f.ssh_user.as_str()
+            ),
+            ("bastion", "2222", "deploy")
+        );
+        assert_eq!(f.ssh_key, "/home/me/.ssh/id_ed25519");
+        assert!(!form_fields(&base(), None).ssh);
+    }
+
+    #[test]
     fn detected_prefill_builds_the_same_target() {
         let found = Found {
             conn: Connection {
@@ -1674,6 +1929,13 @@ mod tests {
         let out = target_fields(f, Origin::Project);
         let conn = build(&out, None, Some(Path::new("/a"))).unwrap();
         assert!(!conn.claude && conn.projects.is_empty());
+    }
+
+    #[test]
+    fn project_target_drops_the_identity_file() {
+        let out = target_fields(ssh_fields(), Origin::Project);
+        let conn = build(&out, None, Some(Path::new("/a"))).unwrap();
+        assert_eq!(conn.ssh.unwrap().identity_file, None);
     }
 
     #[test]

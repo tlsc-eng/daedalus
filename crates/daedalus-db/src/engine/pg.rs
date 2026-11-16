@@ -37,7 +37,6 @@ use crate::edit::Stmt;
 use crate::secret::Secret;
 use crate::value::{Cell, Column, TableRef};
 
-const NO_TUNNEL: &str = "SSH tunnels are not supported in this build yet.";
 pub(crate) const DEFAULT_PORT: u16 = 5432;
 
 pub struct Pg {
@@ -160,14 +159,27 @@ fn driver_host(host: &str) -> &str {
 
 fn pg_config(
     conn: &Connection,
+    via: Option<SocketAddr>,
     password: Option<&Secret>,
     mode: SslMode,
 ) -> tokio_postgres::Config {
     let mut config = tokio_postgres::Config::new();
-    config
-        .host(driver_host(&conn.host))
-        .port(conn.port.unwrap_or(DEFAULT_PORT))
-        .ssl_mode(mode);
+    match via {
+        // The real name still reaches rustls for verification while the socket dials the tunnel.
+        Some(addr) => {
+            let name = match driver_host(&conn.host) {
+                "" => "localhost",
+                h => h,
+            };
+            config.host(name).hostaddr(addr.ip()).port(addr.port());
+        }
+        None => {
+            config
+                .host(driver_host(&conn.host))
+                .port(conn.port.unwrap_or(DEFAULT_PORT));
+        }
+    }
+    config.ssl_mode(mode);
     if !conn.database.is_empty() {
         config.dbname(&conn.database);
     }
@@ -250,12 +262,9 @@ impl Pg {
         via: Option<SocketAddr>,
         password: Option<&Secret>,
     ) -> Result<(Pg, String), String> {
-        if via.is_some() {
-            return Err(NO_TUNNEL.into());
-        }
         let plan = plan(conn.tls);
         let tls = MakeRustlsConnect::new(client_config(plan.verify, conn.ca_file.as_deref())?);
-        let config = pg_config(conn, password, plan.ssl_mode);
+        let config = pg_config(conn, via, password, plan.ssl_mode);
         let (client, connection) = config
             .connect(tls.clone())
             .await
@@ -511,10 +520,51 @@ mod tests {
     fn ipv6_brackets_are_stripped_for_the_driver() {
         assert_eq!(driver_host("[::1]"), "::1");
         assert_eq!(driver_host("localhost"), "localhost");
-        let config = pg_config(&conn("[::1]", Tls::Disable), None, SslMode::Disable);
+        let config = pg_config(&conn("[::1]", Tls::Disable), None, None, SslMode::Disable);
         assert_eq!(
             config.get_hosts(),
             [tokio_postgres::config::Host::Tcp("::1".into())]
+        );
+    }
+
+    #[test]
+    fn pg_config_through_tunnel_dials_hostaddr_and_keeps_host_for_tls() {
+        let via: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let config = pg_config(
+            &conn("db.internal", Tls::Require),
+            Some(via),
+            None,
+            SslMode::Require,
+        );
+        assert_eq!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp("db.internal".into())]
+        );
+        assert_eq!(
+            config.get_hostaddrs(),
+            ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(config.get_ports(), [54321]);
+    }
+
+    #[test]
+    fn pg_config_without_tunnel_is_unchanged() {
+        let config = pg_config(
+            &conn("db.internal", Tls::Require),
+            None,
+            None,
+            SslMode::Require,
+        );
+        assert!(config.get_hostaddrs().is_empty());
+    }
+
+    #[test]
+    fn empty_host_through_tunnel_names_localhost() {
+        let via: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let config = pg_config(&conn("", Tls::Require), Some(via), None, SslMode::Require);
+        assert_eq!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp("localhost".into())]
         );
     }
 }
