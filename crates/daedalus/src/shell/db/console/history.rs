@@ -5,14 +5,14 @@ use daedalus_db::history::{self as store, Entry};
 use daedalus_ui::{ActiveTheme, InputEvent, Space, TextInput};
 use gpui::{
     ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
-    Render, Window, div, prelude::*,
+    MouseDownEvent, Pixels, Point, Render, ScrollHandle, Window, div, prelude::*,
 };
 
 const LIMIT: usize = 200;
 
 pub(super) enum HistoryEvent {
     Insert(String),
-    Close,
+    Close { at: Option<Point<Pixels>> },
 }
 
 enum Loaded {
@@ -26,6 +26,7 @@ pub(super) struct HistoryPopover {
     loaded: Loaded,
     shown: Vec<Entry>,
     selected: usize,
+    scroll: ScrollHandle,
     _sub: gpui::Subscription,
 }
 
@@ -65,11 +66,15 @@ impl HistoryPopover {
             &input,
             window,
             |this, _, event: &InputEvent, _, cx| match event {
-                InputEvent::Changed => this.refilter(cx),
+                InputEvent::Changed => {
+                    this.refilter(cx);
+                    this.selected = 0;
+                    this.scroll.scroll_to_item(0);
+                }
                 InputEvent::Up => this.step(-1, cx),
                 InputEvent::Down => this.step(1, cx),
                 InputEvent::Submit => this.insert(this.selected, cx),
-                InputEvent::Cancel => cx.emit(HistoryEvent::Close),
+                InputEvent::Cancel => cx.emit(HistoryEvent::Close { at: None }),
                 InputEvent::SubmitBeside => {}
             },
         );
@@ -97,6 +102,7 @@ impl HistoryPopover {
             loaded,
             shown: Vec::new(),
             selected: 0,
+            scroll: ScrollHandle::new(),
             _sub: sub,
         }
     }
@@ -117,6 +123,7 @@ impl HistoryPopover {
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let last = self.shown.len().saturating_sub(1) as isize;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        self.scroll.scroll_to_item(self.selected);
         cx.notify();
     }
 
@@ -193,7 +200,11 @@ impl Render for HistoryPopover {
             .flex()
             .flex_col()
             .occlude()
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(HistoryEvent::Close)))
+            .on_mouse_down_out(cx.listener(|_, event: &MouseDownEvent, _, cx| {
+                cx.emit(HistoryEvent::Close {
+                    at: Some(event.position),
+                })
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .bg(t.color.surface)
             .border_1()
@@ -213,6 +224,7 @@ impl Render for HistoryPopover {
                     .id("db-history-list")
                     .max_h(t.ui(320.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .children(note.map(|n| {
                         div()
                             .p(t.space(Space::Md))

@@ -121,7 +121,7 @@ pub(in crate::shell) struct DbConsoleView {
     menu: Option<(Entity<ContextMenu>, Subscription)>,
     history_path: Option<PathBuf>,
     history: Option<(Entity<HistoryPopover>, Subscription)>,
-    history_closed: Option<std::time::Instant>,
+    history_dismissed_by: Option<Point<Pixels>>,
     grid_sub: Option<Subscription>,
     _release: Subscription,
     _subs: Vec<Subscription>,
@@ -215,7 +215,7 @@ impl DbConsoleView {
             menu: None,
             history_path,
             history: None,
-            history_closed: None,
+            history_dismissed_by: None,
             grid_sub: None,
             _release: cx.on_release(|this, cx| {
                 this.save_text(cx);
@@ -634,17 +634,12 @@ impl DbConsoleView {
             .detach();
     }
 
-    fn toggle_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.history.take().is_some() {
-            cx.notify();
+    fn toggle_history(&mut self, click: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::shell::notices::is_dismissing_click(click, &mut self.history_dismissed_by) {
             return;
         }
-        // The outside click that just closed the popover must not reopen it through the button.
-        let just_closed = self
-            .history_closed
-            .take()
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-        if just_closed {
+        if self.history.take().is_some() {
+            cx.notify();
             return;
         }
         let popover = cx.new(|cx| HistoryPopover::new(self.history_path.clone(), window, cx));
@@ -653,12 +648,14 @@ impl DbConsoleView {
             window,
             |this, _, event: &HistoryEvent, window, cx| {
                 this.history = None;
-                if let HistoryEvent::Insert(sql) = event {
-                    let text = format!("{sql}\n");
-                    this.editor
-                        .update(cx, |e, cx| e.replace_text_in_range(None, &text, window, cx));
-                } else {
-                    this.history_closed = Some(std::time::Instant::now());
+                this.history_dismissed_by = None;
+                match event {
+                    HistoryEvent::Insert(sql) => {
+                        let text = format!("{sql}\n");
+                        this.editor
+                            .update(cx, |e, cx| e.replace_text_in_range(None, &text, window, cx));
+                    }
+                    HistoryEvent::Close { at } => this.history_dismissed_by = *at,
                 }
                 window.focus(&this.editor.focus_handle(cx));
                 cx.notify();
@@ -929,7 +926,9 @@ impl DbConsoleView {
             )
             .child(
                 Button::new("db-console-history", "History", ButtonKind::Ghost).on_click(
-                    cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_history(window, cx)),
+                    cx.listener(|this, click: &ClickEvent, window, cx| {
+                        this.toggle_history(click, window, cx)
+                    }),
                 ),
             )
             .children(mode)
