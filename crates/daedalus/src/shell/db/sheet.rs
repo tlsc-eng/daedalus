@@ -37,6 +37,7 @@ pub(in crate::shell) enum DbSheetEvent {
         conn: Box<Connection>,
         origin: Origin,
         password: PasswordChange,
+        root: Option<PathBuf>,
     },
     Test {
         conn: Box<Connection>,
@@ -169,6 +170,54 @@ pub(in crate::shell) fn asks_for_claude_on_production(
     new.production && new.claude && !base.is_some_and(|b| b.production && b.claude)
 }
 
+/// Whether two connections reach the same server as the same user, so a saved password still belongs to the target.
+pub(in crate::shell) fn same_target(a: &Connection, b: &Connection) -> bool {
+    (&a.engine, &a.host, &a.port, &a.database, &a.user)
+        == (&b.engine, &b.host, &b.port, &b.database, &b.user)
+        && a.tls == b.tls
+        && a.ca_file == b.ca_file
+        && a.ssh == b.ssh
+}
+
+/// True when an edit keeps the saved password but points the connection at a different target.
+pub(in crate::shell) fn needs_typed_password(
+    old: Option<&Connection>,
+    new: &Connection,
+    password: &PasswordChange,
+) -> bool {
+    matches!(password, PasswordChange::Keep)
+        && new.save_password
+        && old.is_some_and(|o| o.save_password && !same_target(o, new))
+}
+
+/// The saved row a Test may borrow a password from; project rows use the form's own values.
+pub(super) fn saved_for_test(
+    editing: Option<&Listed>,
+    built: &Connection,
+    typed: bool,
+) -> Option<Listed> {
+    let l = editing.filter(|_| !typed)?;
+    if l.origin == Origin::Project {
+        return Some(Listed {
+            conn: built.clone(),
+            origin: Origin::Project,
+        });
+    }
+    (l.conn.save_password && same_target(&l.conn, built)).then(|| l.clone())
+}
+
+/// Claude access and the personal-only scope make no sense in a file the team commits.
+fn target_fields(f: Fields, target: Origin) -> Fields {
+    match target {
+        Origin::Global => f,
+        Origin::Project => Fields {
+            claude: false,
+            only_here: false,
+            ..f
+        },
+    }
+}
+
 /// Whether an open session no longer matches the edited connection.
 pub(in crate::shell) fn needs_reconnect(old: &Connection, new: &Connection) -> bool {
     (&old.engine, &old.host, &old.port, &old.database, &old.user)
@@ -205,6 +254,7 @@ pub(in crate::shell) struct DbSheet {
     mode: SheetMode,
     base: Option<Connection>,
     root: Option<PathBuf>,
+    target: Origin,
     name: Entity<TextInput>,
     host: Entity<TextInput>,
     port: Entity<TextInput>,
@@ -261,10 +311,15 @@ impl DbSheet {
             SheetMode::Edit(listed) => Some(listed.conn.clone()),
             _ => None,
         };
+        let target = match &mode {
+            SheetMode::Edit(listed) => listed.origin,
+            _ => Origin::Global,
+        };
         let mut sheet = Self {
             mode,
             base: base.clone(),
             root,
+            target,
             name,
             host,
             port,
@@ -287,6 +342,9 @@ impl DbSheet {
         };
         if let Some(conn) = &base {
             sheet.fill(conn, cx);
+            if target == Origin::Project {
+                sheet.keychain = true;
+            }
         }
         let first = match sheet.mode {
             SheetMode::Password { .. } => sheet.password.clone(),
@@ -340,23 +398,26 @@ impl DbSheet {
 
     fn fields(&self, cx: &App) -> Fields {
         let text = |i: &Entity<TextInput>| i.read(cx).text().to_owned();
-        Fields {
-            id: self.new_id.clone(),
-            name: text(&self.name),
-            engine: self.engine,
-            color: self.color.clone(),
-            host: text(&self.host),
-            port: text(&self.port),
-            database: text(&self.database),
-            user: text(&self.user),
-            keychain: self.keychain,
-            tls: self.tls,
-            tls_touched: self.tls_touched,
-            read_only: self.read_only,
-            production: self.production,
-            claude: self.claude,
-            only_here: self.only_here,
-        }
+        target_fields(
+            Fields {
+                id: self.new_id.clone(),
+                name: text(&self.name),
+                engine: self.engine,
+                color: self.color.clone(),
+                host: text(&self.host),
+                port: text(&self.port),
+                database: text(&self.database),
+                user: text(&self.user),
+                keychain: self.keychain,
+                tls: self.tls,
+                tls_touched: self.tls_touched,
+                read_only: self.read_only,
+                production: self.production,
+                claude: self.claude,
+                only_here: self.only_here,
+            },
+            self.target,
+        )
     }
 
     fn built(&self, cx: &App) -> Result<Connection, &'static str> {
@@ -383,15 +444,12 @@ impl DbSheet {
                 return;
             }
         };
-        let origin = match &self.mode {
-            SheetMode::Edit(listed) => listed.origin,
-            _ => Origin::Global,
-        };
         let password = password_change(self.base.as_ref(), &conn, &self.typed_password(cx));
         cx.emit(DbSheetEvent::Save {
             conn: Box::new(conn),
-            origin,
+            origin: self.target,
             password,
+            root: self.root.clone(),
         });
     }
 
@@ -420,10 +478,11 @@ impl DbSheet {
         };
         let typed = self.typed_password(cx);
         let typed = (!typed.is_empty()).then(|| Secret::new(typed));
-        let use_saved = match (&self.mode, &typed) {
-            (SheetMode::Edit(listed), None) if listed.conn.save_password => Some(listed.clone()),
+        let editing = match &self.mode {
+            SheetMode::Edit(listed) => Some(listed),
             _ => None,
         };
+        let use_saved = saved_for_test(editing, &conn, typed.is_some());
         self.status = Status::Testing(Busy::start());
         let delay = cx.theme().motion.indicator_delay;
         self.status_timer = Some(cx.spawn(async move |this, cx| {
@@ -831,6 +890,35 @@ impl DbSheet {
                     .text_color(t.color.content)
                     .child(title),
             )
+            .children((!editing && self.root.is_some()).then(|| {
+                labelled(
+                    "Save to",
+                    SegmentedControl::new(
+                        "db-target",
+                        ["My connections", "This project (shared)"],
+                        usize::from(self.target == Origin::Project),
+                    )
+                    .on_select({
+                        let sheet = cx.entity();
+                        move |i, _, cx| {
+                            sheet.update(cx, |this, cx| {
+                                this.target = match i {
+                                    0 => Origin::Global,
+                                    _ => Origin::Project,
+                                };
+                                cx.notify();
+                            });
+                        }
+                    }),
+                    t,
+                )
+            }))
+            .children((editing && self.target == Origin::Project).then(|| {
+                div()
+                    .text_size(t.typography.caption)
+                    .text_color(t.color.content_muted)
+                    .child("In this project's .daedalus/databases.json")
+            }))
             .child(labelled("Name", boxed(&self.name, t), t))
             .child(labelled(
                 "Driver",
@@ -937,31 +1025,45 @@ impl DbSheet {
                     |this, _| this.production = !this.production,
                     cx,
                 ))
-                .child(checkbox(
-                    "db-claude",
-                    "Claude can read".into(),
-                    self.claude,
-                    t,
-                    |this, _| this.claude = !this.claude,
-                    cx,
-                ))
-                .children(project_name.map(|name| {
+                .children((self.target == Origin::Global).then(|| {
                     checkbox(
-                        "db-only-here",
-                        format!("Only in {name}"),
-                        self.only_here,
+                        "db-claude",
+                        "Claude can read".into(),
+                        self.claude,
                         t,
-                        |this, _| this.only_here = !this.only_here,
+                        |this, _| this.claude = !this.claude,
                         cx,
                     )
-                })),
+                }))
+                .children(
+                    project_name
+                        .filter(|_| self.target == Origin::Global)
+                        .map(|name| {
+                            checkbox(
+                                "db-only-here",
+                                format!("Only in {name}"),
+                                self.only_here,
+                                t,
+                                |this, _| this.only_here = !this.only_here,
+                                cx,
+                            )
+                        }),
+                ),
         );
-        if self.claude {
+        if self.claude && self.target == Origin::Global {
             form = form.child(
                 div()
                     .text_size(t.typography.caption)
                     .text_color(t.color.content_muted)
                     .child("Claude can list tables and run read-only queries. Use a read-only database user."),
+            );
+        }
+        if self.target == Origin::Project {
+            form = form.child(
+                div()
+                    .text_size(t.typography.caption)
+                    .text_color(t.color.content_muted)
+                    .child("Saved in .daedalus/databases.json, which your team can commit. Your password stays in your Keychain."),
             );
         }
         if let Ok(conn) = &built {
@@ -1368,5 +1470,89 @@ mod tests {
             origin: Origin::Global,
         };
         assert_eq!(prompt_detail(&listed), None);
+    }
+
+    fn listed(conn: Connection, origin: Origin) -> Listed {
+        Listed { conn, origin }
+    }
+
+    #[test]
+    fn project_target_drops_claude_and_only_here() {
+        let f = Fields {
+            claude: true,
+            only_here: true,
+            ..fields()
+        };
+        let kept = target_fields(f.clone(), Origin::Global);
+        assert!(kept.claude && kept.only_here);
+        let out = target_fields(f, Origin::Project);
+        let conn = build(&out, None, Some(Path::new("/a"))).unwrap();
+        assert!(!conn.claude && conn.projects.is_empty());
+    }
+
+    #[test]
+    fn saved_for_test_uses_the_form_values_for_project_rows() {
+        let saved = listed(base(), Origin::Project);
+        let mut edited = base();
+        edited.host = "other.example".into();
+        let out = saved_for_test(Some(&saved), &edited, false).unwrap();
+        assert_eq!(out.origin, Origin::Project);
+        assert_ne!(
+            daedalus_db::keychain_account(out.origin, Some(Path::new("/a")), &out.conn),
+            daedalus_db::keychain_account(saved.origin, Some(Path::new("/a")), &saved.conn)
+        );
+    }
+
+    #[test]
+    fn saved_for_test_keeps_personal_rows_as_before() {
+        let mut conn = base();
+        conn.save_password = true;
+        let saved = listed(conn.clone(), Origin::Global);
+        let out = saved_for_test(Some(&saved), &conn, false).unwrap();
+        assert_eq!(out.conn.id, conn.id);
+        conn.save_password = false;
+        assert!(
+            saved_for_test(Some(&listed(conn.clone(), Origin::Global)), &conn, false).is_none()
+        );
+    }
+
+    #[test]
+    fn saved_for_test_never_borrows_when_a_password_is_typed() {
+        let mut conn = base();
+        conn.save_password = true;
+        assert!(saved_for_test(Some(&listed(conn.clone(), Origin::Global)), &conn, true).is_none());
+        assert!(
+            saved_for_test(Some(&listed(conn.clone(), Origin::Project)), &conn, true).is_none()
+        );
+    }
+
+    #[test]
+    fn test_does_not_borrow_a_password_for_a_new_host() {
+        let mut saved = base();
+        saved.save_password = true;
+        let mut edited = saved.clone();
+        edited.host = "attacker.example".into();
+        assert!(saved_for_test(Some(&listed(saved, Origin::Global)), &edited, false).is_none());
+    }
+
+    #[test]
+    fn edit_to_new_host_needs_a_typed_password() {
+        let mut old = base();
+        old.save_password = true;
+        let mut new = old.clone();
+        new.host = "attacker.example".into();
+        assert!(needs_typed_password(
+            Some(&old),
+            &new,
+            &PasswordChange::Keep
+        ));
+        let typed = PasswordChange::Set(Secret::new("pw"));
+        assert!(!needs_typed_password(Some(&old), &new, &typed));
+        assert!(!needs_typed_password(
+            Some(&old),
+            &old,
+            &PasswordChange::Keep
+        ));
+        assert!(!needs_typed_password(None, &new, &PasswordChange::Keep));
     }
 }

@@ -18,7 +18,9 @@ use super::Shell;
 use super::item::ItemView;
 use super::sidebar::Tween;
 use crate::db_secrets;
-use sheet::{DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect};
+use sheet::{
+    DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect, needs_typed_password,
+};
 
 mod console;
 mod explorer;
@@ -150,6 +152,41 @@ fn stale_project_keys(old: &[Connection], new: &[Connection]) -> Vec<String> {
         })
         .map(|o| conn_key(Origin::Project, &o.id))
         .collect()
+}
+
+/// Whether a project row still exists in the shared file read for the active root.
+fn shared_row_still_current(
+    shared: Option<&SharedFile>,
+    active_root: Option<&Path>,
+    id: &str,
+) -> bool {
+    shared.is_some_and(|s| {
+        Some(s.root.as_path()) == active_root && s.conns.iter().any(|c| c.id == id)
+    })
+}
+
+/// The connection as written to the shared file: a SQLite path inside the project is stored relative.
+fn shared_form(mut conn: Connection, root: &Path) -> Connection {
+    if conn.engine == Engine::Sqlite
+        && let Ok(rel) = Path::new(&conn.database).strip_prefix(root)
+    {
+        conn.database = rel.to_string_lossy().into_owned();
+    }
+    conn.claude = false;
+    conn.projects = vec![];
+    conn
+}
+
+/// A personal entry bound to `root` that hides the shared one; a taken id gets `fresh` instead.
+fn personal_copy(shared: &Connection, root: &Path, store: &Store, fresh: String) -> Connection {
+    let mut copy = shared.clone();
+    if store.connections.iter().any(|c| c.id == copy.id) {
+        copy.id = fresh;
+    }
+    copy.projects = vec![root.to_path_buf()];
+    copy.claude = false;
+    copy.save_password = false;
+    copy
 }
 
 /// Whether connecting asks for the password before reading the Keychain.
@@ -874,7 +911,8 @@ impl Shell {
                 conn,
                 origin,
                 password,
-            } => self.db_save_confirmed(*conn, origin, password, window, cx),
+                root,
+            } => self.db_save_confirmed(*conn, origin, password, root, window, cx),
             DbSheetEvent::Test {
                 conn,
                 typed,
@@ -994,6 +1032,7 @@ impl Shell {
         conn: Connection,
         origin: Origin,
         password: PasswordChange,
+        root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1003,7 +1042,7 @@ impl Shell {
             .as_ref()
             .and_then(|s| s.connections.iter().find(|c| c.id == conn.id));
         if !sheet::asks_for_claude_on_production(base, &conn) {
-            return self.db_save(conn, origin, password, window, cx);
+            return self.db_save(conn, origin, password, root, window, cx);
         }
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -1015,7 +1054,7 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(super::lsp::CONFIRMED) = answer.await {
                 this.update_in(cx, |shell, window, cx| {
-                    shell.db_save(conn, origin, password, window, cx)
+                    shell.db_save(conn, origin, password, root, window, cx)
                 })
                 .ok();
             }
@@ -1028,10 +1067,13 @@ impl Shell {
         conn: Connection,
         origin: Origin,
         password: PasswordChange,
+        root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = self.active_root();
+        if origin == Origin::Project {
+            return self.db_save_shared(conn, password, root, window, cx);
+        }
         let account = daedalus_db::keychain_account(origin, root.as_deref(), &conn);
         let old = self
             .db
@@ -1039,6 +1081,9 @@ impl Shell {
             .as_ref()
             .and_then(|s| s.connections.iter().find(|c| c.id == conn.id))
             .cloned();
+        if needs_typed_password(old.as_ref(), &conn, &password) {
+            return self.db_sheet_error("Type the password for the new host".into(), cx);
+        }
         let key = conn_key(origin, &conn.id);
         let new = conn.clone();
         let opened = self.db.sheet_opened;
@@ -1067,6 +1112,66 @@ impl Shell {
                         shell.db_disconnect(&key, cx);
                     }
                     shell.db.selected = Some(key);
+                    if shell.db_sheet_is(opened) {
+                        shell.db_close_sheet(window, cx);
+                    }
+                }
+                Err(e) if shell.db_sheet_is(opened) => shell.db_sheet_error(e, cx),
+                Err(e) => shell.transient_notice("Could not save the connection", e, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn db_save_shared(
+        &mut self,
+        conn: Connection,
+        password: PasswordChange,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else {
+            return self.db_sheet_error("Open a project first".into(), cx);
+        };
+        let conn = shared_form(conn, &root);
+        let account = daedalus_db::keychain_account(Origin::Project, Some(&root), &conn);
+        let old = self
+            .db
+            .shared
+            .as_ref()
+            .filter(|s| s.root == root)
+            .and_then(|s| s.conns.iter().find(|c| c.id == conn.id))
+            .cloned();
+        let key = conn_key(Origin::Project, &conn.id);
+        let new = conn.clone();
+        let opened = self.db.sheet_opened;
+        let task_root = root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    if let PasswordChange::Set(secret) = &password
+                        && conn.save_password
+                        && conn.engine != Engine::Sqlite
+                    {
+                        db_secrets::save(&account, secret).map_err(|e| e.to_string())?;
+                    }
+                    daedalus_db::shared::upsert(&task_root, &conn).map_err(|e| format!("{e:#}"))?;
+                    Ok::<_, String>(daedalus_db::shared::load(&task_root))
+                })
+                .await;
+            this.update_in(cx, |shell, window, cx| match saved {
+                Ok(loaded) => {
+                    // A project switch mid-save must not touch the new project's state.
+                    if shell.active_root().as_ref() == Some(&root) {
+                        shell.db_apply_shared(root, loaded, cx);
+                        if old.is_some_and(|old| needs_reconnect(&old, &new)) {
+                            shell.db_disconnect(&key, cx);
+                        }
+                        shell.db.selected = Some(key);
+                    }
                     if shell.db_sheet_is(opened) {
                         shell.db_close_sheet(window, cx);
                     }
@@ -1466,17 +1571,35 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if listed.origin == Origin::Project && !self.db_project_row_current(&listed.conn.id) {
+            return self.transient_notice(
+                "Could not delete the connection",
+                "This connection is no longer in the project file.",
+                cx,
+            );
+        }
+        let root = self.active_root();
+        let (title, detail) = match listed.origin {
+            Origin::Project => (
+                format!("Delete {} from this project?", listed.conn.name),
+                "It is removed from .daedalus/databases.json for everyone who pulls the change. Your saved password for it is removed too.",
+            ),
+            Origin::Global => (
+                format!("Delete {}?", listed.conn.name),
+                "Its saved password is removed too.",
+            ),
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Delete {}?", listed.conn.name),
-            Some("Its saved password is removed too."),
+            &title,
+            Some(detail),
             &["Delete", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(0) = answer.await {
                 this.update_in(cx, |shell, window, cx| {
-                    shell.db_delete_confirmed(listed, window, cx)
+                    shell.db_delete_confirmed(listed, root, window, cx)
                 })
                 .ok();
             }
@@ -1484,14 +1607,26 @@ impl Shell {
         .detach();
     }
 
-    fn db_delete_confirmed(&mut self, listed: Listed, window: &mut Window, cx: &mut Context<Self>) {
+    fn db_project_row_current(&self, id: &str) -> bool {
+        shared_row_still_current(self.db.shared.as_ref(), self.active_root().as_deref(), id)
+    }
+
+    fn db_delete_confirmed(
+        &mut self,
+        listed: Listed,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if listed.origin == Origin::Project {
+            return self.db_delete_shared(listed, root, window, cx);
+        }
         let key = conn_key(listed.origin, &listed.conn.id);
         self.db_disconnect(&key, cx);
         self.db.meta.remove(&key);
         if self.db.selected.as_deref() == Some(key.as_str()) {
             self.db.selected = None;
         }
-        let root = self.active_root();
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
         let has_secret = listed.conn.save_password && listed.conn.engine != Engine::Sqlite;
         let id = listed.conn.id;
@@ -1522,6 +1657,120 @@ impl Shell {
                         }
                     }
                     Err(e) => shell.transient_notice("Could not delete the connection", e, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn db_delete_shared(
+        &mut self,
+        listed: Listed,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else {
+            return self.transient_notice(
+                "Could not delete the connection",
+                "Open a project first",
+                cx,
+            );
+        };
+        let key = conn_key(Origin::Project, &listed.conn.id);
+        self.db_disconnect(&key, cx);
+        self.db.meta.remove(&key);
+        if self.db.selected.as_deref() == Some(key.as_str()) {
+            self.db.selected = None;
+        }
+        let account = daedalus_db::keychain_account(Origin::Project, Some(&root), &listed.conn);
+        let has_secret = listed.conn.engine != Engine::Sqlite;
+        let id = listed.conn.id;
+        let opened = self.db.sheet_opened;
+        let task_root = root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (keychain, removed) = cx
+                .background_executor()
+                .spawn(async move {
+                    let keychain = match has_secret {
+                        true => db_secrets::delete(&account).err().map(|e| e.to_string()),
+                        false => None,
+                    };
+                    let removed = daedalus_db::shared::remove(&task_root, &id)
+                        .map_err(|e| format!("{e:#}"))
+                        .map(|_| daedalus_db::shared::load(&task_root));
+                    (keychain, removed)
+                })
+                .await;
+            this.update_in(cx, |shell, window, cx| {
+                if let Some(e) = keychain {
+                    shell.transient_notice("Could not remove the saved password", e, cx);
+                }
+                match removed {
+                    Ok(loaded) => {
+                        if shell.active_root().as_ref() == Some(&root) {
+                            shell.db_apply_shared(root, loaded, cx);
+                        }
+                        if shell.db_sheet_is(opened) {
+                            shell.db_close_sheet(window, cx);
+                        }
+                    }
+                    Err(e) => shell.transient_notice("Could not delete the connection", e, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn db_make_personal(&mut self, listed: Listed, cx: &mut Context<Self>) {
+        if listed.origin == Origin::Project && !self.db_project_row_current(&listed.conn.id) {
+            return self.transient_notice(
+                "Could not make a personal copy",
+                "This connection is no longer in the project file.",
+                cx,
+            );
+        }
+        let Some(root) = self
+            .active_root()
+            .filter(|_| listed.origin == Origin::Project)
+        else {
+            return;
+        };
+        let Ok(fresh) = daedalus_db::new_id() else {
+            return self.transient_notice(
+                "Could not make a personal copy",
+                "Could not create an id",
+                cx,
+            );
+        };
+        let old_key = conn_key(Origin::Project, &listed.conn.id);
+        let conn = listed.conn;
+        cx.spawn(async move |this, cx| {
+            let made = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut id = String::new();
+                    let store = edit_store(|store| {
+                        let copy = personal_copy(&conn, &root, store, fresh);
+                        id = copy.id.clone();
+                        store.upsert(copy);
+                    })?;
+                    Ok::<_, String>((store, id))
+                })
+                .await;
+            this.update(cx, |shell, cx| {
+                match made {
+                    Ok((store, id)) => {
+                        shell.db_set_store(store);
+                        shell.db_disconnect(&old_key, cx);
+                        shell.db.meta.remove(&old_key);
+                        shell.db.selected = Some(conn_key(Origin::Global, &id));
+                    }
+                    Err(e) => shell.transient_notice("Could not make a personal copy", e, cx),
                 }
                 cx.notify();
             })
@@ -1958,6 +2207,80 @@ mod tests {
             problems: vec![],
             error: None,
         }
+    }
+
+    fn sqlite_conn(path: &str) -> Connection {
+        Connection {
+            engine: Engine::Sqlite,
+            database: path.into(),
+            ..pg("lite")
+        }
+    }
+
+    #[test]
+    fn shared_form_stores_sqlite_paths_inside_the_project_relative() {
+        let out = shared_form(sqlite_conn("/work/app/data/dev.db"), Path::new("/work/app"));
+        assert_eq!(out.database, "data/dev.db");
+    }
+
+    #[test]
+    fn shared_form_leaves_outside_and_server_paths_alone() {
+        let outside = shared_form(sqlite_conn("/elsewhere/dev.db"), Path::new("/work/app"));
+        assert_eq!(outside.database, "/elsewhere/dev.db");
+        let server = shared_form(pg("x"), Path::new("/work/app"));
+        assert_eq!(server.database, "app");
+    }
+
+    #[test]
+    fn shared_form_never_keeps_claude_or_projects() {
+        let mut conn = pg("x");
+        conn.claude = true;
+        conn.projects = vec![PathBuf::from("/work/app")];
+        let out = shared_form(conn, Path::new("/work/app"));
+        assert!(!out.claude && out.projects.is_empty());
+    }
+
+    #[test]
+    fn shared_row_still_current_needs_same_root_and_id() {
+        let shared = SharedFile {
+            root: PathBuf::from("/a"),
+            conns: vec![pg("x")],
+            problems: vec![],
+            error: None,
+        };
+        let a = Some(Path::new("/a"));
+        assert!(shared_row_still_current(Some(&shared), a, "x"));
+        assert!(!shared_row_still_current(Some(&shared), a, "y"));
+        assert!(!shared_row_still_current(
+            Some(&shared),
+            Some(Path::new("/b")),
+            "x"
+        ));
+        assert!(!shared_row_still_current(None, a, "x"));
+    }
+
+    #[test]
+    fn personal_copy_binds_to_the_root_and_keeps_the_id() {
+        let out = personal_copy(&pg("x"), Path::new("/a"), &Store::empty(), "fresh".into());
+        assert_eq!(out.id, "x");
+        assert_eq!(out.projects, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn personal_copy_takes_a_fresh_id_when_the_id_is_taken() {
+        let mut store = Store::empty();
+        store.upsert(pg("x"));
+        let out = personal_copy(&pg("x"), Path::new("/a"), &store, "fresh".into());
+        assert_eq!(out.id, "fresh");
+    }
+
+    #[test]
+    fn personal_copy_never_carries_claude_or_a_saved_password() {
+        let mut shared = pg("x");
+        shared.claude = true;
+        shared.save_password = true;
+        let out = personal_copy(&shared, Path::new("/a"), &Store::empty(), "fresh".into());
+        assert!(!out.claude && !out.save_password);
     }
 
     #[test]

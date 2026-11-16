@@ -739,25 +739,25 @@ impl Shell {
             MenuItem::separator(),
             toggle,
         ];
-        if listed.origin == Origin::Global {
-            items.push(shell_item("Edit…", cx, {
+        items.push(shell_item("Edit…", cx, {
+            let listed = listed.clone();
+            move |this, window, cx| this.db_open_sheet(SheetMode::Edit(listed.clone()), window, cx)
+        }));
+        if listed.origin == Origin::Project {
+            items.push(shell_item("Make Personal Copy", cx, {
                 let listed = listed.clone();
-                move |this, window, cx| {
-                    this.db_open_sheet(SheetMode::Edit(listed.clone()), window, cx)
-                }
+                move |this, _, cx| this.db_make_personal(listed.clone(), cx)
             }));
         }
         items.push(MenuItem::separator());
         items.push(MenuItem::new("Copy URL", move |_, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
         }));
-        if listed.origin == Origin::Global {
-            items.push(MenuItem::separator());
-            items.push(shell_item("Delete…", cx, {
-                let listed = listed.clone();
-                move |this, window, cx| this.db_delete(listed.clone(), window, cx)
-            }));
-        }
+        items.push(MenuItem::separator());
+        items.push(shell_item("Delete…", cx, {
+            let listed = listed.clone();
+            move |this, window, cx| this.db_delete(listed.clone(), window, cx)
+        }));
         if let Some(refresh) = refresh {
             items.insert(1, refresh);
         }
