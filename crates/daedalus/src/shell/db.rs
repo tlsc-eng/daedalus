@@ -159,6 +159,11 @@ fn prompts_first(listed: &Listed) -> bool {
         && !listed.conn.save_password
 }
 
+/// A shared entry never has its flag written back to the personal store.
+fn marks_saved(listed: &Listed) -> bool {
+    listed.origin == Origin::Global && !listed.conn.save_password
+}
+
 /// Whether a spinner that began at `busy` still shows at `now` for a connect that finished at `at`.
 fn spinner_lingers(busy: Busy, at: Instant, now: Instant, delay: Duration, hold: Duration) -> bool {
     let waited = at.saturating_duration_since(busy.since());
@@ -621,9 +626,40 @@ impl Shell {
     }
 
     fn db_forget_session(&mut self, key: &str, cx: &mut Context<Self>) {
+        if key.starts_with("p:") {
+            self.db_hang_up_tabs(key, cx);
+            self.db_close_prompt_for(key, cx);
+        }
         self.db_disconnect(key, cx);
         self.db.meta.remove(key);
         self.db.expanded.remove(&NodeKey::Conn(key.to_owned()));
+    }
+
+    /// Leaves the tabs open but disconnected, so a changed shared entry never keeps a live session.
+    fn db_hang_up_tabs(&mut self, key: &str, cx: &mut Context<Self>) {
+        let stale: Vec<(SessionId, DbTab)> = self
+            .db
+            .tabs
+            .iter()
+            .filter_map(|(s, w)| Some((*s, w.upgrade()?)))
+            .filter(|(_, tab)| tab.key(cx) == key)
+            .collect();
+        for (session, tab) in stale {
+            self.db.tabs.remove(&session);
+            tab.hang_up(cx);
+        }
+    }
+
+    fn db_close_prompt_for(&mut self, key: &str, cx: &mut Context<Self>) {
+        let open = self.db.sheet.as_ref().is_some_and(|open| {
+            open.entity
+                .read(cx)
+                .password_target()
+                .is_some_and(|l| conn_key(l.origin, &l.conn.id) == key)
+        });
+        if open {
+            self.db_dismiss_sheet(cx);
+        }
     }
 
     pub(super) fn db_shared_changed(&mut self, root: &Path, cx: &mut Context<Self>) {
@@ -798,6 +834,12 @@ impl Shell {
     }
 
     fn db_close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.db_dismiss_sheet(cx);
+        self.focus_active_item(window, cx);
+        cx.notify();
+    }
+
+    fn db_dismiss_sheet(&mut self, cx: &mut Context<Self>) {
         if let Some((session, _)) = self.db.test.take() {
             self.db.send(Command::Disconnect { session });
         }
@@ -824,8 +866,6 @@ impl Shell {
             })
             .detach();
         }
-        self.focus_active_item(window, cx);
-        cx.notify();
     }
 
     fn db_sheet_event(&mut self, event: DbSheetEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1076,10 +1116,7 @@ impl Shell {
         let root = self.active_root();
         let typed = (!password.is_empty()).then(|| password.clone());
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
-        let (id, mark_saved) = (
-            listed.conn.id.clone(),
-            listed.origin == Origin::Global && !listed.conn.save_password,
-        );
+        let (id, mark_saved) = (listed.conn.id.clone(), marks_saved(&listed));
         self.db.send(Command::Connect {
             session,
             conn: listed.conn,
@@ -1910,6 +1947,7 @@ mod tests {
             claude: false,
             projects: vec![],
             save_password: false,
+            ssh: None,
         }
     }
 
@@ -1946,7 +1984,22 @@ mod tests {
 
     #[test]
     fn stale_keys_cover_removed_and_moved_entries() {
-        let old = vec![pg("a"), pg("b"), pg("c"), pg("d"), pg("e"), pg("f")];
+        let mut with_ssh = pg("g");
+        with_ssh.ssh = Some(daedalus_db::SshTunnel {
+            host: "bastion".into(),
+            port: None,
+            user: String::new(),
+            identity_file: None,
+        });
+        let old = vec![
+            pg("a"),
+            pg("b"),
+            pg("c"),
+            pg("d"),
+            pg("e"),
+            pg("f"),
+            with_ssh,
+        ];
         let mut new = old.clone();
         new[0].host = "other".into();
         new[1].port = Some(1);
@@ -1955,9 +2008,10 @@ mod tests {
         new.remove(4);
         new[4].name = "renamed".into();
         new[4].color = Some("accent".into());
+        new[5].ssh.as_mut().unwrap().host = "attacker.example".into();
         let mut keys = stale_project_keys(&old, &new);
         keys.sort();
-        assert_eq!(keys, ["p:a", "p:b", "p:c", "p:d", "p:e"]);
+        assert_eq!(keys, ["p:a", "p:b", "p:c", "p:d", "p:e", "p:g"]);
     }
 
     #[test]
@@ -1970,5 +2024,20 @@ mod tests {
         assert!(prompts_first(&listed(Engine::Postgres, Origin::Global)));
         assert!(!prompts_first(&listed(Engine::Sqlite, Origin::Global)));
         assert!(!prompts_first(&listed(Engine::Sqlite, Origin::Project)));
+    }
+
+    #[test]
+    fn only_global_rows_without_a_saved_flag_get_marked_saved() {
+        let listed = |origin, save_password| Listed {
+            conn: Connection {
+                save_password,
+                ..pg("x")
+            },
+            origin,
+        };
+        assert!(!marks_saved(&listed(Origin::Project, false)));
+        assert!(!marks_saved(&listed(Origin::Project, true)));
+        assert!(marks_saved(&listed(Origin::Global, false)));
+        assert!(!marks_saved(&listed(Origin::Global, true)));
     }
 }

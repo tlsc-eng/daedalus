@@ -53,6 +53,20 @@ impl DbTab {
         }
     }
 
+    /// Hangs up the tab's session and leaves it idle so a later connect starts fresh.
+    pub fn hang_up(&self, cx: &mut App) {
+        match self {
+            Self::Console(v) => v.update(cx, |c, cx| {
+                c.disconnect();
+                c.idle(cx);
+            }),
+            Self::Table(v) => v.update(cx, |c, cx| {
+                c.disconnect();
+                c.idle(cx);
+            }),
+        }
+    }
+
     pub fn idle(&self, cx: &mut App) {
         match self {
             Self::Console(v) => v.update(cx, |c, cx| c.idle(cx)),
