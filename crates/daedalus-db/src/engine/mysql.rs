@@ -149,14 +149,29 @@ fn to_cell(value: &Value, is_bit: bool) -> Cell {
     }
 }
 
+/// Charset 63 is `binary`; it is what tells BLOB from TEXT and VARBINARY from VARCHAR on the wire.
+fn type_name(raw: &str, charset: u16) -> String {
+    let lower = raw
+        .strip_prefix("MYSQL_TYPE_")
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    let binary = charset == 63;
+    let pick = |bin: &str, text: &str| if binary { bin } else { text }.to_owned();
+    match lower.as_str() {
+        "string" => pick("binary", "char"),
+        "var_string" | "varchar" => pick("varbinary", "varchar"),
+        "tiny_blob" => pick("tinyblob", "tinytext"),
+        "medium_blob" => pick("mediumblob", "mediumtext"),
+        "long_blob" => pick("longblob", "longtext"),
+        "blob" => pick("blob", "text"),
+        _ => lower,
+    }
+}
+
 fn column(c: &mysql_async::Column) -> Column {
-    let ty = format!("{:?}", c.column_type());
     Column {
         name: c.name_str().into_owned(),
-        type_name: ty
-            .strip_prefix("MYSQL_TYPE_")
-            .unwrap_or(&ty)
-            .to_ascii_lowercase(),
+        type_name: type_name(&format!("{:?}", c.column_type()), c.character_set()),
         table: None,
     }
 }
@@ -361,6 +376,18 @@ impl MysqlCanceller {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn string_columns_are_named_by_charset() {
+        assert_eq!(type_name("MYSQL_TYPE_BLOB", 63), "blob");
+        assert_eq!(type_name("MYSQL_TYPE_BLOB", 45), "text");
+        assert_eq!(type_name("MYSQL_TYPE_VAR_STRING", 63), "varbinary");
+        assert_eq!(type_name("MYSQL_TYPE_VAR_STRING", 45), "varchar");
+        assert_eq!(type_name("MYSQL_TYPE_STRING", 63), "binary");
+        assert_eq!(type_name("MYSQL_TYPE_LONG_BLOB", 45), "longtext");
+        assert_eq!(type_name("MYSQL_TYPE_LONGLONG", 63), "longlong");
+        assert_eq!(type_name("MYSQL_TYPE_BIT", 63), "bit");
+    }
+
     use super::*;
 
     #[test]
