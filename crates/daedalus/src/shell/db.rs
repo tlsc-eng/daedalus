@@ -968,6 +968,10 @@ impl Shell {
         self.db_open_sheet(SheetMode::Password { listed, tab: None }, window, cx);
     }
 
+    pub(super) fn db_sheet_open(&self) -> bool {
+        self.db.sheet.is_some()
+    }
+
     fn db_sheet_is(&self, opened: u64) -> bool {
         self.db.sheet.is_some() && self.db.sheet_opened == opened
     }

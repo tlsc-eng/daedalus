@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use daedalus_db::Listed;
 use daedalus_ui::ActiveTheme;
 use gpui::{App, Context, InteractiveElement, ScrollStrategy, Window};
@@ -116,6 +118,32 @@ fn step(selectable: &[bool], from: Option<usize>, by: isize) -> Option<usize> {
         .or(from)
 }
 
+/// What Left does from a selection.
+#[derive(Debug, PartialEq)]
+enum Left {
+    Collapse(NodeKey),
+    Select(Sel),
+    Nothing,
+}
+
+fn left_move(lines: &[Line], sel: &Sel, expanded: &HashSet<NodeKey>) -> Left {
+    if let Sel::Node(n) = sel
+        && expanded.contains(n)
+    {
+        return Left::Collapse(n.clone());
+    }
+    sel.ancestors()
+        .into_iter()
+        .map(Sel::Node)
+        .find(|a| find(lines, a).is_some())
+        .map_or(Left::Nothing, Left::Select)
+}
+
+/// Whether a click that collapses `node` leaves the selection alone because it sits inside `node`.
+pub(super) fn keeps_selection(selected: Option<&Sel>, node: &NodeKey, expanded: bool) -> bool {
+    expanded && selected.is_some_and(|s| s.ancestors().contains(node))
+}
+
 /// Rows moved by one page key: a screen minus one row of overlap, never fewer than one.
 fn page_rows(list_h: f32, row_h: f32) -> usize {
     if row_h <= 0. || !list_h.is_finite() || !row_h.is_finite() {
@@ -176,21 +204,13 @@ impl Shell {
         let Some((_, sel)) = self.db_effective(&lines) else {
             return;
         };
-        let Sel::Node(n) = &sel else {
-            return;
-        };
-        if self.db.expanded.contains(n) {
-            self.db_toggle(n.clone(), None, window, cx);
-            return;
-        }
-        if let Some(a) = sel
-            .ancestors()
-            .into_iter()
-            .map(Sel::Node)
-            .find(|a| find(&lines, a).is_some())
-        {
-            self.db.select(a, ScrollStrategy::Top);
-            cx.notify();
+        match left_move(&lines, &sel, &self.db.expanded) {
+            Left::Collapse(n) => self.db_toggle(n, None, window, cx),
+            Left::Select(a) => {
+                self.db.select(a, ScrollStrategy::Top);
+                cx.notify();
+            }
+            Left::Nothing => {}
         }
     }
 
@@ -474,6 +494,55 @@ mod tests {
         assert_eq!(Sel::Note(t, "x".into()).conn(), Some("c"));
         assert_eq!(Sel::Detected("d".into()).conn(), None);
         assert_eq!(Sel::LookInDocker.conn(), None);
+    }
+
+    #[test]
+    fn left_goes_to_the_parent_or_collapses() {
+        let t = table_key("c", "s", "t");
+        let s = NodeKey::Schema("c".into(), "s".into());
+        let lines = [
+            conn("c"),
+            schema("c", "s"),
+            table("c", "s", "t"),
+            column(t.clone(), "id"),
+            note(t.clone(), "retry", Some("c")),
+        ];
+        let open: HashSet<NodeKey> = [t.clone()].into();
+        let none = HashSet::new();
+        let col = Sel::Column(t.clone(), "id".into());
+        assert_eq!(
+            left_move(&lines, &col, &open),
+            Left::Select(Sel::Node(t.clone()))
+        );
+        let retry = Sel::Note(t.clone(), "retry".into());
+        assert_eq!(
+            left_move(&lines, &retry, &open),
+            Left::Select(Sel::Node(t.clone()))
+        );
+        assert_eq!(
+            left_move(&lines, &Sel::Node(t.clone()), &open),
+            Left::Collapse(t.clone())
+        );
+        assert_eq!(
+            left_move(&lines, &Sel::Node(t), &none),
+            Left::Select(Sel::Node(s))
+        );
+        assert_eq!(
+            left_move(&lines, &Sel::Detected("d".into()), &none),
+            Left::Nothing
+        );
+        assert_eq!(left_move(&lines, &Sel::LookInDocker, &none), Left::Nothing);
+    }
+
+    #[test]
+    fn a_collapsing_click_keeps_a_selection_inside_it() {
+        let s = NodeKey::Schema("c".into(), "s".into());
+        let inside = Sel::Node(table_key("c", "s", "t"));
+        assert!(keeps_selection(Some(&inside), &s, true));
+        assert!(!keeps_selection(Some(&inside), &s, false));
+        assert!(!keeps_selection(Some(&Sel::Node(s.clone())), &s, true));
+        assert!(!keeps_selection(None, &s, true));
+        assert!(!keeps_selection(Some(&Sel::Detected("d".into())), &s, true));
     }
 
     #[test]

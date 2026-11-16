@@ -74,7 +74,7 @@ impl Shell {
             let filter = self.outline_filter(cx);
             window.focus(&filter.focus_handle(cx));
         }
-        if mode == SideMode::Data {
+        if mode == SideMode::Data && !self.db_sheet_open() {
             window.focus(&self.db_focus);
         }
     }

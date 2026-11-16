@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use super::detected::DetectedRow;
-use super::nav::{Sel, current, find};
+use super::nav::{Sel, current, find, keeps_selection};
 use super::sheet::SheetMode;
 use super::{Meta, NodeKey, Phase, SharedFile, conn_key};
 use crate::shell::Shell;
@@ -531,7 +531,13 @@ impl Shell {
                         el.hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.db.selected = Some(Sel::Node(node.clone()));
+                        if !keeps_selection(
+                            this.db.selected.as_ref(),
+                            &node,
+                            this.db.expanded.contains(&node),
+                        ) {
+                            this.db.selected = Some(Sel::Node(node.clone()));
+                        }
                         this.db_toggle(node.clone(), None, window, cx)
                     }))
                     .child(slot().child(chevron(turn, &t)))
@@ -562,7 +568,13 @@ impl Shell {
                     .on_click(cx.listener({
                         let (conn, schema, name) = (conn.clone(), schema.clone(), name.clone());
                         move |this, event: &ClickEvent, window, cx| {
-                            this.db.selected = Some(Sel::Node(node.clone()));
+                            if !keeps_selection(
+                                this.db.selected.as_ref(),
+                                &node,
+                                this.db.expanded.contains(&node),
+                            ) {
+                                this.db.selected = Some(Sel::Node(node.clone()));
+                            }
                             if event.click_count() >= 2 {
                                 this.db_open_table(
                                     conn.clone(),
