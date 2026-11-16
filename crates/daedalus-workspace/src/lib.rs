@@ -117,6 +117,8 @@ pub struct UiState {
     /// The drawer tab shown last, which Cmd+J reopens after a launch.
     #[serde(deserialize_with = "lenient_drawer_tab")]
     pub drawer_tab: Option<DrawerTabName>,
+    /// Share of a database console's height its SQL editor takes.
+    pub db_console_split: f32,
 }
 
 /// A bottom-drawer tab, by the name workspace.json stores it under.
@@ -182,6 +184,7 @@ impl Default for UiState {
             sidebar_expanded: false,
             side_mode: SideMode::Sessions,
             drawer_tab: None,
+            db_console_split: 0.4,
         }
     }
 }

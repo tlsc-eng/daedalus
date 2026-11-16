@@ -119,6 +119,7 @@ mod tests {
             sidebar_expanded: true,
             side_mode: SideMode::Git,
             drawer_tab: Some(DrawerTabName::Tests),
+            db_console_split: 0.3,
         };
         w.projects[0].folder = vec!["work".into(), "clients".into()];
         w.collapsed = vec![vec!["work".into()]];
@@ -466,6 +467,12 @@ mod tests {
         assert!(ui.tree_visible);
         assert!(!ui.terminal_panel_open);
         assert_eq!(ui.font_zoom, 0);
+    }
+
+    #[test]
+    fn ui_without_console_split_reads_the_default() {
+        let ui: UiState = serde_json::from_str(r#"{"tree_width":320}"#).unwrap();
+        assert_eq!(ui.db_console_split, 0.4);
     }
 
     #[test]
