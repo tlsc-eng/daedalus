@@ -713,3 +713,33 @@ fn mysql_quotes_backticks() {
         vec![Some("1".into())]
     );
 }
+
+#[test]
+#[ignore = "needs MySQL at DAEDALUS_TEST_MYSQL"]
+fn dials_the_tunnel_address_not_the_host() {
+    let url = std::env::var("DAEDALUS_TEST_MYSQL").expect("DAEDALUS_TEST_MYSQL");
+    let (mut conn, password) = from_url(&url).expect("valid test url");
+    let port = conn.port.unwrap_or(3306);
+    conn.host = "db.invalid".into();
+    conn.tls = daedalus_db::Tls::Disable;
+    let via = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let password = password.or_else(|| Some(Secret::new("")));
+    let (_driver, server) = runtime
+        .block_on(daedalus_db::engine::Driver::connect(
+            &conn,
+            Some(via),
+            password.as_ref(),
+            None,
+        ))
+        .expect("connects through the tunnel address");
+    assert!(
+        ["MySQL", "MariaDB"]
+            .iter()
+            .any(|name| server.starts_with(name)),
+        "{server}"
+    );
+}
