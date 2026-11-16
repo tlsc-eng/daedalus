@@ -176,6 +176,7 @@ pub(in crate::shell) fn needs_reconnect(old: &Connection, new: &Connection) -> b
         || old.tls != new.tls
         || old.ca_file != new.ca_file
         || old.read_only != new.read_only
+        || old.ssh != new.ssh
 }
 
 /// What the sheet does with the saved password when the form is submitted.
@@ -437,6 +438,13 @@ impl DbSheet {
         cx.notify();
     }
 
+    pub(in crate::shell) fn password_target(&self) -> Option<&Listed> {
+        match &self.mode {
+            SheetMode::Password { listed, .. } => Some(listed),
+            _ => None,
+        }
+    }
+
     pub(in crate::shell) fn set_test_result(
         &mut self,
         result: Result<String, String>,
@@ -578,6 +586,82 @@ fn engine_index(engine: Engine) -> usize {
     }
 }
 
+fn tls_label(tls: Tls) -> &'static str {
+    ["Off", "Prefer", "Verify", "Unverified"][tls_index(tls)]
+}
+
+/// Where a project row's password will go, shown before the user types it.
+pub(super) fn prompt_detail(listed: &Listed) -> Option<String> {
+    if listed.origin == Origin::Global {
+        return None;
+    }
+    let conn = &listed.conn;
+    let shown = Connection {
+        user: caption_field(&conn.user),
+        host: caption_field(&conn.host),
+        database: caption_field(&conn.database),
+        ..conn.clone()
+    };
+    let mut out = format!(
+        "{} · TLS {}",
+        daedalus_db::redacted_url(&shown),
+        tls_label(conn.tls)
+    );
+    if let Some(ca) = &conn.ca_file {
+        out.push_str(&format!(
+            " · CA {}",
+            caption_field(&ca.display().to_string())
+        ));
+    }
+    if let Some(ssh) = &conn.ssh {
+        out.push_str(" · via ssh ");
+        if !ssh.user.is_empty() {
+            out.push_str(&format!("{}@", caption_field(&ssh.user)));
+        }
+        out.push_str(&caption_field(&ssh.host));
+        if let Some(port) = ssh.port {
+            out.push_str(&format!(":{port}"));
+        }
+    }
+    Some(out)
+}
+
+/// Makes a value from a shared file safe to show: no control characters, bounded length.
+fn caption_field(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out: String = s
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect();
+    if s.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Whether the host is this machine or a file path, where an unencrypted password stays local.
+fn is_local_host(conn: &Connection) -> bool {
+    conn.engine == Engine::Sqlite
+        || conn.host.is_empty()
+        || conn.host.starts_with('/')
+        || matches!(conn.host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Whether the password can cross a network without TLS to a non-local server.
+fn tls_warning(conn: &Connection) -> Option<&'static str> {
+    if conn.ssh.is_some() {
+        return None;
+    }
+    match conn.tls {
+        Tls::Disable => Some("TLS is off, so the password may cross the network unencrypted."),
+        Tls::Prefer if !is_local_host(conn) => {
+            Some("TLS is optional, so the password may be sent unencrypted.")
+        }
+        _ => None,
+    }
+}
+
 fn tls_index(tls: Tls) -> usize {
     match tls {
         Tls::Disable => 0,
@@ -667,6 +751,13 @@ impl DbSheet {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let keychain = self.keychain;
+        let detail = prompt_detail(listed);
+        let caption = |text: String, color| {
+            div()
+                .text_size(t.typography.caption)
+                .text_color(color)
+                .child(text)
+        };
         div()
             .flex()
             .flex_col()
@@ -679,6 +770,16 @@ impl DbSheet {
                     .text_color(t.color.content)
                     .child(format!("Password for {}", listed.conn.name)),
             )
+            .when_some(detail, |el, detail| {
+                el.child(caption(detail, t.color.content_secondary))
+                    .child(caption(
+                        "From this project's .daedalus/databases.json. Check the server before you type a password.".into(),
+                        t.color.content_muted,
+                    ))
+                    .when_some(tls_warning(&listed.conn), |el, warning| {
+                        el.child(caption(warning.into(), t.color.warning))
+                    })
+            })
             .child(boxed(&self.password, t))
             .child(checkbox(
                 "db-keychain",
@@ -1166,6 +1267,14 @@ mod tests {
         let mut ro = old.clone();
         ro.read_only = true;
         assert!(needs_reconnect(&old, &ro));
+        let mut ssh = old.clone();
+        ssh.ssh = Some(daedalus_db::SshTunnel {
+            host: "bastion".into(),
+            port: None,
+            user: String::new(),
+            identity_file: None,
+        });
+        assert!(needs_reconnect(&old, &ssh));
     }
 
     #[test]
@@ -1189,5 +1298,75 @@ mod tests {
             password_change(None, &off, "new"),
             PasswordChange::Keep
         ));
+    }
+
+    #[test]
+    fn prompt_detail_names_host_tls_and_ca_for_project_rows() {
+        let listed = Listed {
+            conn: base(),
+            origin: Origin::Project,
+        };
+        let detail = prompt_detail(&listed).unwrap();
+        assert!(detail.contains(&daedalus_db::redacted_url(&listed.conn)));
+        assert!(detail.contains("TLS "));
+        assert!(detail.ends_with(" · CA /tmp/ca.pem"));
+    }
+
+    #[test]
+    fn prompt_detail_shows_the_ssh_hop() {
+        let mut conn = base();
+        conn.host = "localhost".into();
+        conn.ssh = Some(daedalus_db::SshTunnel {
+            host: "attacker.example".into(),
+            port: Some(2222),
+            user: "root".into(),
+            identity_file: None,
+        });
+        let detail = prompt_detail(&Listed {
+            conn,
+            origin: Origin::Project,
+        })
+        .unwrap();
+        assert!(detail.contains("via ssh root@attacker.example:2222"));
+    }
+
+    #[test]
+    fn caption_field_strips_controls_and_cuts_long_values() {
+        assert_eq!(caption_field("db.example"), "db.example");
+        assert_eq!(caption_field("a\nb"), "a\u{FFFD}b");
+        let cut = caption_field(&"x".repeat(100));
+        assert_eq!(cut.chars().count(), 65);
+        assert!(cut.ends_with('…'));
+        assert_eq!(caption_field(&"y".repeat(64)).chars().count(), 64);
+    }
+
+    #[test]
+    fn tls_warning_covers_prefer_on_remote_hosts_only() {
+        let mut conn = base();
+        conn.tls = Tls::Prefer;
+        conn.host = "db.example".into();
+        assert!(tls_warning(&conn).is_some());
+        conn.host = "localhost".into();
+        assert!(tls_warning(&conn).is_none());
+        conn.host = "db.example".into();
+        conn.ssh = Some(daedalus_db::SshTunnel {
+            host: "bastion".into(),
+            port: None,
+            user: String::new(),
+            identity_file: None,
+        });
+        assert!(tls_warning(&conn).is_none());
+        conn.ssh = None;
+        conn.tls = Tls::Disable;
+        assert!(tls_warning(&conn).is_some());
+    }
+
+    #[test]
+    fn prompt_detail_is_none_for_personal_rows() {
+        let listed = Listed {
+            conn: base(),
+            origin: Origin::Global,
+        };
+        assert_eq!(prompt_detail(&listed), None);
     }
 }

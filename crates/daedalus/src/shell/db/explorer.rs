@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use daedalus_db::catalog::TableKind;
-use daedalus_db::{Engine, Listed};
+use daedalus_db::{Engine, Listed, Origin};
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, DotState, Ellipsis, IconButton, MenuItem, Space, StatusDot,
     empty_state, motion,
@@ -14,7 +15,7 @@ use gpui::{
 };
 
 use super::sheet::SheetMode;
-use super::{Meta, NodeKey, Phase, conn_key};
+use super::{Meta, NodeKey, Phase, SharedFile, conn_key};
 use crate::shell::Shell;
 use crate::shell::claude_sessions::list::chevron;
 use crate::shell::menus::shell_item;
@@ -29,6 +30,7 @@ pub(super) enum Row {
         engine: Engine,
         color: Option<FolderColor>,
         production: bool,
+        shared: bool,
         read_only: bool,
         claude: bool,
         claude_busy: bool,
@@ -137,6 +139,7 @@ fn rows(
             engine: l.conn.engine,
             color: data_color(l.conn.color.as_deref()),
             production: l.conn.production,
+            shared: l.origin == Origin::Project,
             read_only: l.conn.read_only,
             claude: l.conn.claude,
             claude_busy: meta.get(&key).is_some_and(|m| m.claude_runs > 0),
@@ -226,6 +229,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.db_ensure_loaded(cx);
+        self.db_ensure_shared(cx);
         let t = cx.theme().clone();
         let header = div()
             .flex()
@@ -267,13 +271,23 @@ impl Shell {
                 .into_any_element()
         } else {
             let root = self.active_root();
-            let listed = self
+            let listed = self.db_listed();
+            let notice = self
                 .db
-                .store
+                .shared
                 .as_ref()
-                .map(|s| daedalus_db::for_project(s, &[], root.as_deref()))
-                .unwrap_or_default();
-            if self.db.loaded && listed.is_empty() {
+                .filter(|s| Some(&s.root) == root.as_ref())
+                .and_then(|file| {
+                    let (line, error) = shared_notice(file)?;
+                    Some(self.render_shared_notice(
+                        root.clone()?,
+                        line,
+                        error,
+                        notice_tip(file),
+                        cx,
+                    ))
+                });
+            let list = if self.db.loaded && listed.is_empty() {
                 let new = Button::new("db-new-empty", "New connection", ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.db_open_sheet(SheetMode::New, window, cx)
@@ -307,7 +321,15 @@ impl Shell {
                         }
                     }))
                     .into_any_element()
-            }
+            };
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .children(notice)
+                .child(list)
+                .into_any_element()
         };
         div()
             .size_full()
@@ -315,6 +337,45 @@ impl Shell {
             .flex_col()
             .child(header)
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_shared_notice(
+        &self,
+        root: PathBuf,
+        line: String,
+        error: bool,
+        tip: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme().clone();
+        let tint = if error {
+            t.color.danger
+        } else {
+            t.color.warning
+        };
+        div()
+            .id("db-shared-notice")
+            .w_full()
+            .h(t.ui(ROW_HEIGHT))
+            .flex_none()
+            .pl(t.space(Space::Lg))
+            .pr(t.space(Space::Md))
+            .flex()
+            .items_center()
+            .text_size(t.typography.caption)
+            .text_color(tint)
+            .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
+            .when(!error, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let path = daedalus_db::shared::path(&root);
+                        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                            this.open_file(path, window, cx);
+                        }
+                    }))
+            })
+            .child(div().flex_1().min_w_0().ellipsis().child(line))
             .into_any_element()
     }
 
@@ -489,6 +550,7 @@ impl Shell {
             engine,
             color,
             production,
+            shared,
             read_only,
             claude,
             claude_busy,
@@ -610,6 +672,7 @@ impl Shell {
                     .text_color(t.color.content_muted)
                     .child(engine_label(engine)),
             )
+            .when(shared, |el| el.child(tag("project", t.color.content_muted)))
             .when(production, |el| el.child(tag("prod", t.color.danger)))
             .when(read_only, |el| {
                 el.child(tag("read-only", t.color.content_muted))
@@ -675,27 +738,62 @@ impl Shell {
             }),
             MenuItem::separator(),
             toggle,
-            shell_item("Edit…", cx, {
+        ];
+        if listed.origin == Origin::Global {
+            items.push(shell_item("Edit…", cx, {
                 let listed = listed.clone();
                 move |this, window, cx| {
                     this.db_open_sheet(SheetMode::Edit(listed.clone()), window, cx)
                 }
-            }),
-            MenuItem::separator(),
-            MenuItem::new("Copy URL", move |_, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
-            }),
-            MenuItem::separator(),
-            shell_item("Delete…", cx, {
+            }));
+        }
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new("Copy URL", move |_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+        }));
+        if listed.origin == Origin::Global {
+            items.push(MenuItem::separator());
+            items.push(shell_item("Delete…", cx, {
                 let listed = listed.clone();
                 move |this, window, cx| this.db_delete(listed.clone(), window, cx)
-            }),
-        ];
+            }));
+        }
         if let Some(refresh) = refresh {
             items.insert(1, refresh);
         }
         self.open_context_menu(event.position, items, window, cx);
     }
+}
+
+/// The explorer's line about the shared file, and whether it is an error.
+fn shared_notice(file: &SharedFile) -> Option<(String, bool)> {
+    if file.error.is_some() {
+        return Some(("Could not read .daedalus/databases.json".into(), true));
+    }
+    let n = file.problems.len();
+    if n == 0 {
+        return None;
+    }
+    let count = if n == 1 {
+        "1 problem".to_owned()
+    } else {
+        format!("{n} problems")
+    };
+    Some((format!("{count} in .daedalus/databases.json"), false))
+}
+
+/// File text can echo teammate-written strings, so each line is cut before it reaches a tooltip.
+fn notice_tip(file: &SharedFile) -> String {
+    const SHOWN: usize = 8;
+    let cut = |s: &String| s.chars().take(200).collect::<String>();
+    if let Some(e) = &file.error {
+        return cut(e);
+    }
+    let mut lines: Vec<String> = file.problems.iter().take(SHOWN).map(cut).collect();
+    if file.problems.len() > SHOWN {
+        lines.push(format!("…and {} more", file.problems.len() - SHOWN));
+    }
+    lines.join("\n")
 }
 
 pub(super) fn dot_shape(filled: bool, tint: gpui::Hsla, t: &daedalus_ui::Theme) -> AnyElement {
@@ -993,5 +1091,62 @@ mod tests {
         assert_eq!(data_color(Some("accent")), Some(FolderColor::Accent));
         assert_eq!(data_color(Some("chartreuse")), None);
         assert_eq!(data_color(None), None);
+    }
+
+    fn shared_file(problems: Vec<String>, error: Option<String>) -> SharedFile {
+        SharedFile {
+            root: "/a".into(),
+            conns: vec![],
+            problems,
+            error,
+        }
+    }
+
+    #[test]
+    fn project_rows_are_marked_shared() {
+        let listed = vec![
+            Listed {
+                conn: conn("a", "A"),
+                origin: Origin::Global,
+            },
+            Listed {
+                conn: conn("b", "B"),
+                origin: Origin::Project,
+            },
+        ];
+        let out = rows(&listed, &HashMap::new(), &HashSet::new(), Duration::ZERO);
+        assert!(matches!(&out[0], Row::Conn { shared: false, .. }));
+        assert!(matches!(&out[1], Row::Conn { shared: true, .. }));
+    }
+
+    #[test]
+    fn shared_notice_prefers_the_error_and_counts_problems() {
+        assert_eq!(shared_notice(&shared_file(vec![], None)), None);
+        let one = shared_file(vec!["x".into()], None);
+        assert_eq!(
+            shared_notice(&one),
+            Some(("1 problem in .daedalus/databases.json".into(), false))
+        );
+        let two = shared_file(vec!["x".into(), "y".into()], None);
+        assert_eq!(
+            shared_notice(&two),
+            Some(("2 problems in .daedalus/databases.json".into(), false))
+        );
+        let broken = shared_file(vec!["x".into()], Some("bad".into()));
+        assert_eq!(
+            shared_notice(&broken),
+            Some(("Could not read .daedalus/databases.json".into(), true))
+        );
+    }
+
+    #[test]
+    fn notice_tip_cuts_long_lines_and_counts_the_rest() {
+        let mut problems: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+        problems[0] = "x".repeat(500);
+        let tip = notice_tip(&shared_file(problems, None));
+        let lines: Vec<&str> = tip.lines().collect();
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[0].chars().count(), 200);
+        assert_eq!(lines[8], "…and 2 more");
     }
 }

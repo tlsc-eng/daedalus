@@ -53,6 +53,17 @@ impl DbTab {
         }
     }
 
+    /// Hangs up the tab's session through `fail` so in-flight work is cleared, not left busy.
+    pub fn hang_up(&self, cx: &mut App) {
+        match self {
+            Self::Console(v) => v.update(cx, |c, cx| {
+                c.disconnect();
+                c.fail("The shared connection changed.", cx);
+            }),
+            Self::Table(v) => v.update(cx, |c, cx| c.fail("The shared connection changed.", cx)),
+        }
+    }
+
     pub fn idle(&self, cx: &mut App) {
         match self {
             Self::Console(v) => v.update(cx, |c, cx| c.idle(cx)),

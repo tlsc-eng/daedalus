@@ -226,7 +226,7 @@ impl DbTableView {
     }
 
     /// Hangs up the session; never after a `Failed`, which already ended it.
-    fn disconnect(&mut self) {
+    pub(super) fn disconnect(&mut self) {
         if let (Some(session), Some(handle)) = (self.session.take(), &self.handle) {
             handle.send(Command::Disconnect { session });
         }

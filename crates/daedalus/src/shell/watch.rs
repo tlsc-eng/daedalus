@@ -224,6 +224,10 @@ impl Shell {
                 _ => {}
             }
         }
+        let shared_dir = root.join(".daedalus");
+        if everything || paths.iter().any(|p| in_root(p).starts_with(&shared_dir)) {
+            self.db_shared_changed(root, cx);
+        }
         cx.notify();
     }
 }
