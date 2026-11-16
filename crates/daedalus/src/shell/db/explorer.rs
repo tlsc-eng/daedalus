@@ -296,20 +296,24 @@ impl Shell {
                     }));
                 let look = self
                     .db_can_look_in_docker()
-                    .then(|| self.render_look_in_docker(cx));
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .p(t.space(Space::Lg))
-                    .child(empty_state(
-                        "No databases",
-                        "Add a connection here, or edit databases.json.",
-                        Some(new),
-                        cx,
-                    ))
-                    .children(look)
-                    .into_any_element()
+                    .then(|| self.render_look_in_docker(true, cx));
+                let empty = empty_state(
+                    "No databases",
+                    "Add a connection here, or edit databases.json.",
+                    Some(new),
+                    cx,
+                );
+                match look {
+                    Some(look) => div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .p(t.space(Space::Lg))
+                        .child(empty)
+                        .child(look)
+                        .into_any_element(),
+                    None => empty.into_any_element(),
+                }
             } else {
                 let delay = t.motion.indicator_delay;
                 let rows = rows(&listed, &self.db.meta, &self.db.expanded, delay);
@@ -330,9 +334,10 @@ impl Shell {
                             false => el,
                         }
                     }))
-                    .when(!detected.is_empty() || self.db_can_look_in_docker(), |el| {
-                        el.child(self.render_detected(detected, cx))
-                    })
+                    .when(
+                        !detected.is_empty() || (self.db.loaded && self.db_can_look_in_docker()),
+                        |el| el.child(self.render_detected(detected, cx)),
+                    )
                     .into_any_element()
             };
             div()

@@ -109,8 +109,12 @@ impl Shell {
         match update {
             Update::Unreachable(tried) => {
                 state.unreachable = Some(tried);
+                let had = !state.list.is_empty();
                 state.list.clear();
                 state.loaded = true;
+                if had {
+                    self.db_containers_changed(cx);
+                }
             }
             Update::Containers(list) => {
                 state.unreachable = None;

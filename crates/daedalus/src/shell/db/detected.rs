@@ -206,11 +206,16 @@ impl Shell {
         self.active_root().is_some() && !self.containers_started()
     }
 
-    pub(super) fn render_look_in_docker(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_look_in_docker(
+        &self,
+        centered: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = cx.theme().clone();
         div()
             .id("db-look-docker")
-            .w_full()
+            .when(!centered, |el| el.w_full())
+            .when(centered, |el| el.justify_center())
             .h(t.ui(ROW_HEIGHT))
             .pl(px(t.ui_scale * 12.))
             .pr(t.space(Space::Md))
@@ -309,7 +314,7 @@ impl Shell {
             .collect::<Vec<_>>();
         let look = self
             .db_can_look_in_docker()
-            .then(|| self.render_look_in_docker(cx));
+            .then(|| self.render_look_in_docker(false, cx));
         div()
             .children(header)
             .children(items)
