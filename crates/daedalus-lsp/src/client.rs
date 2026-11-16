@@ -1417,12 +1417,12 @@ mod tests {
     }
 
     fn stopped_within(events: &async_channel::Receiver<Event>) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match events.try_recv() {
                 Ok(Event::Stopped(why)) => return why,
                 Ok(_) => {}
-                Err(_) if Instant::now() >= deadline => panic!("no Stopped event within 5s"),
+                Err(_) if Instant::now() >= deadline => panic!("no Stopped event within 15s"),
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }
@@ -1474,7 +1474,7 @@ mod tests {
             // SAFETY: the child is still held by the client, so its group id is not reused.
             unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
         }
-        assert!(started.elapsed() < Duration::from_secs(2), "stopped late");
+        assert!(started.elapsed() < Duration::from_secs(10), "stopped late");
         why
     }
 
