@@ -979,7 +979,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let listed = self.db.store.as_ref().and_then(|store| {
-            daedalus_db::for_project(store, self.active_root().as_deref())
+            daedalus_db::for_project(store, &[], self.active_root().as_deref())
                 .into_iter()
                 .find(|l| conn_key(l.origin, &l.conn.id) == key)
         });
@@ -1124,7 +1124,7 @@ impl Shell {
         }
         let key = tab.key(cx);
         let listed = self.db.store.as_ref().and_then(|store| {
-            daedalus_db::for_project(store, self.active_root().as_deref())
+            daedalus_db::for_project(store, &[], self.active_root().as_deref())
                 .into_iter()
                 .find(|l| conn_key(l.origin, &l.conn.id) == key)
         });

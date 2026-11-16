@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::catalog::{Catalog, Schema, Table, TableKind};
 use crate::classify::{self, Kind};
-use crate::config::{self, Connection, Engine, Listed, Store};
+use crate::config::{self, Connection, Engine, Listed, Origin, Store};
 use crate::value::Cell;
 use crate::worker::Update;
 
@@ -143,11 +143,11 @@ fn has_locking_clause(words: &[String]) -> bool {
     })
 }
 
-/// Connections the user shared with Claude, in the store's order for `root`.
+/// Personal connections the user shared with Claude, in the store's order for `root`; project-file entries never qualify.
 pub fn visible(store: &Store, root: Option<&Path>) -> Vec<Listed> {
-    config::for_project(store, root)
+    config::for_project(store, &[], root)
         .into_iter()
-        .filter(|l| l.conn.claude)
+        .filter(|l| l.conn.claude && l.origin == Origin::Global)
         .collect()
 }
 
@@ -660,6 +660,15 @@ mod tests {
         let v = visible(&s, None);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].conn.id, "a");
+    }
+
+    #[test]
+    fn visible_lists_only_personal_entries() {
+        let mut s = Store::empty();
+        s.connections = vec![conn("a", "A", true), conn("b", "B", true)];
+        let v = visible(&s, Some(Path::new("/work/a")));
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().all(|l| l.origin == Origin::Global));
     }
 
     #[test]

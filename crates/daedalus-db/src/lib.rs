@@ -8,6 +8,7 @@ pub mod edit;
 pub mod engine;
 pub mod export;
 pub mod secret;
+pub mod shared;
 pub mod value;
 pub mod worker;
 

@@ -271,7 +271,7 @@ impl Shell {
                 .db
                 .store
                 .as_ref()
-                .map(|s| daedalus_db::for_project(s, root.as_deref()))
+                .map(|s| daedalus_db::for_project(s, &[], root.as_deref()))
                 .unwrap_or_default();
             if self.db.loaded && listed.is_empty() {
                 let new = Button::new("db-new-empty", "New connection", ButtonKind::Secondary)
@@ -754,7 +754,8 @@ mod tests {
 
     #[test]
     fn rows_put_the_error_under_its_connection() {
-        let listed = daedalus_db::for_project(&store(vec![conn("a", "A"), conn("b", "B")]), None);
+        let listed =
+            daedalus_db::for_project(&store(vec![conn("a", "A"), conn("b", "B")]), &[], None);
         let mut meta = HashMap::new();
         meta.insert(
             conn_key(Origin::Global, "a"),
@@ -779,6 +780,7 @@ mod tests {
                 conn("2", "Alpha"),
                 conn("3", "gamma"),
             ]),
+            &[],
             None,
         );
         let names: Vec<_> = rows(&listed, &HashMap::new(), &HashSet::new(), Duration::ZERO)
@@ -822,7 +824,7 @@ mod tests {
         truncated: bool,
         open: &[NodeKey],
     ) -> (Vec<Listed>, HashMap<String, Meta>, HashSet<NodeKey>) {
-        let listed = daedalus_db::for_project(&store(vec![conn("a", "A")]), None);
+        let listed = daedalus_db::for_project(&store(vec![conn("a", "A")]), &[], None);
         let mut meta = HashMap::new();
         meta.insert(
             KEY.to_owned(),
