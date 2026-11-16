@@ -334,6 +334,7 @@ impl DbConsoleView {
         self.tx_open = false;
         self.batch.reset();
         self.busy = None;
+        self.grid.update(cx, |g, cx| g.set_stale(false, cx));
         cx.notify();
     }
 
