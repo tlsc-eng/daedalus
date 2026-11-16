@@ -17,7 +17,7 @@ use daedalus_ui::motion::{self, Busy};
 use daedalus_ui::{
     ActiveTheme, Button, ButtonKind, ContextMenu, DataGrid, DotState, GridEvent, Space, StatusDot,
 };
-use daedalus_workspace::Axis;
+use daedalus_workspace::{Axis, UiState};
 use gpui::{
     AnyElement, Bounds, ClickEvent, Context, CursorStyle, DismissEvent, DispatchPhase, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
@@ -75,12 +75,11 @@ pub(in crate::shell) enum DbConsoleEvent {
 
 const EDITOR_MIN: f32 = 80.;
 const RESULTS_MIN: f32 = 120.;
-pub(in crate::shell) const DEFAULT_SPLIT: f32 = 0.4;
 
 /// The editor's share of `len` px, keeping both panes at their minimum; the default when they cannot both fit.
 fn clamp_split(ratio: f32, len: f32) -> f32 {
     if !ratio.is_finite() || !len.is_finite() || len < EDITOR_MIN + RESULTS_MIN {
-        return DEFAULT_SPLIT;
+        return UiState::default().db_console_split;
     }
     ratio.clamp(EDITOR_MIN / len, 1. - RESULTS_MIN / len)
 }
@@ -708,12 +707,13 @@ impl DbConsoleView {
 }
 
 impl DbConsoleView {
-    fn split_handle(&self, editor_h: f32, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn split_handle(&self, ratio: f32, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         resize_handle("db-console-split", Axis::Vertical, cx.theme().color.accent)
             .absolute()
             .left_0()
             .right_0()
-            .top(px(editor_h - DIVIDER_HIT))
+            .top(relative(ratio))
+            .mt(px(-DIVIDER_HIT))
             .h(px(1. + 2. * DIVIDER_HIT))
             .on_mouse_down(
                 MouseButton::Left,
@@ -721,8 +721,8 @@ impl DbConsoleView {
                     cx.stop_propagation();
                     if e.click_count == 2 {
                         this.split_drag = false;
-                        this.split = DEFAULT_SPLIT;
-                        cx.emit(DbConsoleEvent::SplitChanged(DEFAULT_SPLIT));
+                        this.split = UiState::default().db_console_split;
+                        cx.emit(DbConsoleEvent::SplitChanged(this.split));
                     } else {
                         this.split_drag = true;
                     }
@@ -788,7 +788,11 @@ impl Render for DbConsoleView {
         let toolbar = self.render_toolbar(cx);
         let results = self.render_results(cx);
         let h = f32::from(self.split_area.borrow().size.height);
-        let ratio = clamp_split(self.split, h);
+        let ratio = if h > 0. {
+            clamp_split(self.split, h)
+        } else {
+            self.split
+        };
         let area = self.split_area.clone();
         let recorder = canvas(
             move |bounds, _, _| {
@@ -830,7 +834,7 @@ impl Render for DbConsoleView {
                             .child(div().size_full().child(self.editor.clone())),
                     )
                     .child(results)
-                    .child(self.split_handle(h * ratio, cx))
+                    .child(self.split_handle(ratio, cx))
                     .children(self.split_hook(cx)),
             )
             .children(self.menu.as_ref().map(|(menu, _)| menu.clone()))
