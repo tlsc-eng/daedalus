@@ -76,6 +76,8 @@ fn build_opts(conn: &Connection, password: Option<&Secret>, tls: Option<SslOpts>
         .pass(password.map(|p| p.expose().to_owned()))
         .ssl_opts(tls)
         .client_found_rows(true)
+        // The driver would otherwise hop to a local unix socket named by the server.
+        .prefer_socket(false)
         .into()
 }
 
@@ -430,5 +432,11 @@ mod tests {
         }
         let ssl = ssl_opts(Tls::Require, None).expect("ssl");
         assert!(!ssl.accept_invalid_certs() && !ssl.skip_domain_validation());
+    }
+
+    #[test]
+    fn opts_stay_on_tcp() {
+        let (conn, _) = crate::from_url("mysql://u@db.example.com/db").expect("url");
+        assert!(!build_opts(&conn, None, None).prefer_socket());
     }
 }
