@@ -660,7 +660,7 @@ impl DbTableView {
 
     /// Runs `then` now, or after the user agrees to drop the pending edits.
     fn guard(&mut self, then: Discard, window: &mut Window, cx: &mut Context<Self>) {
-        if self.submitting.is_some() || self.preview.is_some() {
+        if self.submitting.is_some() || self.preview.is_some() || self.export.is_some() {
             return;
         }
         self.grid.update(cx, |g, cx| g.cancel_edit(window, cx));
@@ -680,6 +680,9 @@ impl DbTableView {
                 return;
             }
             this.update_in(cx, |this, window, cx| {
+                if this.export.is_some() {
+                    return;
+                }
                 this.drop_edits(window, cx);
                 this.run_discarded(then, cx);
             })

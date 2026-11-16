@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use daedalus_db::Engine;
 use daedalus_db::export::{self, FileExport, Format};
@@ -37,6 +37,7 @@ pub(in crate::shell::db) struct Export {
     session: SessionId,
     handle: Handle,
     rows: Arc<AtomicU64>,
+    stopping: Arc<AtomicBool>,
     busy: Busy,
     tx: UnboundedSender<Update>,
     _task: Task<()>,
@@ -46,6 +47,14 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "export".into())
+}
+
+/// Cancelling makes the database fail the statement, which is the user's stop and not a failure.
+fn run_error(message: String, stopping: bool) -> Outcome {
+    match stopping {
+        true => Outcome::Stopped,
+        false => Outcome::Failed(message),
+    }
 }
 
 fn to_columns(columns: &[GridColumn]) -> Vec<Column> {
@@ -99,6 +108,8 @@ pub(in crate::shell::db) fn start<V: 'static>(
     let (tx, mut rx) = unbounded::<Update>();
     let rows = Arc::new(AtomicU64::new(0));
     let counter = rows.clone();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop_seen = stopping.clone();
     let worker = handle.clone();
     let task = cx.spawn(async move |this, cx| {
         let Spec {
@@ -175,7 +186,9 @@ pub(in crate::shell::db) fn start<V: 'static>(
                         Err(e) => failed(e),
                     };
                 }
-                Update::RunError { message, .. } => break Outcome::Failed(message),
+                Update::RunError { message, .. } => {
+                    break run_error(message, stop_seen.load(Ordering::Relaxed));
+                }
                 _ => {}
             }
         };
@@ -187,6 +200,7 @@ pub(in crate::shell::db) fn start<V: 'static>(
         session,
         handle,
         rows,
+        stopping,
         busy: Busy::start(),
         tx,
         _task: task,
@@ -219,6 +233,7 @@ impl Export {
     }
 
     pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
         self.cancel();
     }
 
@@ -353,6 +368,14 @@ mod tests {
         assert_eq!(file_stem(""), "result");
         assert_eq!(file_stem("..."), "result");
         assert_eq!(file_stem("users-1.v2"), "users-1.v2");
+    }
+
+    #[test]
+    fn a_run_error_after_stop_is_a_stop() {
+        let stopped = run_error("canceling statement due to user request".into(), true);
+        assert!(matches!(stopped, Outcome::Stopped));
+        let failed = run_error("boom".into(), false);
+        assert!(matches!(failed, Outcome::Failed(m) if m == "boom"));
     }
 
     #[test]
