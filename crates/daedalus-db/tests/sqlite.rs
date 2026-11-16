@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use daedalus_db::edit::Stmt;
+use daedalus_db::export::{Format, to_string};
+use daedalus_db::value::Column;
 use daedalus_db::worker::{
     ApplyError, Command, Handle, RunId, RunMode, SessionId, TxOp, Update, start,
 };
@@ -171,6 +173,30 @@ impl Rig {
                 }
                 Update::Done { run: r, .. } if r == RunId(run) => return Ok(all),
                 Update::RunError { message, .. } => return Err(message),
+                _ => {}
+            }
+        }
+    }
+
+    /// Like `collect`, but also returns the columns of the last statement; a run error panics.
+    fn result(&self, run: u64) -> (Vec<Column>, Vec<Vec<Option<String>>>) {
+        let mut columns = Vec::new();
+        let mut all = Vec::new();
+        loop {
+            match self.next() {
+                Update::Columns { columns: c, .. } => columns = c,
+                Update::Rows { rows, more, .. } => {
+                    all.extend(rows);
+                    if more {
+                        self.handle.send(Command::FetchMore {
+                            session: S,
+                            run: RunId(run),
+                            rows: 500,
+                        });
+                    }
+                }
+                Update::Done { run: r, .. } if r == RunId(run) => return (columns, all),
+                Update::RunError { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }
@@ -989,4 +1015,122 @@ fn capped_run_truncates_at_the_row_cap() {
     let rig = rig(false);
     rig.run_capped(1, COUNT_PAST_CAP, 5000, RunMode::Auto, true);
     assert_eq!(rig.collect_done(1, 5000), (100_000, true));
+}
+
+fn types(columns: &[Column]) -> Vec<&str> {
+    columns.iter().map(|c| c.type_name.as_str()).collect()
+}
+
+fn some(v: &str) -> Option<String> {
+    Some(v.to_owned())
+}
+
+#[test]
+fn expression_columns_carry_the_storage_class() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "select count(*) as n, 1.5 as r, x'00' as b, 'a' as t, null as z",
+        500,
+    );
+    let (columns, rows) = rig.result(1);
+    assert_eq!(types(&columns), ["integer", "real", "blob", "text", ""]);
+    assert_eq!(
+        rows,
+        [vec![some("1"), some("1.5"), some("\\x00"), some("a"), None]]
+    );
+}
+
+#[test]
+fn first_non_null_value_types_the_column() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with v(x) as (values (null),(null),(7)) select x from v",
+        500,
+    );
+    let (columns, rows) = rig.result(1);
+    assert_eq!(types(&columns), ["integer"]);
+    assert_eq!(rows, [vec![None], vec![None], vec![some("7")]]);
+}
+
+#[test]
+fn declared_types_are_kept() {
+    let rig = rig(false);
+    rig.run(1, "create table t(a text, b)", 500);
+    rig.result(1);
+    rig.run(2, "insert into t values (1, 2)", 500);
+    rig.result(2);
+    rig.run(3, "select a, b from t", 500);
+    let (columns, rows) = rig.result(3);
+    assert_eq!(types(&columns), ["text", "integer"]);
+    assert_eq!(rows, [vec![some("1"), some("2")]]);
+}
+
+#[test]
+fn an_all_null_column_stays_untyped_and_no_row_is_lost() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with recursive c(x) as (select 1 union all select x+1 from c where x < 150) select null as z, x from c",
+        500,
+    );
+    let (columns, rows) = rig.result(1);
+    assert_eq!(types(&columns), ["", "integer"]);
+    assert_eq!(rows.len(), 150);
+    assert_eq!(rows[0][1], some("1"));
+    assert_eq!(rows[149][1], some("150"));
+    assert!(rows.iter().all(|r| r[0].is_none()));
+}
+
+#[test]
+fn count_star_exports_as_a_json_number() {
+    let rig = rig(false);
+    rig.run(1, "select count(*) as n, 1.5 as r, x'00ff' as b", 500);
+    let (columns, rows) = rig.result(1);
+    assert_eq!(
+        to_string(Format::Json, Engine::Sqlite, None, &columns, &rows),
+        "[\n  {\"n\": 1, \"r\": 1.5, \"b\": \"\\\\x00ff\"}\n]\n"
+    );
+    assert_eq!(
+        to_string(Format::Insert, Engine::Sqlite, None, &columns, &rows),
+        "INSERT INTO \"result\" (\"n\", \"r\", \"b\") VALUES (1, 1.5, X'00ff');\n"
+    );
+}
+
+#[test]
+fn an_error_during_the_read_ahead_still_delivers_the_rows_before_it() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with recursive c(x) as (select 1 union all select x+1 from c where x < 10) \
+         select null as z, abs(case when x < 5 then x else -9223372036854775807 - 1 end) as v from c",
+        500,
+    );
+    let mut columns = false;
+    let mut rows = 0;
+    loop {
+        match rig.next() {
+            Update::Columns { .. } => columns = true,
+            Update::Rows { rows: r, .. } => rows += r.len(),
+            Update::RunError { .. } => break,
+            Update::Done { .. } => panic!("expected an error"),
+            _ => {}
+        }
+    }
+    assert_eq!((columns, rows), (true, 4));
+}
+
+#[test]
+fn the_read_ahead_stops_at_the_byte_bound() {
+    let rig = rig(false);
+    rig.run(
+        1,
+        "with recursive c(x) as (select 1 union all select x+1 from c where x < 20) \
+         select case when x >= 15 then 1 end as z, zeroblob(1048576) as b from c",
+        500,
+    );
+    let (columns, rows) = rig.result(1);
+    assert_eq!(types(&columns), ["", "blob"]);
+    assert_eq!(rows.len(), 20);
 }

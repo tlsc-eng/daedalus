@@ -246,6 +246,26 @@ fn run_catalog(db: &Db, tx: &Tx, cancelled: &AtomicBool) {
     }
 }
 
+const TYPE_LOOKAHEAD: usize = 100;
+const TYPE_LOOKAHEAD_BYTES: usize = 4 << 20;
+
+/// SQLite's name for a value's storage class, as typeof() spells it; None for NULL.
+fn storage_class(value: ValueRef<'_>) -> Option<&'static str> {
+    match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(_) => Some("integer"),
+        ValueRef::Real(_) => Some("real"),
+        ValueRef::Text(_) => Some("text"),
+        ValueRef::Blob(_) => Some("blob"),
+    }
+}
+
+fn row_cells(row: &rusqlite::Row<'_>, width: usize) -> Vec<Cell> {
+    (0..width)
+        .map(|i| row.get_ref(i).map(cell).unwrap_or(None))
+        .collect()
+}
+
 fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
     let mut batch = Batch::new(db, sql);
     loop {
@@ -284,7 +304,7 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
             }
             continue;
         }
-        let columns: Vec<Column> = stmt
+        let mut columns: Vec<Column> = stmt
             .columns()
             .map(|c| Column {
                 name: c.name().to_owned(),
@@ -292,9 +312,6 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
                 table: None,
             })
             .collect();
-        if !send(tx, Ok(Item::Columns(columns))) {
-            return;
-        }
         let mut rows = match stmt.query([]) {
             Ok(rows) => rows,
             Err(e) => {
@@ -302,7 +319,53 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
                 return;
             }
         };
+        let mut ahead: Vec<Vec<Cell>> = Vec::new();
+        // Expression columns have no declared type, so the first non-NULL value's storage class stands in.
+        let mut ahead_bytes = 0usize;
+        // An error here must not drop the rows already read, so it is sent after them.
+        let mut stopped = None;
+        while ahead.len() < TYPE_LOOKAHEAD
+            && ahead_bytes < TYPE_LOOKAHEAD_BYTES
+            && columns.iter().any(|c| c.type_name.is_empty())
+        {
+            if cancelled.load(Ordering::Relaxed) {
+                stopped = Some(interrupted());
+                break;
+            }
+            match rows.next() {
+                Ok(Some(row)) => {
+                    for (i, c) in columns.iter_mut().enumerate() {
+                        if c.type_name.is_empty()
+                            && let Some(class) = row.get_ref(i).ok().and_then(storage_class)
+                        {
+                            c.type_name = class.to_owned();
+                        }
+                    }
+                    let cells = row_cells(row, width);
+                    ahead_bytes += cells.iter().flatten().map(String::len).sum::<usize>();
+                    ahead.push(cells);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    stopped = Some(failure(&e, sql));
+                    break;
+                }
+            }
+        }
+        if !send(tx, Ok(Item::Columns(columns))) {
+            return;
+        }
         let mut count = 0u64;
+        for cells in ahead {
+            if !send(tx, Ok(Item::Row(cells))) {
+                return;
+            }
+            count += 1;
+        }
+        if let Some(e) = stopped {
+            send(tx, Err(e));
+            return;
+        }
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 send(tx, Err(interrupted()));
@@ -310,10 +373,7 @@ fn run_script(db: &Db, sql: &str, tx: &Tx, cancelled: &AtomicBool) {
             }
             match rows.next() {
                 Ok(Some(row)) => {
-                    let cells = (0..width)
-                        .map(|i| row.get_ref(i).map(cell).unwrap_or(None))
-                        .collect();
-                    if !send(tx, Ok(Item::Row(cells))) {
+                    if !send(tx, Ok(Item::Row(row_cells(row, width)))) {
                         return;
                     }
                     count += 1;
@@ -443,6 +503,15 @@ impl SqliteCanceller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_class_names_match_typeof() {
+        assert_eq!(storage_class(ValueRef::Null), None);
+        assert_eq!(storage_class(ValueRef::Integer(1)), Some("integer"));
+        assert_eq!(storage_class(ValueRef::Real(1.5)), Some("real"));
+        assert_eq!(storage_class(ValueRef::Text(b"a")), Some("text"));
+        assert_eq!(storage_class(ValueRef::Blob(b"")), Some("blob"));
+    }
 
     #[test]
     fn idle_cancel_does_not_hit_next_query() {
