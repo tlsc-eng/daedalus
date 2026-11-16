@@ -73,6 +73,27 @@ pub(super) struct Fields {
     pub only_here: bool,
 }
 
+/// The form values a connection fills in when it is loaded into the sheet.
+fn form_fields(conn: &Connection, root: Option<&Path>) -> Fields {
+    Fields {
+        id: conn.id.clone(),
+        name: conn.name.clone(),
+        engine: conn.engine,
+        color: conn.color.clone(),
+        host: conn.host.clone(),
+        port: conn.port.map(|p| p.to_string()).unwrap_or_default(),
+        database: conn.database.clone(),
+        user: conn.user.clone(),
+        keychain: conn.save_password,
+        tls: conn.tls,
+        tls_touched: true,
+        read_only: conn.read_only,
+        production: conn.production,
+        claude: conn.claude,
+        only_here: root.is_some_and(|r| conn.projects.iter().any(|p| p == r)),
+    }
+}
+
 /// Turns the form into a connection; the id, Claude access and CA file come from `base` when editing.
 pub(super) fn build(
     f: &Fields,
@@ -390,27 +411,21 @@ impl DbSheet {
         let set = |input: &Entity<TextInput>, text: &str, cx: &mut Context<Self>| {
             input.update(cx, |i, cx| i.set_text(text, cx));
         };
-        set(&self.name, &conn.name, cx);
-        set(&self.host, &conn.host, cx);
-        set(
-            &self.port,
-            &conn.port.map(|p| p.to_string()).unwrap_or_default(),
-            cx,
-        );
-        set(&self.database, &conn.database, cx);
-        set(&self.user, &conn.user, cx);
-        self.engine = conn.engine;
-        self.color = conn.color.clone();
-        self.tls = conn.tls;
-        self.tls_touched = true;
-        self.keychain = conn.save_password;
-        self.read_only = conn.read_only;
-        self.production = conn.production;
-        self.claude = conn.claude;
-        self.only_here = self
-            .root
-            .as_ref()
-            .is_some_and(|r| conn.projects.contains(r));
+        let f = form_fields(conn, self.root.as_deref());
+        set(&self.name, &f.name, cx);
+        set(&self.host, &f.host, cx);
+        set(&self.port, &f.port, cx);
+        set(&self.database, &f.database, cx);
+        set(&self.user, &f.user, cx);
+        self.engine = f.engine;
+        self.color = f.color;
+        self.tls = f.tls;
+        self.tls_touched = f.tls_touched;
+        self.keychain = f.keychain;
+        self.read_only = f.read_only;
+        self.production = f.production;
+        self.claude = f.claude;
+        self.only_here = f.only_here;
     }
 
     pub(in crate::shell) fn prefill(&mut self, found: Found, cx: &mut Context<Self>) {
@@ -746,6 +761,12 @@ pub(super) fn caption_field(s: &str) -> String {
             let hidden = matches!(
                 c,
                 '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+                    | '\u{061C}'
+                    | '\u{00AD}'
+                    | '\u{180E}'
+                    | '\u{2028}'..='\u{2029}'
+                    | '\u{FFF9}'..='\u{FFFB}'
+                    | '\u{E0000}'..='\u{E007F}'
             );
             if c.is_control() || hidden { '\u{FFFD}' } else { c }
         })
@@ -1543,6 +1564,25 @@ mod tests {
         assert!(cut.ends_with('…'));
         assert_eq!(caption_field(&"y".repeat(64)).chars().count(), 64);
         assert_eq!(caption_field("a\u{202E}b\u{200B}c"), "a\u{FFFD}b\u{FFFD}c");
+        assert_eq!(caption_field("a\u{061C}b"), "a\u{FFFD}b");
+        assert_eq!(caption_field("a\u{2028}b"), "a\u{FFFD}b");
+        assert_eq!(caption_field("a\u{E0041}b"), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn detected_prefill_builds_the_same_target() {
+        let found = Found {
+            conn: Connection {
+                host: "localhost".into(),
+                port: Some(5432),
+                ..base()
+            },
+            password: None,
+            note: String::new(),
+            password_note: String::new(),
+        };
+        let built = build(&form_fields(&found.conn, None), None, None).unwrap();
+        assert!(same_target(&found.conn, &built));
     }
 
     fn found_with(password: &str) -> Found {
