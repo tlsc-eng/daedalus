@@ -50,41 +50,78 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn escapes_root(db: &str) -> bool {
+/// True when `db` can reach outside `root`, by its text or through a link that already exists.
+fn escapes_root(root: &Path, db: &str) -> bool {
     let p = Path::new(db);
-    p.is_absolute()
+    if p.is_absolute()
         || p.components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    // A not-yet-created file can still sit inside a linked directory, so check the nearest existing parent.
+    let Some(full) = root
+        .join(p)
+        .ancestors()
+        .find(|a| a.exists())
+        .map(Path::to_path_buf)
+    else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    full.canonicalize().map_or(true, |f| !f.starts_with(root))
+}
+
+enum ReadError {
+    Link(String),
+    Other(String),
+}
+
+impl ReadError {
+    fn into_message(self) -> String {
+        match self {
+            ReadError::Link(m) | ReadError::Other(m) => m,
+        }
+    }
 }
 
 /// Reads the file's text, refusing links, non-regular files and anything over the size cap.
-fn read_text(root: &Path) -> Result<Option<String>, String> {
+fn read_text(root: &Path) -> Result<Option<String>, ReadError> {
     use std::io::Read;
-    for dir in [root.join(".daedalus"), path(root)] {
+    let other = |e: std::io::Error| ReadError::Other(format!("read {FILE}: {e}"));
+    for (i, dir) in [root.join(".daedalus"), path(root)].into_iter().enumerate() {
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.file_type().is_symlink() => {
-                return Err(format!("{FILE} must not be reached through a symlink"));
+                return Err(ReadError::Link(format!(
+                    "{FILE} must not be reached through a symlink"
+                )));
+            }
+            // Opening a FIFO would block before the post-open check could run.
+            Ok(m) if i == 1 && !m.is_file() => {
+                return Err(ReadError::Other(format!("{FILE} is not a regular file")));
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("read {FILE}: {e}")),
+            Err(e) => return Err(other(e)),
         }
     }
-    let file = fs::File::open(path(root)).map_err(|e| format!("read {FILE}: {e}"))?;
+    let file = fs::File::open(path(root)).map_err(other)?;
     match file.metadata() {
         Ok(m) if m.is_file() => {}
-        _ => return Err(format!("{FILE} is not a regular file")),
+        _ => return Err(ReadError::Other(format!("{FILE} is not a regular file"))),
     }
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("read {FILE}: {e}"))?;
+        .map_err(other)?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!("{FILE} is larger than 1 MiB"));
+        return Err(ReadError::Other(format!("{FILE} is larger than 1 MiB")));
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|_| format!("{FILE} is not UTF-8"))
+        .map_err(|_| ReadError::Other(format!("{FILE} is not UTF-8")))
 }
 
 /// Parses the shared file; personal and unknown keys are reported and left out.
@@ -158,7 +195,7 @@ pub fn parse(text: &str, root: &Path) -> Result<Parsed, String> {
         {
             *ca = root.join(&*ca);
         }
-        if conn.engine == Engine::Sqlite && escapes_root(&conn.database) {
+        if conn.engine == Engine::Sqlite && escapes_root(root, &conn.database) {
             conn.read_only = true;
             problems.push(format!(
                 "{label}: database path leaves the project, opened read-only"
@@ -177,14 +214,14 @@ pub fn load(root: &Path) -> Result<Parsed, String> {
     match read_text(root) {
         Ok(Some(text)) => parse(&text, root),
         Ok(None) => Ok((vec![], vec![])),
-        Err(e) if e.ends_with("symlink") => Ok((vec![], vec![e])),
-        Err(e) => Err(e),
+        Err(ReadError::Link(m)) => Ok((vec![], vec![m])),
+        Err(ReadError::Other(m)) => Err(m),
     }
 }
 
 /// Reads the raw document, or `None` when the file does not exist; a broken file is an error.
 fn read_raw(root: &Path) -> anyhow::Result<Option<Value>> {
-    let Some(text) = read_text(root).map_err(anyhow::Error::msg)? else {
+    let Some(text) = read_text(root).map_err(|e| anyhow::Error::msg(e.into_message()))? else {
         return Ok(None);
     };
     match serde_json::from_str::<Value>(&text) {
@@ -514,6 +551,37 @@ mod tests {
         let up = r#"{"id":"b","name":"B","engine":"sqlite","database":"../x.db"}"#;
         let ok = r#"{"id":"c","name":"C","engine":"sqlite","database":"data/x.db"}"#;
         let (conns, problems) = parse(&doc(&format!("{abs},{up},{ok}")), Path::new("/r")).unwrap();
+        assert_eq!(problems.len(), 2);
+        assert!(conns[0].read_only && conns[1].read_only);
+        assert!(!conns[2].read_only);
+    }
+
+    #[test]
+    fn fifo_is_an_error_not_a_hang() {
+        let root = temp("realfifo");
+        fs::create_dir_all(root.join(".daedalus")).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(path(&root))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(load(&root).unwrap_err().contains("not a regular file"));
+        assert!(upsert(&root, &conn("a")).is_err());
+    }
+
+    #[test]
+    fn sqlite_path_through_a_link_out_of_the_root_is_read_only() {
+        let root = temp("linkroot");
+        let out = temp("linkout");
+        fs::write(out.join("real.db"), "").unwrap();
+        std::os::unix::fs::symlink(&out, root.join("data")).unwrap();
+        std::os::unix::fs::symlink(out.join("real.db"), root.join("app.db")).unwrap();
+        fs::write(root.join("in.db"), "").unwrap();
+        let e = |id: &str, db: &str| {
+            format!(r#"{{"id":"{id}","name":"{id}","engine":"sqlite","database":"{db}"}}"#)
+        };
+        let text = doc(&[e("d", "data/x.db"), e("f", "app.db"), e("i", "in.db")].join(","));
+        let (conns, problems) = parse(&text, &root).unwrap();
         assert_eq!(problems.len(), 2);
         assert!(conns[0].read_only && conns[1].read_only);
         assert!(!conns[2].read_only);
