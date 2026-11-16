@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,8 @@ pub(super) struct DbState {
     test_done: Option<(Result<String, String>, u128)>,
     tabs: HashMap<SessionId, DbTabRef>,
     claude: mcp::ClaudeDb,
+    shared: Option<SharedFile>,
+    shared_task: Option<(PathBuf, Task<()>)>,
 }
 
 #[derive(Clone, Default)]
@@ -93,6 +95,14 @@ pub(super) struct Meta {
     pub catalog_error: Option<String>,
     pub reading: Option<Busy>,
     pub claude_runs: usize,
+}
+
+/// The active project's `.daedalus/databases.json` as last read.
+pub(super) struct SharedFile {
+    pub(super) root: PathBuf,
+    pub(super) conns: Vec<Connection>,
+    pub(super) problems: Vec<String>,
+    pub(super) error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -113,6 +123,40 @@ fn conn_key(origin: Origin, id: &str) -> String {
         Origin::Global => format!("g:{id}"),
         Origin::Project => format!("p:{id}"),
     }
+}
+
+/// Connections for `root`; a shared file read for another root is never used.
+fn listed_for(
+    store: Option<&Store>,
+    shared: Option<&SharedFile>,
+    root: Option<&Path>,
+) -> Vec<Listed> {
+    let Some(store) = store else {
+        return vec![];
+    };
+    let slice = shared
+        .filter(|s| Some(s.root.as_path()) == root)
+        .map_or(&[][..], |s| &s.conns);
+    daedalus_db::for_project(store, slice, root)
+}
+
+/// Keys of project rows whose open session no longer matches the file.
+fn stale_project_keys(old: &[Connection], new: &[Connection]) -> Vec<String> {
+    old.iter()
+        .filter(|o| {
+            new.iter()
+                .find(|n| n.id == o.id)
+                .is_none_or(|n| needs_reconnect(o, n))
+        })
+        .map(|o| conn_key(Origin::Project, &o.id))
+        .collect()
+}
+
+/// Whether connecting asks for the password before reading the Keychain.
+fn prompts_first(listed: &Listed) -> bool {
+    listed.conn.engine != Engine::Sqlite
+        && listed.origin == Origin::Global
+        && !listed.conn.save_password
 }
 
 /// Whether a spinner that began at `busy` still shows at `now` for a connect that finished at `at`.
@@ -464,7 +508,136 @@ impl Shell {
         self.db.loaded = false;
         self.db.load_error = None;
         self.db.load_task = None;
+        if let Some(root) = self.active_root() {
+            self.db_load_shared(root, cx);
+        }
         cx.notify();
+    }
+
+    fn db_ensure_shared(&mut self, cx: &mut Context<Self>) {
+        let root = self.active_root();
+        if self
+            .db
+            .shared
+            .as_ref()
+            .is_some_and(|s| Some(&s.root) != root.as_ref())
+        {
+            self.db_drop_project_sessions(cx);
+            self.db.shared = None;
+        }
+        let Some(root) = root else {
+            return;
+        };
+        let loading = self
+            .db
+            .shared_task
+            .as_ref()
+            .is_some_and(|(r, _)| *r == root);
+        if self.db.shared.is_some() || loading {
+            return;
+        }
+        self.db_load_shared(root, cx);
+    }
+
+    fn db_shared_ready(&self) -> bool {
+        self.active_root()
+            .is_none_or(|r| self.db.shared.as_ref().is_some_and(|s| s.root == r))
+    }
+
+    fn db_load_shared(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let task_root = root.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let read = root.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { daedalus_db::shared::load(&read) })
+                .await;
+            this.update(cx, |shell, cx| {
+                if shell
+                    .db
+                    .shared_task
+                    .as_ref()
+                    .is_some_and(|(r, _)| *r == root)
+                {
+                    shell.db.shared_task = None;
+                }
+                if shell.active_root().as_ref() == Some(&root) {
+                    shell.db_apply_shared(root, loaded, cx);
+                }
+            })
+            .ok();
+        });
+        self.db.shared_task = Some((task_root, task));
+    }
+
+    fn db_apply_shared(
+        &mut self,
+        root: PathBuf,
+        loaded: Result<(Vec<Connection>, Vec<String>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self
+            .db
+            .shared
+            .as_ref()
+            .filter(|s| s.root == root)
+            .map_or(&[][..], |s| &s.conns);
+        let (conns, problems, error) = match loaded {
+            Ok((c, p)) => (c, p, None),
+            Err(e) => (vec![], vec![], Some(e)),
+        };
+        let stale = stale_project_keys(old, &conns);
+        for key in stale {
+            self.db_forget_session(&key, cx);
+        }
+        self.db.shared = Some(SharedFile {
+            root,
+            conns,
+            problems,
+            error,
+        });
+        cx.notify();
+    }
+
+    fn db_drop_project_sessions(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self
+            .db
+            .meta
+            .keys()
+            .filter(|k| k.starts_with("p:"))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.db_forget_session(&key, cx);
+        }
+        if self
+            .db
+            .selected
+            .as_deref()
+            .is_some_and(|k| k.starts_with("p:"))
+        {
+            self.db.selected = None;
+        }
+    }
+
+    fn db_forget_session(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.db_disconnect(key, cx);
+        self.db.meta.remove(key);
+        self.db.expanded.remove(&NodeKey::Conn(key.to_owned()));
+    }
+
+    pub(super) fn db_shared_changed(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if self.db.shared.as_ref().is_some_and(|s| s.root == root) {
+            self.db_load_shared(root.to_path_buf(), cx);
+        }
+    }
+
+    fn db_listed(&self) -> Vec<Listed> {
+        listed_for(
+            self.db.store.as_ref(),
+            self.db.shared.as_ref(),
+            self.active_root().as_deref(),
+        )
     }
 
     fn db_connect(&mut self, listed: Listed, window: &mut Window, cx: &mut Context<Self>) {
@@ -475,7 +648,7 @@ impl Shell {
         ) {
             return;
         }
-        if listed.conn.engine != Engine::Sqlite && !listed.conn.save_password {
+        if prompts_first(&listed) {
             self.db_prompt_password(&key, listed, window, cx);
             return;
         }
@@ -903,7 +1076,10 @@ impl Shell {
         let root = self.active_root();
         let typed = (!password.is_empty()).then(|| password.clone());
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
-        let (id, was_saved) = (listed.conn.id.clone(), listed.conn.save_password);
+        let (id, mark_saved) = (
+            listed.conn.id.clone(),
+            listed.origin == Origin::Global && !listed.conn.save_password,
+        );
         self.db.send(Command::Connect {
             session,
             conn: listed.conn,
@@ -919,7 +1095,7 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     db_secrets::save(&account, &password).map_err(|e| e.to_string())?;
-                    if was_saved {
+                    if !mark_saved {
                         return Ok(None);
                     }
                     edit_store(|store| {
@@ -979,11 +1155,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let listed = self.db.store.as_ref().and_then(|store| {
-            daedalus_db::for_project(store, &[], self.active_root().as_deref())
-                .into_iter()
-                .find(|l| conn_key(l.origin, &l.conn.id) == key)
-        });
+        let listed = self
+            .db_listed()
+            .into_iter()
+            .find(|l| conn_key(l.origin, &l.conn.id) == key);
         let Some(listed) = listed else {
             return;
         };
@@ -1021,6 +1196,7 @@ impl Shell {
         cx.subscribe(&view, |this, view, event: &DbConsoleEvent, cx| {
             if matches!(event, DbConsoleEvent::WantCatalog) {
                 let key = view.read(cx).key().to_owned();
+                this.db_ensure_shared(cx);
                 match this.db.meta.get(&key).and_then(|m| m.catalog.clone()) {
                     Some(c) => view.update(cx, |v, _| v.set_catalog(Arc::new(c))),
                     None => view.update(cx, |v, _| v.introspect()),
@@ -1040,6 +1216,7 @@ impl Shell {
         table: &str,
         cx: &mut Context<Self>,
     ) -> ItemView {
+        self.db_ensure_shared(cx);
         let spec = self
             .db
             .meta
@@ -1080,7 +1257,8 @@ impl Shell {
     }
 
     fn db_reconnect_tab(&mut self, tab: DbTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.db.loaded {
+        self.db_ensure_shared(cx);
+        if !self.db.loaded || !self.db_shared_ready() {
             self.db_ensure_loaded(cx);
             let tab = tab.downgrade();
             cx.spawn_in(window, async move |this, cx| {
@@ -1094,7 +1272,8 @@ impl Shell {
                     let ready = this
                         .update(cx, |shell, cx| {
                             shell.db_ensure_loaded(cx);
-                            shell.db.loaded
+                            shell.db_ensure_shared(cx);
+                            shell.db.loaded && shell.db_shared_ready()
                         })
                         .ok();
                     match ready {
@@ -1124,11 +1303,10 @@ impl Shell {
             return;
         }
         let key = tab.key(cx);
-        let listed = self.db.store.as_ref().and_then(|store| {
-            daedalus_db::for_project(store, &[], self.active_root().as_deref())
-                .into_iter()
-                .find(|l| conn_key(l.origin, &l.conn.id) == key)
-        });
+        let listed = self
+            .db_listed()
+            .into_iter()
+            .find(|l| conn_key(l.origin, &l.conn.id) == key);
         match listed {
             Some(listed) => self.db_connect_tab(tab, listed, window, cx),
             None => tab.fail("This connection no longer exists.", cx),
@@ -1164,7 +1342,7 @@ impl Shell {
             tab.fail(e, cx);
             return;
         }
-        let prompt = listed.conn.engine != Engine::Sqlite && !listed.conn.save_password;
+        let prompt = prompts_first(&listed);
         if prompt {
             // No session yet: closing the sheet must leave the tab on its Connect button.
             let info = Info::from(&listed);
@@ -1714,5 +1892,83 @@ mod tests {
         assert!(!lingers(350));
         let quick = busy.since() + Duration::from_millis(100);
         assert!(!spinner_lingers(busy, quick, quick, delay, hold));
+    }
+    fn pg(id: &str) -> Connection {
+        Connection {
+            id: id.into(),
+            name: id.into(),
+            engine: Engine::Postgres,
+            host: "db.example".into(),
+            port: Some(5432),
+            database: "app".into(),
+            user: "me".into(),
+            tls: daedalus_db::Tls::Prefer,
+            ca_file: None,
+            read_only: false,
+            production: false,
+            color: None,
+            claude: false,
+            projects: vec![],
+            save_password: false,
+        }
+    }
+
+    fn shared(root: &str, conns: Vec<Connection>) -> SharedFile {
+        SharedFile {
+            root: PathBuf::from(root),
+            conns,
+            problems: vec![],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn listed_for_ignores_a_shared_file_of_another_root() {
+        let file = shared("/a", vec![pg("x")]);
+        let out = listed_for(Some(&Store::empty()), Some(&file), Some(Path::new("/b")));
+        assert!(out.iter().all(|l| l.origin != Origin::Project));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn listed_for_lists_shared_entries_as_project_rows() {
+        let file = shared("/a", vec![pg("x")]);
+        let out = listed_for(Some(&Store::empty()), Some(&file), Some(Path::new("/a")));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].origin, Origin::Project);
+    }
+
+    #[test]
+    fn listed_for_without_a_root_lists_no_shared_entries() {
+        let file = shared("/a", vec![pg("x")]);
+        assert!(listed_for(Some(&Store::empty()), Some(&file), None).is_empty());
+    }
+
+    #[test]
+    fn stale_keys_cover_removed_and_moved_entries() {
+        let old = vec![pg("a"), pg("b"), pg("c"), pg("d"), pg("e"), pg("f")];
+        let mut new = old.clone();
+        new[0].host = "other".into();
+        new[1].port = Some(1);
+        new[2].tls = daedalus_db::Tls::Disable;
+        new[3].ca_file = Some("/tmp/ca.pem".into());
+        new.remove(4);
+        new[4].name = "renamed".into();
+        new[4].color = Some("accent".into());
+        let mut keys = stale_project_keys(&old, &new);
+        keys.sort();
+        assert_eq!(keys, ["p:a", "p:b", "p:c", "p:d", "p:e"]);
+    }
+
+    #[test]
+    fn project_rows_read_the_keychain_before_prompting() {
+        let listed = |engine, origin| Listed {
+            conn: Connection { engine, ..pg("x") },
+            origin,
+        };
+        assert!(!prompts_first(&listed(Engine::Postgres, Origin::Project)));
+        assert!(prompts_first(&listed(Engine::Postgres, Origin::Global)));
+        assert!(!prompts_first(&listed(Engine::Sqlite, Origin::Global)));
+        assert!(!prompts_first(&listed(Engine::Sqlite, Origin::Project)));
     }
 }

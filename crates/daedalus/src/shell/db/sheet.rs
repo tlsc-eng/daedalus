@@ -578,6 +578,27 @@ fn engine_index(engine: Engine) -> usize {
     }
 }
 
+fn tls_label(tls: Tls) -> &'static str {
+    ["Off", "Prefer", "Verify", "Unverified"][tls_index(tls)]
+}
+
+/// Where a project row's password will go, shown before the user types it.
+pub(super) fn prompt_detail(listed: &Listed) -> Option<String> {
+    if listed.origin == Origin::Global {
+        return None;
+    }
+    let conn = &listed.conn;
+    let mut out = format!(
+        "{} · TLS {}",
+        daedalus_db::redacted_url(conn),
+        tls_label(conn.tls)
+    );
+    if let Some(ca) = &conn.ca_file {
+        out.push_str(&format!(" · CA {}", ca.display()));
+    }
+    Some(out)
+}
+
 fn tls_index(tls: Tls) -> usize {
     match tls {
         Tls::Disable => 0,
@@ -667,6 +688,13 @@ impl DbSheet {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let keychain = self.keychain;
+        let detail = prompt_detail(listed);
+        let caption = |text: String, color| {
+            div()
+                .text_size(t.typography.caption)
+                .text_color(color)
+                .child(text)
+        };
         div()
             .flex()
             .flex_col()
@@ -679,6 +707,19 @@ impl DbSheet {
                     .text_color(t.color.content)
                     .child(format!("Password for {}", listed.conn.name)),
             )
+            .when_some(detail, |el, detail| {
+                el.child(caption(detail, t.color.content_secondary))
+                    .child(caption(
+                        "From this project's .daedalus/databases.json. Check the server before you type a password.".into(),
+                        t.color.content_muted,
+                    ))
+                    .when(listed.conn.tls == Tls::Disable, |el| {
+                        el.child(caption(
+                            "TLS is off, so the password may cross the network unencrypted.".into(),
+                            t.color.warning,
+                        ))
+                    })
+            })
             .child(boxed(&self.password, t))
             .child(checkbox(
                 "db-keychain",
@@ -1189,5 +1230,26 @@ mod tests {
             password_change(None, &off, "new"),
             PasswordChange::Keep
         ));
+    }
+
+    #[test]
+    fn prompt_detail_names_host_tls_and_ca_for_project_rows() {
+        let listed = Listed {
+            conn: base(),
+            origin: Origin::Project,
+        };
+        let detail = prompt_detail(&listed).unwrap();
+        assert!(detail.contains(&daedalus_db::redacted_url(&listed.conn)));
+        assert!(detail.contains("TLS "));
+        assert!(detail.ends_with(" · CA /tmp/ca.pem"));
+    }
+
+    #[test]
+    fn prompt_detail_is_none_for_personal_rows() {
+        let listed = Listed {
+            conn: base(),
+            origin: Origin::Global,
+        };
+        assert_eq!(prompt_detail(&listed), None);
     }
 }
