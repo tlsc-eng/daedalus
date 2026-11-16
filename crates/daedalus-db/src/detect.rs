@@ -56,11 +56,16 @@ pub fn read_env(root: &Path) -> Vec<EnvFile> {
         .iter()
         .filter_map(|&name| {
             let path = root.join(name);
-            let meta = fs::metadata(&path).ok()?;
+            // A symlink pointing outside the project must not leak other files into suggestions.
+            let real = path.canonicalize().ok()?;
+            if !real.starts_with(root.canonicalize().ok()?) {
+                return None;
+            }
+            let meta = fs::metadata(&real).ok()?;
             if !meta.is_file() || meta.len() > MAX_ENV_BYTES {
                 return None;
             }
-            let text = fs::read_to_string(&path).ok()?;
+            let text = fs::read_to_string(&real).ok()?;
             Some(EnvFile { name, text })
         })
         .collect()
@@ -204,7 +209,9 @@ fn merge(env: &[EnvFile]) -> Merged {
     let mut map = Merged::new();
     for file in env.iter().rev() {
         for (k, v) in parse_env(&file.text) {
-            if !v.contains("${") {
+            if v.is_empty() || v.contains("${") {
+                map.remove(&k);
+            } else {
                 map.insert(k, (v, file.name));
             }
         }
@@ -288,7 +295,7 @@ fn compose_name(root: &Path, env: &[EnvFile]) -> String {
                 .find(|(k, _)| k == "COMPOSE_PROJECT_NAME")
         })
         .map(|(_, v)| v)
-        .filter(|v| !v.contains("${"));
+        .filter(|v| !v.is_empty() && !v.contains("${"));
     match from_env {
         Some(v) => normalize_project(&v),
         None => normalize_project(
@@ -912,5 +919,64 @@ mod tests {
         fs::write(dir.join(".env"), vec![b'a'; MAX_ENV_BYTES as usize + 1]).unwrap();
         assert!(read_env(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interpolated_local_value_hides_lower_file() {
+        let s = run(&[
+            ef(".env.local", "DATABASE_URL=postgres://${USER}@new/db\n"),
+            ef(".env", "DATABASE_URL=postgres://u@stale/db\n"),
+        ]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn interpolated_value_hides_earlier_line_in_same_file() {
+        let s = run(&[ef(
+            ".env",
+            "DATABASE_URL=postgres://u@stale/db\nDATABASE_URL=${X}\n",
+        )]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn blank_postgres_user_uses_defaults() {
+        let s = run(&[ef(
+            ".env",
+            "POSTGRES_DB=shop\nPOSTGRES_USER=\nPOSTGRES_PASSWORD=\n",
+        )]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].conn.user, "postgres");
+        assert!(s[0].password.is_none());
+    }
+
+    #[test]
+    fn blank_pgport_uses_default_port() {
+        let s = run(&[ef(".env", "PGHOST=h\nPGUSER=me\nPGPORT=\n")]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].conn.port, None);
+    }
+
+    #[test]
+    fn blank_compose_project_name_falls_back_to_folder() {
+        let mut c = container("postgres:16", &["15432:5432"]);
+        c.project = Some(normalize_project("My App.v2"));
+        let hit = detect(&root(), &[ef(".env", "COMPOSE_PROJECT_NAME=\n")], &[c], &[]);
+        assert_eq!(hit.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_symlink_must_stay_inside_project() {
+        let dir = temp("symlink");
+        let outside = temp("symlink-out");
+        fs::write(dir.join("real.txt"), "A=1").unwrap();
+        fs::write(outside.join("secret"), "B=2").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.txt"), dir.join(".env")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join(".env.local")).unwrap();
+        let names: Vec<_> = read_env(&dir).iter().map(|f| f.name).collect();
+        assert_eq!(names, vec![".env"]);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 }
