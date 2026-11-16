@@ -732,4 +732,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn sqlite_storage_classes_type_json_and_insert() {
+        let cols = [
+            col("n", "integer"),
+            col("r", "real"),
+            col("b", "blob"),
+            col("t", "text"),
+            col("z", ""),
+        ];
+        let rows = vec![vec![s("2"), s("0.5"), s("\\x0a"), s("3"), s("4")]];
+        assert_eq!(
+            run(Format::Json, Engine::Sqlite, &cols, &rows),
+            "[\n  {\"n\": 2, \"r\": 0.5, \"b\": \"\\\\x0a\", \"t\": \"3\", \"z\": \"4\"}\n]\n"
+        );
+        assert_eq!(
+            run(Format::Insert, Engine::Sqlite, &cols, &rows),
+            "INSERT INTO \"result\" (\"n\", \"r\", \"b\", \"t\", \"z\") VALUES (2, 0.5, X'0a', '3', '4');\n"
+        );
+    }
 }
