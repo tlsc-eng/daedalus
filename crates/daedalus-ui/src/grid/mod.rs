@@ -18,6 +18,8 @@ use crate::components::Tooltip;
 use crate::motion::{self, Busy, Glide, Opening};
 use crate::{ActiveTheme, Ellipsis, InputEvent, Size, Space, TextInput, Theme};
 
+const MAX_UNDRAWN_TICKS: u8 = 6;
+
 use model::{
     CellPos, GridModel, Kind, MAX_COL_W, autoscroll_speed, autoscroll_step, bar_offset, cell_at,
     column_lefts, column_width, display_text, drag_width, edge_overshoot, gutter_chars, page_rows,
@@ -142,6 +144,7 @@ pub struct DataGrid {
     drag_pos: Option<Point<Pixels>>,
     autoscroll: Option<Task<()>>,
     autoscroll_at: Option<Instant>,
+    undrawn_ticks: u8,
     editable: bool,
     marks: GridMarks,
     editing: Option<Editing>,
@@ -186,6 +189,7 @@ impl DataGrid {
             drag_pos: None,
             autoscroll: None,
             autoscroll_at: None,
+            undrawn_ticks: 0,
             editable: false,
             marks: GridMarks::default(),
             editing: None,
@@ -205,6 +209,9 @@ impl DataGrid {
         cx: &mut Context<Self>,
     ) {
         self.model.show(columns, rows, more);
+        self.drag = None;
+        self.drag_pos = None;
+        self.stop_autoscroll();
         if let Some(editing) = self.editing.take() {
             self.refocus_pending = Some(editing.input.focus_handle(cx));
         }
@@ -877,6 +884,7 @@ impl DataGrid {
 
     fn start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.autoscroll_at = Some(Instant::now());
+        self.undrawn_ticks = 0;
         self.autoscroll = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -899,7 +907,11 @@ impl DataGrid {
         let (Some(rows), Some(pos)) = (rows, pos) else {
             return self.stop_autoscroll();
         };
-        if !window.is_window_active() {
+        // The drag hook repaints every frame; if it stops, mouse-up can no longer reach us.
+        self.undrawn_ticks = self.undrawn_ticks.saturating_add(1);
+        if !window.is_window_active() || self.undrawn_ticks > MAX_UNDRAWN_TICKS {
+            self.drag = None;
+            self.drag_pos = None;
             return self.stop_autoscroll();
         }
         let now = Instant::now();
@@ -980,7 +992,8 @@ impl DataGrid {
         Some(
             gpui::canvas(
                 |_, _, _| {},
-                move |_, _, window, _| {
+                move |_, _, window, cx| {
+                    grid.update(cx, |this, _| this.undrawn_ticks = 0).ok();
                     let g = grid.clone();
                     window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
