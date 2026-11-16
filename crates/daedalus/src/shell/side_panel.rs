@@ -62,7 +62,7 @@ impl Shell {
         }
     }
 
-    /// `select_side_mode`, then focuses Outline's filter, which is what asking for the outline means.
+    /// `select_side_mode`, then focuses what the mode types into: Outline's filter or the Data explorer.
     pub(super) fn show_side_mode(
         &mut self,
         mode: SideMode,
@@ -73,6 +73,9 @@ impl Shell {
         if mode == SideMode::Outline {
             let filter = self.outline_filter(cx);
             window.focus(&filter.focus_handle(cx));
+        }
+        if mode == SideMode::Data && !self.db_sheet_open() {
+            window.focus(&self.db_focus);
         }
     }
 

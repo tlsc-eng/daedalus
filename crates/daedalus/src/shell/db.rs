@@ -10,14 +10,15 @@ use daedalus_ui::motion::{self, Busy, Closing};
 use daedalus_ui::{ActiveTheme, Theme};
 use daedalus_workspace::ItemKind;
 use gpui::{
-    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, Subscription, Task,
-    UniformListScrollHandle, Window, div, prelude::*, px,
+    Animation, AnyElement, Context, Entity, MouseButton, PromptLevel, ScrollStrategy, Subscription,
+    Task, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 
 use super::Shell;
 use super::item::ItemView;
 use super::sidebar::Tween;
 use crate::db_secrets;
+use nav::Sel;
 use sheet::{
     DbSheet, DbSheetEvent, PasswordChange, SheetMode, needs_reconnect, needs_typed_password,
 };
@@ -27,6 +28,7 @@ mod detected;
 mod explorer;
 mod exporting;
 mod mcp;
+mod nav;
 mod sheet;
 mod tab;
 mod table;
@@ -78,7 +80,8 @@ pub(super) struct DbState {
     expanded: HashSet<NodeKey>,
     turning: HashMap<NodeKey, Tween>,
     next_session: u64,
-    selected: Option<String>,
+    selected: Option<Sel>,
+    reveal: Option<ScrollStrategy>,
     spin: Option<Task<()>>,
     sheet: Option<OpenSheet>,
     sheet_closing: Option<(Entity<DbSheet>, Closing)>,
@@ -222,6 +225,12 @@ fn path() -> Result<PathBuf, String> {
 }
 
 impl DbState {
+    /// Selects `sel` and scrolls it into view on the next render.
+    fn select(&mut self, sel: Sel, reveal: ScrollStrategy) {
+        self.selected = Some(sel);
+        self.reveal = Some(reveal);
+    }
+
     fn phase(&self, key: &str) -> Phase {
         self.meta
             .get(key)
@@ -662,7 +671,8 @@ impl Shell {
         if self
             .db
             .selected
-            .as_deref()
+            .as_ref()
+            .and_then(Sel::conn)
             .is_some_and(|k| k.starts_with("p:"))
         {
             self.db.selected = None;
@@ -818,9 +828,13 @@ impl Shell {
     }
 
     /// Drops finished chevron turns and keeps frames coming while one runs on screen.
-    pub(super) fn sync_db_motion(&mut self, window: &mut Window, cx: &Context<Self>) {
+    pub(super) fn sync_db_motion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.data_shown() {
             self.db.turning.clear();
+            // A hidden explorer cannot take keys, so give them back to the editor.
+            if self.db_focus.contains_focused(window, cx) {
+                self.focus_active_item(window, cx);
+            }
             return;
         }
         let fast = cx.theme().motion.fast;
@@ -952,6 +966,10 @@ impl Shell {
             return;
         }
         self.db_open_sheet(SheetMode::Password { listed, tab: None }, window, cx);
+    }
+
+    pub(super) fn db_sheet_open(&self) -> bool {
+        self.db.sheet.is_some()
     }
 
     fn db_sheet_is(&self, opened: u64) -> bool {
@@ -1118,7 +1136,9 @@ impl Shell {
                     if old.is_some_and(|old| needs_reconnect(&old, &new)) {
                         shell.db_disconnect(&key, cx);
                     }
-                    shell.db.selected = Some(key);
+                    shell
+                        .db
+                        .select(Sel::Node(NodeKey::Conn(key)), ScrollStrategy::Center);
                     if shell.db_sheet_is(opened) {
                         shell.db_close_sheet(window, cx);
                     }
@@ -1177,7 +1197,9 @@ impl Shell {
                         if old.is_some_and(|old| needs_reconnect(&old, &new)) {
                             shell.db_disconnect(&key, cx);
                         }
-                        shell.db.selected = Some(key);
+                        shell
+                            .db
+                            .select(Sel::Node(NodeKey::Conn(key)), ScrollStrategy::Center);
                     }
                     if shell.db_sheet_is(opened) {
                         shell.db_close_sheet(window, cx);
@@ -1639,7 +1661,7 @@ impl Shell {
         let key = conn_key(listed.origin, &listed.conn.id);
         self.db_disconnect(&key, cx);
         self.db.meta.remove(&key);
-        if self.db.selected.as_deref() == Some(key.as_str()) {
+        if self.db.selected.as_ref().and_then(Sel::conn) == Some(key.as_str()) {
             self.db.selected = None;
         }
         let account = daedalus_db::keychain_account(listed.origin, root.as_deref(), &listed.conn);
@@ -1697,7 +1719,7 @@ impl Shell {
         let key = conn_key(Origin::Project, &listed.conn.id);
         self.db_disconnect(&key, cx);
         self.db.meta.remove(&key);
-        if self.db.selected.as_deref() == Some(key.as_str()) {
+        if self.db.selected.as_ref().and_then(Sel::conn) == Some(key.as_str()) {
             self.db.selected = None;
         }
         let account = daedalus_db::keychain_account(Origin::Project, Some(&root), &listed.conn);
@@ -1783,7 +1805,10 @@ impl Shell {
                         shell.db_set_store(store);
                         shell.db_disconnect(&old_key, cx);
                         shell.db.meta.remove(&old_key);
-                        shell.db.selected = Some(conn_key(Origin::Global, &id));
+                        shell.db.select(
+                            Sel::Node(NodeKey::Conn(conn_key(Origin::Global, &id))),
+                            ScrollStrategy::Center,
+                        );
                     }
                     Err(e) => shell.transient_notice("Could not make a personal copy", e, cx),
                 }

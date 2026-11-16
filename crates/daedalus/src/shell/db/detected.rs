@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use super::explorer::engine_label;
+use super::nav::Sel;
 use super::sheet::{Found, SheetMode, caption_field};
 use crate::shell::Shell;
 use crate::shell::menus::shell_item;
@@ -173,7 +174,12 @@ impl Shell {
         }
     }
 
-    fn db_open_detected(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn db_open_detected(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.db.sheet.is_some() {
             return;
         }
@@ -209,6 +215,7 @@ impl Shell {
     pub(super) fn render_look_in_docker(
         &self,
         centered: bool,
+        selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = cx.theme().clone();
@@ -224,8 +231,13 @@ impl Shell {
             .cursor_pointer()
             .text_size(t.typography.caption)
             .text_color(t.color.content_muted)
-            .hover(|s| s.bg(t.color.surface_hover))
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.containers_start(cx)))
+            .when(selected, |el| super::explorer::selected_look(el, &t))
+            .when(!selected, |el| el.hover(|s| s.bg(t.color.surface_hover)))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.db.selected = Some(Sel::LookInDocker);
+                this.containers_start(cx);
+                cx.notify();
+            }))
             .child("Look in Docker")
             .into_any_element()
     }
@@ -270,6 +282,7 @@ impl Shell {
     pub(super) fn render_detected_row(
         &self,
         row: DetectedRow,
+        selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = cx.theme().clone();
@@ -287,7 +300,8 @@ impl Shell {
             .cursor_pointer()
             .text_size(t.typography.caption)
             .text_color(t.color.content_muted)
-            .hover(|s| s.bg(t.color.surface_hover))
+            .when(selected, |el| super::explorer::selected_look(el, &t))
+            .when(!selected, |el| el.hover(|s| s.bg(t.color.surface_hover)))
             .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
             .on_mouse_down(
                 MouseButton::Right,
@@ -300,7 +314,9 @@ impl Shell {
                 }),
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.db.selected = Some(Sel::Detected(key.clone()));
                 this.db_open_detected(&key, window, cx);
+                cx.notify();
             }))
             .child(div().min_w_0().flex_1().ellipsis().child(row.name))
             .child(div().flex_none().child(engine_label(row.engine)))

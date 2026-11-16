@@ -12,11 +12,12 @@ use daedalus_ui::{
 };
 use daedalus_workspace::FolderColor;
 use gpui::{
-    AnyElement, ClickEvent, ClipboardItem, Context, FontWeight, MouseButton, MouseDownEvent,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, FontWeight, MouseButton, MouseDownEvent,
     Window, div, prelude::*, px, uniform_list,
 };
 
 use super::detected::DetectedRow;
+use super::nav::{Sel, current, find, keeps_selection};
 use super::sheet::SheetMode;
 use super::{Meta, NodeKey, Phase, SharedFile, conn_key};
 use crate::shell::Shell;
@@ -80,7 +81,7 @@ pub(super) enum Tone {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Line {
+pub(super) enum Line {
     Tree(Row, f32),
     DetectedHeader,
     Detected(DetectedRow),
@@ -139,6 +140,13 @@ fn fades(rows: &[Row], turn: impl Fn(&NodeKey) -> f32) -> Vec<f32> {
 
 pub(super) fn data_color(name: Option<&str>) -> Option<FolderColor> {
     serde_json::from_value(serde_json::Value::String(name?.to_owned())).ok()
+}
+
+/// The file tree's selected-row look: colour, weight and background, so the row height holds.
+pub(super) fn selected_look<E: Styled>(el: E, t: &daedalus_ui::Theme) -> E {
+    el.text_color(t.color.accent)
+        .font_weight(FontWeight::MEDIUM)
+        .bg(t.color.surface_accent)
 }
 
 pub(super) fn engine_label(engine: Engine) -> &'static str {
@@ -324,7 +332,7 @@ impl Shell {
                     }));
                 let look = self
                     .db_can_look_in_docker()
-                    .then(|| self.render_look_in_docker(true, cx));
+                    .then(|| self.render_look_in_docker(true, false, cx));
                 let empty = empty_state(
                     "No databases",
                     "Add a connection here, or edit databases.json.",
@@ -343,38 +351,51 @@ impl Shell {
                     None => empty.into_any_element(),
                 }
             } else {
-                let delay = t.motion.indicator_delay;
-                let rows = rows(&listed, &self.db.meta, &self.db.expanded, delay);
-                let fade = fades(&rows, |n| self.db.turn_of(n, t.motion.fast));
-                let look = self.db.loaded && self.db_can_look_in_docker();
-                let lines = Rc::new(lines(rows, fade, detected, look));
+                let lines = self.db_lines(&listed, detected, cx);
+                let picked = self.db.selected.as_ref().and_then(|s| current(&lines, s));
+                if let Some(strategy) = self.db.reveal
+                    && let Some(ix) = self.db.selected.as_ref().and_then(|s| find(&lines, s))
+                {
+                    self.db.reveal = None;
+                    self.db.scroll.scroll_to_item(ix, strategy);
+                }
+                let lines = Rc::new(lines);
                 let listed = Rc::new(listed);
                 uniform_list(
                     "data-explorer-rows",
                     lines.len(),
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
                         range
-                            .map(|i| match lines[i].clone() {
-                                Line::Tree(row, fade) => {
-                                    let el = match row {
-                                        Row::Conn { .. } => this.render_conn_row(row, &listed, cx),
-                                        Row::Error { key, message } => {
-                                            this.render_error_row(key, message, cx)
+                            .map(|i| {
+                                let selected = picked == Some(i);
+                                match lines[i].clone() {
+                                    Line::Tree(row, fade) => {
+                                        let el = match row {
+                                            Row::Conn { .. } => {
+                                                this.render_conn_row(row, &listed, selected, cx)
+                                            }
+                                            Row::Error { key, message } => {
+                                                this.render_error_row(key, message, cx)
+                                            }
+                                            row => this.render_node_row(row, selected, cx),
+                                        };
+                                        match fade < 1. {
+                                            true => div()
+                                                .w_full()
+                                                .opacity(fade)
+                                                .child(el)
+                                                .into_any_element(),
+                                            false => el,
                                         }
-                                        row => this.render_node_row(row, cx),
-                                    };
-                                    match fade < 1. {
-                                        true => div()
-                                            .w_full()
-                                            .opacity(fade)
-                                            .child(el)
-                                            .into_any_element(),
-                                        false => el,
+                                    }
+                                    Line::DetectedHeader => this.render_detected_header(cx),
+                                    Line::Detected(row) => {
+                                        this.render_detected_row(row, selected, cx)
+                                    }
+                                    Line::LookInDocker => {
+                                        this.render_look_in_docker(false, selected, cx)
                                     }
                                 }
-                                Line::DetectedHeader => this.render_detected_header(cx),
-                                Line::Detected(row) => this.render_detected_row(row, cx),
-                                Line::LookInDocker => this.render_look_in_docker(false, cx),
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -393,7 +414,9 @@ impl Shell {
                 .child(list)
                 .into_any_element()
         };
-        div()
+        super::nav::bind_explorer_keys(div(), cx)
+            .track_focus(&self.db_focus)
+            .key_context("DataExplorer")
             .size_full()
             .flex()
             .flex_col()
@@ -441,6 +464,25 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The Data explorer's lines: the tree with each row's fade, then the Detected group.
+    pub(super) fn db_lines(
+        &self,
+        listed: &[Listed],
+        detected: Vec<DetectedRow>,
+        cx: &App,
+    ) -> Vec<Line> {
+        let t = cx.theme();
+        let rows = rows(
+            listed,
+            &self.db.meta,
+            &self.db.expanded,
+            t.motion.indicator_delay,
+        );
+        let fade = fades(&rows, |n| self.db.turn_of(n, t.motion.fast));
+        let look = self.db.loaded && self.db_can_look_in_docker();
+        lines(rows, fade, detected, look)
+    }
+
     fn render_error_row(&self, key: String, message: String, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
         let tip = message.clone();
@@ -459,7 +501,7 @@ impl Shell {
             .into_any_element()
     }
 
-    fn render_node_row(&self, row: Row, cx: &mut Context<Self>) -> AnyElement {
+    fn render_node_row(&self, row: Row, selected: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
         let fast = t.motion.fast;
         let base = |id: String, depth: u8| {
@@ -484,8 +526,18 @@ impl Shell {
                 let turn = self.db.turn_of(&node, fast);
                 base(format!("db-schema:{conn}:{name}"), 1)
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
+                    .when(selected, |el| selected_look(el, &t))
+                    .when(!selected, |el| {
+                        el.hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
+                    })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        if !keeps_selection(
+                            this.db.selected.as_ref(),
+                            &node,
+                            this.db.expanded.contains(&node),
+                        ) {
+                            this.db.selected = Some(Sel::Node(node.clone()));
+                        }
                         this.db_toggle(node.clone(), None, window, cx)
                     }))
                     .child(slot().child(chevron(turn, &t)))
@@ -509,10 +561,20 @@ impl Shell {
                 let turn = self.db.turn_of(&node, fast);
                 base(format!("db-table:{conn}:{schema}:{name}"), 2)
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
+                    .when(selected, |el| selected_look(el, &t))
+                    .when(!selected, |el| {
+                        el.hover(|s| s.bg(t.color.surface_hover).text_color(t.color.content))
+                    })
                     .on_click(cx.listener({
                         let (conn, schema, name) = (conn.clone(), schema.clone(), name.clone());
                         move |this, event: &ClickEvent, window, cx| {
+                            if !keeps_selection(
+                                this.db.selected.as_ref(),
+                                &node,
+                                this.db.expanded.contains(&node),
+                            ) {
+                                this.db.selected = Some(Sel::Node(node.clone()));
+                            }
                             if event.click_count() >= 2 {
                                 this.db_open_table(
                                     conn.clone(),
@@ -563,6 +625,14 @@ impl Shell {
                 pk,
                 nullable,
             } => base(format!("db-column:{parent:?}:{name}"), 3)
+                .when(selected, |el| selected_look(el, &t))
+                .on_click(cx.listener({
+                    let sel = Sel::Column(parent.clone(), name.clone());
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.db.selected = Some(sel.clone());
+                        cx.notify();
+                    }
+                }))
                 .child(slot())
                 .child(div().min_w_0().ellipsis().child(name))
                 .child(
@@ -591,12 +661,15 @@ impl Shell {
                     .text_color(color)
                     .tooltip(move |_, cx| daedalus_ui::Tooltip::view(tip.clone(), cx))
                     .when_some(retry, |el, key| {
+                        let sel = Sel::Note(parent.clone(), text.clone());
                         el.cursor_pointer()
-                            .hover(|s| s.bg(t.color.surface_hover))
+                            .when(!selected, |el| el.hover(|s| s.bg(t.color.surface_hover)))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.db.selected = Some(sel.clone());
                                 this.db_introspect(&key, cx)
                             }))
                     })
+                    .when(selected, |el| selected_look(el, &t))
                     .child(slot())
                     .child(div().flex_1().min_w_0().ellipsis().child(text))
                     .into_any_element()
@@ -605,7 +678,13 @@ impl Shell {
         }
     }
 
-    fn render_conn_row(&self, row: Row, listed: &[Listed], cx: &mut Context<Self>) -> AnyElement {
+    fn render_conn_row(
+        &self,
+        row: Row,
+        listed: &[Listed],
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Row::Conn {
             key,
             name,
@@ -623,7 +702,6 @@ impl Shell {
             return div().into_any_element();
         };
         let t = cx.theme().clone();
-        let selected = self.db.selected.as_deref() == Some(key.as_str());
         let tint = color.map_or(t.color.content_muted, |c| folder_color(&t, c));
         let (delay, hold) = (t.motion.indicator_delay, t.motion.indicator_hold);
         let spinning = match &phase {
@@ -701,7 +779,7 @@ impl Shell {
             .on_click(cx.listener({
                 let key = key.clone();
                 move |this, event: &ClickEvent, window, cx| {
-                    this.db.selected = Some(key.clone());
+                    this.db.selected = Some(Sel::Node(NodeKey::Conn(key.clone())));
                     if event.click_count() >= 2 {
                         click_toggle(this, window, cx);
                     }
