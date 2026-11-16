@@ -24,3 +24,4 @@ tree-sitter.workspace = true
 tree-sitter-sequel.workspace = true
 rusqlite.workspace = true
 mysql_async.workspace = true
+libc.workspace = true

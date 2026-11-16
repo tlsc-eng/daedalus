@@ -242,6 +242,7 @@ impl Shell {
                 windows::quit_ide(cx);
                 this.tests_quit();
                 this.debug_quit();
+                daedalus_db::tunnel::kill_all();
                 async {}
             }),
         ];

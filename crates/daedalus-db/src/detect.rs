@@ -241,6 +241,7 @@ fn build(root: &Path, t: Target) -> (Connection, Option<Secret>) {
         user: t.user,
         tls,
         ca_file: None,
+        ssh: None,
         read_only: false,
         production: false,
         color: None,

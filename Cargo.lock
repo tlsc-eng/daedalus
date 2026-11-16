@@ -1499,6 +1499,7 @@ dependencies = [
  "async-channel 2.5.0",
  "bytes",
  "futures",
+ "libc",
  "mysql_async",
  "rusqlite",
  "rustls",

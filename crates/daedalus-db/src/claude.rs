@@ -634,6 +634,7 @@ mod tests {
             user: "secretuser".into(),
             tls: Tls::Disable,
             ca_file: None,
+            ssh: None,
             read_only: true,
             production: false,
             color: None,

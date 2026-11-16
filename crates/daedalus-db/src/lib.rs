@@ -11,6 +11,7 @@ pub mod export;
 pub mod history;
 pub mod secret;
 pub mod shared;
+pub mod tunnel;
 pub mod value;
 pub mod worker;
 

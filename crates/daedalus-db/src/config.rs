@@ -73,6 +73,8 @@ pub struct Connection {
     pub tls: Tls,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnel>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -209,6 +211,62 @@ pub fn for_project(store: &Store, shared: &[Connection], root: Option<&Path>) ->
     out
 }
 
+/// An SSH server the database is reached through; host and port of the connection are then as the server sees them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SshTunnel {
+    /// Host name, IP or ~/.ssh/config alias.
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<PathBuf>,
+}
+
+fn host_chars_ok(host: &str) -> bool {
+    !host.starts_with('-')
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '%')
+        })
+}
+
+impl SshTunnel {
+    /// Rejects values ssh could read as options; the messages never echo a value.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.host.is_empty() || !host_chars_ok(&self.host) {
+            return Err("SSH host is not valid");
+        }
+        if self.port == Some(0) {
+            return Err("SSH port must be 1-65535");
+        }
+        let user_ok = self.user.is_empty()
+            || (!self.user.starts_with('-')
+                && self
+                    .user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@')));
+        if !user_ok {
+            return Err("SSH user is not valid");
+        }
+        if let Some(key) = &self.identity_file {
+            let text = key.to_string_lossy();
+            if !(key.is_absolute() || text.starts_with("~/")) || text.starts_with('-') {
+                return Err("Identity file must be an absolute path or start with ~/");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks a database host that is reached through a tunnel; empty means localhost.
+pub fn check_target(host: &str) -> Result<(), &'static str> {
+    if host.starts_with('/') || !host_chars_ok(host) {
+        return Err("Database host must be a host name or IP when using SSH");
+    }
+    Ok(())
+}
+
 /// Keychain account for the connection's password.
 pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) -> String {
     match origin {
@@ -224,7 +282,7 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
                 .as_deref()
                 .map(|p| p.as_os_str().as_encoded_bytes())
                 .unwrap_or_default();
-            let parts: [&[u8]; 9] = [
+            let mut parts: Vec<&[u8]> = vec![
                 root,
                 conn.id.as_bytes(),
                 conn.engine.name().as_bytes(),
@@ -235,6 +293,19 @@ pub fn keychain_account(origin: Origin, root: Option<&Path>, conn: &Connection) 
                 tls.as_bytes(),
                 ca,
             ];
+            let ssh_port = conn
+                .ssh
+                .as_ref()
+                .and_then(|s| s.port)
+                .map(|p| p.to_string())
+                .unwrap_or_default();
+            if let Some(ssh) = &conn.ssh {
+                parts.extend([
+                    ssh.host.as_bytes(),
+                    ssh_port.as_bytes(),
+                    ssh.user.as_bytes(),
+                ]);
+            }
             let mut hasher = Sha256::new();
             for part in parts {
                 hasher.update((part.len() as u64).to_le_bytes());
@@ -307,6 +378,7 @@ pub fn from_url(input: &str) -> Result<(Connection, Option<Secret>), String> {
         user: String::new(),
         tls: Tls::Prefer,
         ca_file: None,
+        ssh: None,
         read_only: false,
         production: false,
         color: None,
@@ -400,6 +472,7 @@ mod tests {
             user: "me".into(),
             tls: Tls::Require,
             ca_file: Some("/etc/ca.pem".into()),
+            ssh: None,
             read_only: true,
             production: true,
             color: None,
@@ -594,6 +667,103 @@ mod tests {
             keychain_account(Origin::Project, Some(root), &a),
             keychain_account(Origin::Project, Some(root), &b)
         );
+    }
+
+    fn tunnel(host: &str) -> SshTunnel {
+        SshTunnel {
+            host: host.into(),
+            port: None,
+            user: String::new(),
+            identity_file: None,
+        }
+    }
+
+    #[test]
+    fn ssh_round_trips_and_is_omitted_when_none() {
+        let mut c = conn("a", "A");
+        assert!(!serde_json::to_string(&c).unwrap().contains("\"ssh\""));
+        c.ssh = Some(SshTunnel {
+            port: Some(2222),
+            user: "me".into(),
+            identity_file: Some("~/.ssh/id".into()),
+            ..tunnel("bastion")
+        });
+        let back: Connection = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn ssh_check_rejects_option_injection_and_bad_chars() {
+        for host in ["-oProxyCommand=x", "a b", "a;b", ""] {
+            assert_eq!(tunnel(host).check(), Err("SSH host is not valid"), "{host}");
+        }
+        for host in ["bastion", "10.0.0.1", "[::1]"] {
+            assert_eq!(tunnel(host).check(), Ok(()), "{host}");
+        }
+        let port = SshTunnel {
+            port: Some(0),
+            ..tunnel("h")
+        };
+        assert_eq!(port.check(), Err("SSH port must be 1-65535"));
+        for user in ["-l", "a b", "a;b"] {
+            let t = SshTunnel {
+                user: user.into(),
+                ..tunnel("h")
+            };
+            assert_eq!(t.check(), Err("SSH user is not valid"), "{user}");
+        }
+        let user = SshTunnel {
+            user: "me@corp".into(),
+            ..tunnel("h")
+        };
+        assert_eq!(user.check(), Ok(()));
+        for key in ["rel/key", "-oFoo", "~foo"] {
+            let t = SshTunnel {
+                identity_file: Some(key.into()),
+                ..tunnel("h")
+            };
+            assert!(t.check().is_err(), "{key}");
+        }
+        for key in ["~/.ssh/id_ed25519", "/home/me/key"] {
+            let t = SshTunnel {
+                identity_file: Some(key.into()),
+                ..tunnel("h")
+            };
+            assert_eq!(t.check(), Ok(()), "{key}");
+        }
+    }
+
+    #[test]
+    fn check_target_rejects_socket_paths() {
+        assert_eq!(check_target(""), Ok(()));
+        assert_eq!(check_target("db.internal"), Ok(()));
+        assert_eq!(check_target("::1"), Ok(()));
+        for bad in ["/var/run/pg.sock", "-oFoo", "a b"] {
+            assert!(check_target(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn keychain_account_is_unchanged_without_ssh() {
+        let account =
+            keychain_account(Origin::Project, Some(Path::new("/work/a")), &conn("a", "A"));
+        assert_eq!(
+            account,
+            "p-0e8f020b62fafc509f0fbeaa7470a7fbe2183bb693259270b0b7940292dc8c2a"
+        );
+    }
+
+    #[test]
+    fn keychain_account_changes_when_ssh_host_changes() {
+        let root = Path::new("/work/a");
+        let plain = conn("a", "A");
+        let mut a = plain.clone();
+        a.ssh = Some(tunnel("one"));
+        let mut b = plain.clone();
+        b.ssh = Some(tunnel("two"));
+        let account = |c| keychain_account(Origin::Project, Some(root), c);
+        assert_ne!(account(&plain), account(&a));
+        assert_ne!(account(&a), account(&b));
     }
 
     #[test]

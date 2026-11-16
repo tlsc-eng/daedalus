@@ -2,6 +2,7 @@ pub mod mysql;
 pub mod pg;
 pub mod sqlite;
 
+use std::net::SocketAddr;
 use std::path::Path;
 
 use std::pin::Pin;
@@ -83,12 +84,13 @@ impl Driver {
     /// Returns the driver and a server description; the error is safe to show.
     pub async fn connect(
         conn: &Connection,
+        via: Option<SocketAddr>,
         password: Option<&Secret>,
         root: Option<&Path>,
     ) -> Result<(Driver, String), String> {
         match conn.engine {
             Engine::Postgres => {
-                let (pg, server) = pg::Pg::connect(conn, password).await?;
+                let (pg, server) = pg::Pg::connect(conn, via, password).await?;
                 Ok((Driver::Postgres(pg), server))
             }
             Engine::Sqlite => {
@@ -96,7 +98,7 @@ impl Driver {
                 Ok((Driver::Sqlite(db), server))
             }
             Engine::Mysql => {
-                let (mysql, server) = mysql::Mysql::connect(conn, password).await?;
+                let (mysql, server) = mysql::Mysql::connect(conn, via, password).await?;
                 Ok((Driver::Mysql(mysql), server))
             }
         }
