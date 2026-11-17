@@ -881,7 +881,7 @@ impl TerminalView {
     }
 
     fn on_message(&mut self, msg: ServerMsg, cx: &mut Context<Self>) {
-        let palette = cx.theme().terminal.clone();
+        let palette = cx.theme().terminal_palette.clone();
         match msg {
             ServerMsg::Spawned { pane } if self.closed => {
                 self.send(ClientMsg::Kill { pane });
@@ -1927,7 +1927,7 @@ impl Render for TerminalView {
                 .size_full()
                 .flex()
                 .flex_col()
-                .bg(t.terminal.background);
+                .bg(t.terminal_palette.background);
 
         if let Some(stale) = self.stale {
             return root

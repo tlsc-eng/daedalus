@@ -1987,7 +1987,7 @@ impl Shell {
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.terminal.background)
+            .bg(t.terminal_palette.background)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.focus_pane(pane_id, window, cx)),

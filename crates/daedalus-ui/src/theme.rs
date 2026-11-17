@@ -1,6 +1,9 @@
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
+mod terminal_themes;
+pub use terminal_themes::TerminalTheme;
+
 use gpui::{BoxShadow, Global, Hsla, Pixels, SharedString, point, px, rgb, rgba};
 
 /// Semantic colour tokens; components use only these, never raw palette values.
@@ -121,7 +124,7 @@ pub struct Motion {
 }
 
 /// Terminal palette: the 16 ANSI colours plus defaults, minted at one tonal level.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct TerminalColors {
     pub foreground: Hsla,
     /// Bold default-colour text.
@@ -132,6 +135,8 @@ pub struct TerminalColors {
     pub cursor: Hsla,
     pub cursor_text: Hsla,
     pub selection: Hsla,
+    /// Text colour inside a selection; None keeps each cell's own colour.
+    pub selection_foreground: Option<Hsla>,
     /// Normal 0..8 then bright 8..16, in ANSI order.
     pub ansi: [Hsla; 16],
 }
@@ -186,6 +191,10 @@ pub struct Theme {
     pub ui_scale: f32,
     pub color: Colors,
     pub terminal: TerminalColors,
+    /// The palette terminal panes draw with.
+    pub terminal_theme: TerminalTheme,
+    /// `terminal_theme`'s colours for the current appearance; UI elements keep using `terminal`.
+    pub terminal_palette: TerminalColors,
     pub syntax: SyntaxColors,
     pub typography: Typography,
     pub shape: Shape,
@@ -239,6 +248,7 @@ fn dark_scheme() -> (Colors, TerminalColors, SyntaxColors) {
             cursor: c(0xeb5e43),
             cursor_text: c(0x0b0807),
             selection: c(0x331510),
+            selection_foreground: None,
             // Hues follow Claude Code's dark theme (success, error, warning, permission).
             ansi: [
                 c(0x15110f),
@@ -329,6 +339,7 @@ fn light_scheme() -> (Colors, TerminalColors, SyntaxColors) {
             cursor: c(0xc6361e),
             cursor_text: c(0xfefdfc),
             selection: c(0xffdbcf),
+            selection_foreground: None,
             // Claude Code's light hues; white and bright white are greys, as VS Code's light
             // terminal has them, so text a program prints in white stays readable.
             ansi: [
@@ -403,6 +414,8 @@ impl Theme {
             appearance,
             ui_scale: 1.,
             color,
+            terminal_theme: TerminalTheme::default(),
+            terminal_palette: terminal.clone(),
             terminal,
             syntax,
             typography: Typography {
@@ -437,6 +450,13 @@ impl Theme {
         self.color = color;
         self.terminal = terminal;
         self.syntax = syntax;
+        self.terminal_palette = self.terminal_theme.palette(appearance);
+    }
+
+    /// Switches terminal panes to `theme`, in the current appearance.
+    pub fn set_terminal_theme(&mut self, theme: TerminalTheme) {
+        self.terminal_theme = theme;
+        self.terminal_palette = theme.palette(self.appearance);
     }
 
     pub fn is_dark(&self) -> bool {
@@ -732,6 +752,16 @@ mod tests {
                 assert_reads(&format!("ansi {i}"), fg, bg, min, &t);
             }
         }
+    }
+
+    #[test]
+    fn switching_terminal_theme_keeps_it_across_appearance_changes() {
+        let mut theme = Theme::dark(false);
+        theme.set_terminal_theme(TerminalTheme::Catppuccin);
+        theme.set_appearance(Appearance::Light);
+        assert_eq!(theme.terminal_theme, TerminalTheme::Catppuccin);
+        assert!(theme.terminal_palette == TerminalTheme::Catppuccin.palette(Appearance::Light));
+        assert!(theme.terminal == scheme(Appearance::Light).1);
     }
 
     #[test]
