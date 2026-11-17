@@ -195,6 +195,8 @@ pub struct Theme {
     pub terminal_theme: TerminalTheme,
     /// `terminal_theme`'s colours for the current appearance; UI elements keep using `terminal`.
     pub terminal_palette: TerminalColors,
+    /// UI colours for things drawn inside terminal panes, matched to the terminal palette's light or dark.
+    pub terminal_ui: Colors,
     pub syntax: SyntaxColors,
     pub typography: Typography,
     pub shape: Shape,
@@ -413,6 +415,7 @@ impl Theme {
         Self {
             appearance,
             ui_scale: 1.,
+            terminal_ui: color.clone(),
             color,
             terminal_theme: TerminalTheme::default(),
             terminal_palette: terminal.clone(),
@@ -451,12 +454,14 @@ impl Theme {
         self.terminal = terminal;
         self.syntax = syntax;
         self.terminal_palette = self.terminal_theme.palette(appearance);
+        self.terminal_ui = scheme(self.terminal_theme.minted_for(appearance)).0;
     }
 
     /// Switches terminal panes to `theme`, in the current appearance.
     pub fn set_terminal_theme(&mut self, theme: TerminalTheme) {
         self.terminal_theme = theme;
         self.terminal_palette = theme.palette(self.appearance);
+        self.terminal_ui = scheme(theme.minted_for(self.appearance)).0;
     }
 
     pub fn is_dark(&self) -> bool {
@@ -765,6 +770,17 @@ mod tests {
             TerminalTheme::Catppuccin.palette(Appearance::Light)
         );
         assert_eq!(theme.terminal, scheme(Appearance::Light).1);
+    }
+
+    #[test]
+    fn a_dark_only_terminal_theme_keeps_dark_ui_colours_in_light_mode() {
+        let mut theme = Theme::light(false);
+        theme.set_terminal_theme(TerminalTheme::Nord);
+        assert_eq!(
+            theme.terminal_ui.success,
+            scheme(Appearance::Dark).0.success
+        );
+        assert_eq!(theme.color.success, scheme(Appearance::Light).0.success);
     }
 
     #[test]

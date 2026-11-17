@@ -433,11 +433,11 @@ impl Element for TerminalElement {
         };
         let theme = cx.theme();
         let palette = theme.terminal_palette.clone();
-        let match_color = theme.color.warning;
+        let match_color = theme.terminal_ui.warning;
         let prompt_colors = (
-            theme.color.success,
-            theme.color.danger,
-            theme.color.content_muted,
+            theme.terminal_ui.success,
+            theme.terminal_ui.danger,
+            theme.terminal_ui.content_muted,
         );
         let font_size = theme.typography.code;
         let font = Font {
