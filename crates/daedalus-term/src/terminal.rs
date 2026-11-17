@@ -543,7 +543,7 @@ impl Terminal {
 
     /// Whether the shell is probably reading its command line, falling back to the foreground process when it emits no marks.
     pub fn shell_editing(&self, shell_in_front: bool) -> bool {
-        shell_in_front && self.exit.is_none() && (self.at_prompt() || !self.prompt_marks)
+        shell_in_front && self.exit.is_none() && (self.at_prompt() || !self.has_prompt_marks())
     }
 
     /// The rows of the soft-wrapped line the cursor is on, or `None` where clicks must not become keys.
