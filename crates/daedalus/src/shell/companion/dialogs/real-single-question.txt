@@ -1,0 +1,20 @@
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Repro
+
+│ This is a repro check for the single-question card. Before you answer, open
+│ this session on your phone: does the chat show the options? Pick what the
+│ phone shows.
+
+❯ 1. Options show on phone
+     The card lists these options and I could tap one
+  2. Needs input, no options
+     The card says Needs input / Open terminal and lists no options
+  3. Couldn't read / cut off
+     The card says Daedalus couldn't read the prompt, or that it is cut off
+  4. No card at all
+     Chat shows no answer card
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
