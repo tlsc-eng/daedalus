@@ -26,6 +26,8 @@ struct HookInput {
     message: Option<String>,
     tool_name: Option<String>,
     tool_input: Option<ToolInput>,
+    /// Set when the hook fires inside a subagent or an in-process teammate.
+    agent_id: Option<String>,
     /// On Stop: the session's background tasks still running.
     #[serde(default)]
     background_tasks: Vec<BackgroundTask>,
@@ -93,6 +95,16 @@ fn tool_notice(tool: Option<&str>) -> NoticeKind {
     NoticeKind::ClaudeNeedsInput {
         message: message.into(),
     }
+}
+
+/// What a tool hook reports, or `None` for a subagent's routine tool call, which must not hide the main session's question.
+fn tool_hook_notice(event: &str, input: &HookInput) -> Option<NoticeKind> {
+    let kind = if event == "claude-tool" {
+        tool_notice(input.tool_name.as_deref())
+    } else {
+        NoticeKind::ClaudeRunning
+    };
+    (kind != NoticeKind::ClaudeRunning || input.agent_id.is_none()).then_some(kind)
 }
 
 /// Claude stops between turns while its background tasks work; it resumes when they report.
@@ -272,8 +284,12 @@ fn notify(args: &[&str]) -> anyhow::Result<()> {
     }
     let kind = match (event.as_deref(), flag("--title")) {
         (Some("claude-stop"), _) => NoticeKind::ClaudeStopped,
-        (Some("claude-running"), _) => NoticeKind::ClaudeRunning,
-        (Some("claude-tool"), _) => tool_notice(hook_input().tool_name.as_deref()),
+        (Some(event @ ("claude-running" | "claude-tool")), _) => {
+            let Some(kind) = tool_hook_notice(event, &hook_input()) else {
+                return Ok(());
+            };
+            kind
+        }
         (Some("claude-needs-input"), _) => NoticeKind::ClaudeNeedsInput {
             message: flag("--message").or_else(hook_message).unwrap_or_default(),
         },
@@ -475,6 +491,43 @@ mod tests {
         ));
         assert_eq!(tool("Bash"), NoticeKind::ClaudeRunning);
         assert_eq!(tool_notice(None), NoticeKind::ClaudeRunning);
+    }
+
+    #[test]
+    fn a_subagents_tool_calls_do_not_mark_the_session_running() {
+        for event in ["claude-tool", "claude-running"] {
+            let input = hook_input(serde_json::json!({"tool_name": "Bash", "agent_id": "a1b2c3"}));
+            assert_eq!(tool_hook_notice(event, &input), None);
+        }
+    }
+
+    #[test]
+    fn the_main_sessions_tool_calls_still_mark_it_running() {
+        for event in ["claude-tool", "claude-running"] {
+            for json in [
+                serde_json::json!({"tool_name": "Bash"}),
+                serde_json::json!({}),
+                serde_json::json!({"agent_type": "reviewer"}),
+            ] {
+                assert_eq!(
+                    tool_hook_notice(event, &hook_input(json)),
+                    Some(NoticeKind::ClaudeRunning)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_question_waits_on_the_user_even_from_a_subagent() {
+        for json in [
+            serde_json::json!({"tool_name": "AskUserQuestion", "agent_id": "a1"}),
+            serde_json::json!({"tool_name": "AskUserQuestion"}),
+        ] {
+            assert!(matches!(
+                tool_hook_notice("claude-tool", &hook_input(json)),
+                Some(NoticeKind::ClaudeNeedsInput { .. })
+            ));
+        }
     }
 
     #[test]

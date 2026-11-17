@@ -657,6 +657,7 @@ mod tests {
     const REAL_TABS_FIRST: &str = include_str!("dialogs/real-tabs-first.txt");
     const REAL_TABS: &str = include_str!("dialogs/real-tabs.txt");
     const REAL_MULTI: &str = include_str!("dialogs/real-multi-select.txt");
+    const REAL_SINGLE: &str = include_str!("dialogs/real-single-question.txt");
 
     fn dialog(screen: &str) -> Dialog {
         parse(&screen.lines().map(str::to_string).collect::<Vec<_>>()).expect("a dialog")
@@ -812,6 +813,36 @@ mod tests {
         assert_eq!(d.options[2].text.as_deref(), Some(""));
         assert!(!d.multi && d.submit.is_none());
         assert_eq!(d.highlight, Some(0));
+    }
+
+    #[test]
+    fn a_real_lone_question_with_a_quoted_title_reads_its_options() {
+        let d = dialog(REAL_SINGLE);
+        assert_eq!(d.kind, DialogKind::Question);
+        assert!(d.tabs.is_empty());
+        assert!(
+            d.title
+                .as_deref()
+                .unwrap()
+                .starts_with("This is a repro check for the single-question card.")
+        );
+        assert_eq!(
+            labels(&d),
+            [
+                "Options show on phone",
+                "Needs input, no options",
+                "Couldn't read / cut off",
+                "No card at all",
+                "Other"
+            ]
+        );
+        assert_eq!(
+            d.options[0].description.as_deref(),
+            Some("The card lists these options and I could tap one")
+        );
+        assert!(d.options[4].input);
+        assert_eq!(d.highlight, Some(0));
+        assert!(!d.partial);
     }
 
     #[test]

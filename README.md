@@ -915,7 +915,8 @@ points at). They go after any of your own on the same events:
   dialogs and agents waiting on you mark it **needs input**. Claude's `idle_prompt` reminder
   does not;
 - `PreToolUse` on every tool marks `AskUserQuestion` and `ExitPlanMode` as **needs input** and any
-  other tool as **running**;
+  other tool as **running**; a subagent's tool calls (hook input with `agent_id`) do not mark it
+  running, so a question stays **needs input** while background agents work;
 - `PreToolUse` and `PostToolUse` on `Edit|MultiEdit|Write`, for reviewing Claude's edits (below);
 - `PostToolUse` on `TodoWrite|ExitPlanMode`, which shows the session's todo progress ("3/7") on
   its terminal tab and its todos and plan in the Sessions list.
