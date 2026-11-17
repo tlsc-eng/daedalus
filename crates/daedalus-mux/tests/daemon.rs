@@ -221,6 +221,33 @@ fn shells_do_not_inherit_the_daemon_environment() {
     assert!(out.contains(&format!("home=[{}]", daemon.home.display())));
 }
 
+fn clicolor_probe(daemon: &Daemon) -> String {
+    let (conn, mut reader) = daemon.connect();
+    let pane = spawn_pane(&conn, &mut reader);
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    conn.send(&ClientMsg::Input {
+        pane,
+        data: b"echo \"clicolor=[${CLICOLOR}] end=[${DAEDALUS_PANE_ID}]\"\r".to_vec(),
+    })
+    .unwrap();
+    read_until(&mut reader, &format!("end=[{pane}]"))
+}
+
+#[test]
+fn new_shells_get_clicolor() {
+    let daemon = Daemon::start("clicolor");
+    let out = clicolor_probe(&daemon);
+    assert!(out.contains("clicolor=[1]"), "{out}");
+}
+
+#[test]
+fn a_clicolor_from_zshrc_wins() {
+    let daemon = Daemon::start("clicolor-rc");
+    std::fs::write(daemon.home.join(".zshrc"), "export CLICOLOR=0\n").unwrap();
+    let out = clicolor_probe(&daemon);
+    assert!(out.contains("clicolor=[0]"), "{out}");
+}
+
 /// The window publishes its IDE port in ide.env; each new shell reads it, nothing else from it.
 #[test]
 fn new_shells_get_the_ide_port_from_ide_env() {

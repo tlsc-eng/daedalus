@@ -79,6 +79,11 @@ impl Pane {
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // macOS ls and friends print plain text unless this is set.
+        cmd.env(
+            "CLICOLOR",
+            std::env::var_os("CLICOLOR").unwrap_or_else(|| "1".into()),
+        );
         cmd.env("TERM_PROGRAM", "daedalus");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         cmd.env("DAEDALUS_PANE_ID", id.to_string());
