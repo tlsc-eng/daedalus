@@ -27,6 +27,7 @@ impl Daemon {
             .env("DAEDALUS_NOTIFY_AFTER_SECS", "0")
             .env("SHELL", "/bin/zsh")
             .env_remove("CLICOLOR")
+            .env_remove("DAEDALUS_PROMPT")
             .envs(env.iter().copied())
             .spawn()
             .unwrap();
@@ -575,6 +576,23 @@ fn a_detached_head_shows_seven_characters() {
         "]42",
     );
     assert!(out.contains("%F{5}0123456%f"), "{out}");
+}
+
+#[test]
+fn a_fifo_for_head_does_not_hang_the_prompt() {
+    let daemon = Daemon::start("prompt-fifo");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let fifo = std::ffi::CString::new(repo.join(".git/HEAD").to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("p=[%F{4}%~%f %"), "{out}");
 }
 
 #[test]
