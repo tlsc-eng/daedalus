@@ -230,6 +230,7 @@ const INHERITED: &[&str] = &[
     "TMPDIR",
     "LANG",
     "SSH_AUTH_SOCK",
+    "DAEDALUS_PROMPT",
     "__CF_USER_TEXT_ENCODING",
 ];
 

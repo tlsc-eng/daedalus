@@ -89,7 +89,9 @@ sessions alive:
 - zsh shell integration (OSC 133) marks commands; one that runs longer than 10 seconds posts a
   notification when it finishes. `DAEDALUS_NOTIFY_AFTER_SECS` changes the threshold and
   `DAEDALUS_SHELL_INTEGRATION=0` turns the integration off; set them in the environment the daemon
-  starts from, e.g. `open -a Daedalus --env DAEDALUS_NOTIFY_AFTER_SECS=30`.
+  starts from, e.g. `open -a Daedalus --env DAEDALUS_NOTIFY_AFTER_SECS=30`. If the prompt is zsh's or macOS's stock one, Daedalus colours it (cwd, git branch,
+  exit status); any prompt you set (PROMPT/PS1, oh-my-zsh, starship, p10k) is kept, and
+  `DAEDALUS_PROMPT=0` (in the daemon environment or ~/.zshenv) keeps the stock one.
 - With those marks each prompt gets a dot in the left margin (the success colour, red after a
   non-zero exit, an outline while the command runs); `cmd-up` and `cmd-down` scroll the previous
   or next prompt to the top, and **Copy Last Command Output** (right-click menu or command

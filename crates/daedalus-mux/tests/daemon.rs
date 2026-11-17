@@ -27,6 +27,7 @@ impl Daemon {
             .env("DAEDALUS_NOTIFY_AFTER_SECS", "0")
             .env("SHELL", "/bin/zsh")
             .env_remove("CLICOLOR")
+            .env_remove("DAEDALUS_PROMPT")
             .envs(env.iter().copied())
             .spawn()
             .unwrap();
@@ -391,6 +392,207 @@ fn zsh_integration_reports_finished_commands() {
             break;
         }
     }
+}
+
+/// Spawns a pane in `cwd`, runs `line` and returns the output up to `needle`.
+fn run_in_pane(daemon: &Daemon, cwd: &std::path::Path, line: &str, needle: &str) -> String {
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: cwd.to_path_buf(),
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    conn.send(&ClientMsg::Input {
+        pane,
+        data: format!("{line}\r").into_bytes(),
+    })
+    .unwrap();
+    read_until(&mut reader, needle)
+}
+
+#[test]
+fn zsh_gets_a_coloured_prompt_when_none_is_set() {
+    let daemon = Daemon::start("prompt");
+    let probe = r#"print -r -- "p=[$PROMPT]""#;
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        probe,
+        "p=[%F{4}%~%f %F{2}%#%f ]",
+    );
+    assert!(out.contains("p=[%F{4}%~%f %F{2}%#%f ]"), "{out}");
+    let (conn, mut reader) = daemon.connect();
+    let pane = spawn_pane(&conn, &mut reader);
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    for _ in 0..2 {
+        conn.send(&ClientMsg::Input {
+            pane,
+            data: format!("{probe}\r").into_bytes(),
+        })
+        .unwrap();
+    }
+    read_until(&mut reader, "p=[%F{4}%~%f %(?.%F{2}.%F{1})%#%f ]");
+}
+
+#[test]
+fn a_prompt_from_zshrc_is_kept() {
+    let daemon = Daemon::start("prompt-rc");
+    std::fs::write(daemon.home.join(".zshrc"), "PROMPT='mine> '\n").unwrap();
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]""#,
+        "p=[mine> ]",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn daedalus_prompt_0_keeps_the_stock_prompt() {
+    let daemon = Daemon::start("prompt-off");
+    std::fs::write(daemon.home.join(".zshenv"), "export DAEDALUS_PROMPT=0\n").unwrap();
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn the_prompt_shows_the_git_branch() {
+    let daemon = Daemon::start("prompt-git");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature-x\n").unwrap();
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: repo,
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    read_until(&mut reader, "feature-x");
+}
+
+#[test]
+fn the_prompt_shows_a_worktree_branch() {
+    let daemon = Daemon::start("prompt-wt");
+    let gitdir = daemon.home.join("gitdirs/wt");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/wt-y\n").unwrap();
+    let wt = daemon.home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: wt,
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    read_until(&mut reader, "wt-y");
+}
+
+#[test]
+fn daedalus_prompt_0_in_the_daemon_environment_keeps_the_stock_prompt() {
+    let daemon = Daemon::start_with("prompt-env", &[("DAEDALUS_PROMPT", "0")]);
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn a_hostile_branch_name_is_sanitised() {
+    let daemon = Daemon::start("prompt-evil");
+    std::fs::write(daemon.home.join(".zshrc"), "setopt prompt_subst\n").unwrap();
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let pwned = daemon.home.join("pwned");
+    std::fs::write(
+        repo.join(".git/HEAD"),
+        format!("ref: refs/heads/$(touch {})%F{{1}}\n", pwned.display()),
+    )
+    .unwrap();
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("??touch?"), "{out}");
+    assert!(!out.contains("%F{1}"), "{out}");
+    assert!(!pwned.exists(), "branch name was executed");
+}
+
+#[test]
+fn a_prompt_set_after_the_first_prompt_is_kept() {
+    let daemon = Daemon::start("prompt-late");
+    let (conn, mut reader) = daemon.connect();
+    let pane = spawn_pane(&conn, &mut reader);
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    for line in ["PROMPT='x> '", "true", r#"print -r -- "p=[$PROMPT]""#] {
+        conn.send(&ClientMsg::Input {
+            pane,
+            data: format!("{line}\r").into_bytes(),
+        })
+        .unwrap();
+    }
+    read_until(&mut reader, "p=[x> ]");
+}
+
+#[test]
+fn a_detached_head_shows_seven_characters() {
+    let daemon = Daemon::start("prompt-detached");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".git/HEAD"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .unwrap();
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("%F{5}0123456%f"), "{out}");
+}
+
+#[test]
+fn a_fifo_for_head_does_not_hang_the_prompt() {
+    let daemon = Daemon::start("prompt-fifo");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let fifo = std::ffi::CString::new(repo.join(".git/HEAD").to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("p=[%F{4}%~%f %"), "{out}");
 }
 
 #[test]
