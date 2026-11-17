@@ -26,6 +26,7 @@ impl Daemon {
             .env("DAEDALUS_TEST_SECRET", "leaked")
             .env("DAEDALUS_NOTIFY_AFTER_SECS", "0")
             .env("SHELL", "/bin/zsh")
+            .env_remove("CLICOLOR")
             .envs(env.iter().copied())
             .spawn()
             .unwrap();
@@ -238,6 +239,13 @@ fn new_shells_get_clicolor() {
     let daemon = Daemon::start("clicolor");
     let out = clicolor_probe(&daemon);
     assert!(out.contains("clicolor=[1]"), "{out}");
+}
+
+#[test]
+fn a_clicolor_in_the_daemon_environment_is_kept() {
+    let daemon = Daemon::start_with("clicolor-env", &[("CLICOLOR", "0")]);
+    let out = clicolor_probe(&daemon);
+    assert!(out.contains("clicolor=[0]"), "{out}");
 }
 
 #[test]
