@@ -9,8 +9,10 @@ pub enum TerminalTheme {
 }
 
 impl TerminalTheme {
+    /// Every theme, in the order a picker lists them.
     pub const ALL: [TerminalTheme; 2] = [Self::Tlsc, Self::Catppuccin];
 
+    /// Stable identifier used in settings.
     pub fn id(self) -> &'static str {
         match self {
             Self::Tlsc => "tlsc",
@@ -18,10 +20,12 @@ impl TerminalTheme {
         }
     }
 
+    /// The theme whose [`id`](Self::id) is `id`.
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.id() == id)
     }
 
+    /// Display name for pickers.
     pub fn name(self) -> &'static str {
         match self {
             Self::Tlsc => "tlsc",
@@ -29,6 +33,7 @@ impl TerminalTheme {
         }
     }
 
+    /// The colours this theme uses in `appearance`.
     pub fn palette(self, appearance: Appearance) -> TerminalColors {
         match (self, appearance) {
             (Self::Tlsc, a) => scheme(a).1,
@@ -103,7 +108,7 @@ mod tests {
     fn tlsc_is_the_default_and_matches_the_app_palette() {
         assert_eq!(TerminalTheme::default(), TerminalTheme::Tlsc);
         for a in BOTH {
-            assert!(TerminalTheme::Tlsc.palette(a) == scheme(a).1);
+            assert_eq!(TerminalTheme::Tlsc.palette(a), scheme(a).1);
         }
     }
 

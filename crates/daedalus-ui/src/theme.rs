@@ -123,8 +123,8 @@ pub struct Motion {
     pub indicator_hold: Duration,
 }
 
-/// Terminal palette: the 16 ANSI colours plus defaults, minted at one tonal level.
-#[derive(Clone, PartialEq)]
+/// Terminal palette: the 16 ANSI colours plus defaults.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalColors {
     pub foreground: Hsla,
     /// Bold default-colour text.
@@ -760,8 +760,11 @@ mod tests {
         theme.set_terminal_theme(TerminalTheme::Catppuccin);
         theme.set_appearance(Appearance::Light);
         assert_eq!(theme.terminal_theme, TerminalTheme::Catppuccin);
-        assert!(theme.terminal_palette == TerminalTheme::Catppuccin.palette(Appearance::Light));
-        assert!(theme.terminal == scheme(Appearance::Light).1);
+        assert_eq!(
+            theme.terminal_palette,
+            TerminalTheme::Catppuccin.palette(Appearance::Light)
+        );
+        assert_eq!(theme.terminal, scheme(Appearance::Light).1);
     }
 
     #[test]
