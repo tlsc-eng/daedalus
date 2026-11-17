@@ -1,7 +1,9 @@
 The terminal palettes in crates/daedalus-ui/src/theme/terminal_themes.rs come from the Ghostty theme
 files in iTerm2-Color-Schemes (https://github.com/mbadolato/iTerm2-Color-Schemes), commit c806b1b,
 ghostty/. Faint text colours are derived.
-Tokyo Night colours from https://github.com/folke/tokyonight.nvim, Apache License 2.0, the licence Daedalus itself uses.
+
+Tokyo Night colours from https://github.com/folke/tokyonight.nvim, Apache License 2.0, the licence
+Daedalus itself uses.
 
 Copyright (c) 2011 to Present Mark Badolato (iTerm2-Color-Schemes)
 Copyright (c) 2021 Catppuccin (https://github.com/catppuccin/catppuccin)

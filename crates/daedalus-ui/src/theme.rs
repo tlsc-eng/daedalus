@@ -784,6 +784,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ui_follows_the_appearance_until_a_dark_only_theme_is_chosen() {
+        let mut theme = Theme::dark(false);
+        theme.set_appearance(Appearance::Light);
+        assert_eq!(
+            theme.terminal_ui.success,
+            scheme(Appearance::Light).0.success
+        );
+        theme.set_terminal_theme(TerminalTheme::Nord);
+        assert_eq!(
+            theme.terminal_ui.success,
+            scheme(Appearance::Dark).0.success
+        );
+    }
+
+    #[test]
     fn switching_appearance_keeps_zoom_and_motion() {
         let mut theme = Theme::dark(true);
         theme.set_code_zoom(3);

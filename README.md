@@ -1529,6 +1529,6 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 Bundled third-party assets keep their own licences: the Geist fonts (SIL OFL,
 `crates/daedalus-ui/assets/fonts/OFL.txt`), seti-ui icons (MIT,
-`crates/daedalus-ui/assets/icons/LICENSE-seti.md`), terminal colour themes (MIT,
+`crates/daedalus-ui/assets/icons/LICENSE-seti.md`), terminal colour themes (MIT and Apache 2.0,
 `crates/daedalus-ui/assets/LICENSE-terminal-themes.md`) and Mermaid (MIT,
 `crates/daedalus-preview/assets/LICENSE-mermaid`).
