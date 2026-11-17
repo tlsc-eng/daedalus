@@ -1185,6 +1185,13 @@ mod tests {
     }
 
     #[test]
+    fn shell_editing_is_false_after_the_shell_exits() {
+        let (mut t, _) = terminal();
+        t.handle(PaneEvent::Exited(Some(0)), &Theme::dark(false).terminal);
+        assert!(!t.shell_editing(true));
+    }
+
+    #[test]
     fn a_click_on_the_input_line_sends_left_arrows_to_it() {
         let (mut t, _) = terminal();
         prompt_with(&mut t, "% echo hello world");
