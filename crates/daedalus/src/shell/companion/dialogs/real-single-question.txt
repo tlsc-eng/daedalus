@@ -1,3 +1,7 @@
+
+
+⏺ fork(Capture single-question dialog frame)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
 ────────────────────────────────────────────────────────────────────────────────
  ☐ Repro
 
