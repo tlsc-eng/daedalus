@@ -393,6 +393,120 @@ fn zsh_integration_reports_finished_commands() {
     }
 }
 
+/// Spawns a pane in `cwd`, runs `line` and returns the output up to `needle`.
+fn run_in_pane(daemon: &Daemon, cwd: &std::path::Path, line: &str, needle: &str) -> String {
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: cwd.to_path_buf(),
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    conn.send(&ClientMsg::Input {
+        pane,
+        data: format!("{line}\r").into_bytes(),
+    })
+    .unwrap();
+    read_until(&mut reader, needle)
+}
+
+#[test]
+fn zsh_gets_a_coloured_prompt_when_none_is_set() {
+    let daemon = Daemon::start("prompt");
+    let probe = r#"print -r -- "p=[$PROMPT]""#;
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        probe,
+        "p=[%F{4}%~%f %F{2}%#%f ]",
+    );
+    assert!(out.contains("p=[%F{4}%~%f %F{2}%#%f ]"), "{out}");
+    let (conn, mut reader) = daemon.connect();
+    let pane = spawn_pane(&conn, &mut reader);
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    for _ in 0..2 {
+        conn.send(&ClientMsg::Input {
+            pane,
+            data: format!("{probe}\r").into_bytes(),
+        })
+        .unwrap();
+    }
+    read_until(&mut reader, "p=[%F{4}%~%f %(?.%F{2}.%F{1})%#%f ]");
+}
+
+#[test]
+fn a_prompt_from_zshrc_is_kept() {
+    let daemon = Daemon::start("prompt-rc");
+    std::fs::write(daemon.home.join(".zshrc"), "PROMPT='mine> '\n").unwrap();
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]""#,
+        "p=[mine> ]",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn daedalus_prompt_0_keeps_the_stock_prompt() {
+    let daemon = Daemon::start("prompt-off");
+    std::fs::write(daemon.home.join(".zshenv"), "export DAEDALUS_PROMPT=0\n").unwrap();
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn the_prompt_shows_the_git_branch() {
+    let daemon = Daemon::start("prompt-git");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature-x\n").unwrap();
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: repo,
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    read_until(&mut reader, "feature-x");
+}
+
+#[test]
+fn the_prompt_shows_a_worktree_branch() {
+    let daemon = Daemon::start("prompt-wt");
+    let gitdir = daemon.home.join("gitdirs/wt");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/wt-y\n").unwrap();
+    let wt = daemon.home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+    let (conn, mut reader) = daemon.connect();
+    conn.send(&ClientMsg::Spawn {
+        cwd: wt,
+        rows: 24,
+        cols: 80,
+    })
+    .unwrap();
+    let ServerMsg::Spawned { pane } = next(&mut reader) else {
+        panic!("expected Spawned")
+    };
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    read_until(&mut reader, "wt-y");
+}
+
 #[test]
 fn notices_wait_for_a_subscriber() {
     let daemon = Daemon::start("backlog");

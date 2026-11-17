@@ -1,5 +1,6 @@
 # Daedalus shell integration. Marks prompts and commands with OSC 133 so Daedalus can tell when a long
 # command finishes. Set DAEDALUS_SHELL_INTEGRATION=0 in the environment to turn it off.
+# It also colours the stock prompt; DAEDALUS_PROMPT=0 keeps the plain one.
 if [[ -n "${DAEDALUS_ORIG_ZDOTDIR+x}" ]]; then
   ZDOTDIR="$DAEDALUS_ORIG_ZDOTDIR"
   unset DAEDALUS_ORIG_ZDOTDIR
@@ -21,7 +22,50 @@ if [[ -o interactive ]]; then
     fi
     builtin printf '\e]133;A\a'
   }
+  # Reads HEAD without running git, which on a Mac without the developer tools opens an installer.
+  _daedalus_branch() {
+    emulate -L zsh
+    local dir=$PWD head gitdir
+    while [[ ! -e $dir/.git ]]; do
+      [[ -z $dir ]] && return 1
+      dir=${dir%/*}
+    done
+    gitdir=$dir/.git
+    if [[ -f $gitdir ]]; then
+      gitdir=$(<$gitdir); gitdir=${gitdir#gitdir: }
+      [[ $gitdir == /* ]] || gitdir=$dir/$gitdir
+    fi
+    [[ -r $gitdir/HEAD ]] || return 1
+    head=$(<$gitdir/HEAD)
+    if [[ $head == 'ref: refs/heads/'* ]]; then
+      REPLY=${head#ref: refs/heads/}
+    else
+      REPLY=${head[1,7]}
+    fi
+    REPLY=${REPLY//[^[:alnum:]._\/+@#-]/?}
+  }
+  _daedalus_prompt() {
+    emulate -L zsh
+    local mark='%(?.%F{2}.%F{1})'
+    if [[ -z ${_daedalus_ps1+x} ]]; then
+      # Only zsh's and macOS's stock prompts count as unset; any other prompt is the user's choice.
+      if [[ ${DAEDALUS_PROMPT:-1} == 0 || ( $PROMPT != '%m%# ' && $PROMPT != '%n@%m %1~ %# ' ) ]]; then
+        precmd_functions=(${precmd_functions:#_daedalus_prompt})
+        return
+      fi
+      # The status left by startup files is not from a command the user ran.
+      mark='%F{2}'
+    elif [[ $PROMPT != "$_daedalus_ps1" ]]; then
+      # A prompt theme took over after the first prompt; it owns PROMPT from now on.
+      precmd_functions=(${precmd_functions:#_daedalus_prompt})
+      return
+    fi
+    local REPLY branch=
+    _daedalus_branch && branch=" %F{5}$REPLY%f"
+    PROMPT="%F{4}%~%f$branch $mark%#%f "
+    _daedalus_ps1=$PROMPT
+  }
   # First in line, so $? is the command's status and not another hook's.
-  precmd_functions=(_daedalus_precmd $precmd_functions)
+  precmd_functions=(_daedalus_precmd _daedalus_prompt $precmd_functions)
   preexec_functions=(_daedalus_preexec $preexec_functions)
 fi
