@@ -81,7 +81,7 @@ struct RowKey {
     line_height: Pixels,
     font_size: Pixels,
     font: SharedString,
-    palette: [Hsla; 23],
+    palette: [Hsla; 24],
     display_offset: usize,
     selection: Option<SelectionRange>,
     focused: bool,
@@ -180,8 +180,8 @@ fn match_quads(
         .collect()
 }
 
-fn palette_key(p: &TerminalColors) -> [Hsla; 23] {
-    let mut key = [p.foreground; 23];
+fn palette_key(p: &TerminalColors) -> [Hsla; 24] {
+    let mut key = [p.foreground; 24];
     key[1..7].copy_from_slice(&[
         p.bright_foreground,
         p.dim_foreground,
@@ -190,8 +190,13 @@ fn palette_key(p: &TerminalColors) -> [Hsla; 23] {
         p.cursor_text,
         p.selection,
     ]);
-    key[7..].copy_from_slice(&p.ansi);
+    key[7..23].copy_from_slice(&p.ansi);
+    key[23] = p.selection_foreground.unwrap_or_default();
     key
+}
+
+fn selection_colours(fg: Hsla, p: &TerminalColors) -> (Hsla, Hsla) {
+    (p.selection_foreground.unwrap_or(fg), p.selection)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -282,7 +287,7 @@ impl RowBuilder<'_> {
                 .selection
                 .is_some_and(|s| s.contains(GridPoint::new(line, Column(col))))
             {
-                bg = palette.selection;
+                (fg, bg) = selection_colours(fg, palette);
             }
 
             match &mut bg_run {
@@ -427,7 +432,7 @@ impl Element for TerminalElement {
             rebuilt: 0,
         };
         let theme = cx.theme();
-        let palette = theme.terminal.clone();
+        let palette = theme.terminal_palette.clone();
         let match_color = theme.color.warning;
         let prompt_colors = (
             theme.color.success,
@@ -758,6 +763,15 @@ mod tests {
     fn full_damage_rebuilds_everything() {
         let mut cache = warm(key());
         assert_eq!(rebuilt(&mut cache, key(), Damage::Full), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn selected_text_uses_the_theme_selection_colour() {
+        let (red, blue) = (gpui::red(), gpui::blue());
+        let mut p = Theme::dark(false).terminal;
+        assert_eq!(selection_colours(red, &p), (red, p.selection));
+        p.selection_foreground = Some(blue);
+        assert_eq!(selection_colours(red, &p), (blue, p.selection));
     }
 
     #[test]

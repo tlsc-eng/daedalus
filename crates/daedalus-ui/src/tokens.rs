@@ -74,6 +74,7 @@ fn appearance(theme: &Theme) -> Value {
         cursor,
         cursor_text,
         selection,
+        selection_foreground: _,
         ansi,
     } = &theme.terminal;
     json!({

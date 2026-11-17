@@ -23,7 +23,7 @@ pub use logo::{Glyph, Lockup};
 pub use menu::{ContextMenu, MenuItem};
 pub use theme::{
     Appearance, CODE_SIZE, CODE_ZOOM, Colors, Motion, Shape, Size, Space, SyntaxColors,
-    TerminalColors, Theme, Typography, UI_ZOOM,
+    TerminalColors, TerminalTheme, Theme, Typography, UI_ZOOM,
 };
 
 use gpui::{App, Styled, WindowAppearance};
@@ -47,6 +47,14 @@ pub fn appearance_for(appearance: WindowAppearance) -> Appearance {
     match appearance {
         WindowAppearance::Light | WindowAppearance::VibrantLight => Appearance::Light,
         WindowAppearance::Dark | WindowAppearance::VibrantDark => Appearance::Dark,
+    }
+}
+
+/// Recolours every terminal, unless `theme` is already the one shown.
+pub fn set_terminal_theme(theme: TerminalTheme, cx: &mut App) {
+    if cx.theme().terminal_theme != theme {
+        cx.global_mut::<Theme>().set_terminal_theme(theme);
+        cx.refresh_windows();
     }
 }
 
