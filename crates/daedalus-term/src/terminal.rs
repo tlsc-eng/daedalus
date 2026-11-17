@@ -99,6 +99,8 @@ pub struct Terminal {
     probe_out: bool,
     /// The shell drew a prompt (OSC 133 `A`) and has not started a command (`C`) since.
     at_prompt: bool,
+    /// The shell has emitted at least one OSC 133 prompt mark, so `at_prompt` can be trusted.
+    prompt_marks: bool,
 }
 
 /// Why the last command's output cannot be copied.
@@ -156,6 +158,7 @@ impl Terminal {
             dropped: 0,
             probe_out: false,
             at_prompt: false,
+            prompt_marks: false,
         }
     }
 
@@ -226,6 +229,7 @@ impl Terminal {
                 }
                 self.prompt_start = Some(self.cursor_abs());
                 self.at_prompt = true;
+                self.prompt_marks = true;
             }
             Mark::Command => self.tag_prompt(true),
             Mark::Output => {
@@ -530,6 +534,16 @@ impl Terminal {
     /// Whether the shell is reading a command line, as its OSC 133 marks tell.
     pub fn at_prompt(&self) -> bool {
         self.at_prompt && self.exit.is_none()
+    }
+
+    /// Whether the shell has ever emitted an OSC 133 prompt mark.
+    pub fn has_prompt_marks(&self) -> bool {
+        self.prompt_marks
+    }
+
+    /// Whether the shell is probably reading its command line, falling back to the foreground process when it emits no marks.
+    pub fn shell_editing(&self, shell_in_front: bool) -> bool {
+        shell_in_front && self.exit.is_none() && (self.at_prompt() || !self.prompt_marks)
     }
 
     /// The rows of the soft-wrapped line the cursor is on, or `None` where clicks must not become keys.
@@ -1144,6 +1158,30 @@ mod tests {
         let (mut alt, _) = terminal();
         feed(&mut alt, b"\x1b[?1049h\x1b]133;A\x07");
         assert!(!alt.at_prompt());
+    }
+
+    #[test]
+    fn has_prompt_marks_is_false_until_a_prompt_mark() {
+        let (mut t, _) = terminal();
+        assert!(!t.has_prompt_marks());
+        feed(&mut t, b"\x1b]133;A\x07");
+        assert!(t.has_prompt_marks());
+    }
+
+    #[test]
+    fn shell_editing_without_marks_trusts_the_shell_in_front() {
+        let (t, _) = terminal();
+        assert!(t.shell_editing(true));
+        assert!(!t.shell_editing(false));
+    }
+
+    #[test]
+    fn shell_editing_with_marks_follows_at_prompt() {
+        let (mut t, _) = terminal();
+        feed(&mut t, b"\x1b]133;A\x07");
+        assert!(t.shell_editing(true));
+        feed(&mut t, b"\x1b]133;C\x07");
+        assert!(!t.shell_editing(true));
     }
 
     #[test]

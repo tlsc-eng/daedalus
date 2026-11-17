@@ -67,6 +67,9 @@ const STALE_POLL: Duration = Duration::from_secs(1);
 
 const SESSION_LOST: &[u8] = b"\x1b[2m[previous session ended; started a new shell]\x1b[0m\r\n";
 
+/// How long the "Copied" pill stays after copy-on-select.
+const COPIED_FLASH: Duration = Duration::from_millis(1200);
+
 /// New output re-runs an open search at most this often; a full scrollback scan takes ~10 ms.
 const SEARCH_RERUN: Duration = Duration::from_millis(150);
 
@@ -244,6 +247,8 @@ pub struct TerminalView {
     /// A dismissed find bar, still drawn while it fades out.
     find_closing: Option<(FindBar, Closing)>,
     find_generation: u64,
+    copied: bool,
+    copied_generation: u64,
     /// Query and toggles of the last closed find bar, restored when it reopens.
     last_find: Option<(String, bool, bool)>,
     /// The button whose press went to the program, so its release does too.
@@ -298,6 +303,8 @@ impl TerminalView {
             find_opening: None,
             find_closing: None,
             find_generation: 0,
+            copied: false,
+            copied_generation: 0,
             last_find: None,
             mouse_press: None,
             mouse_cell: None,
@@ -1043,7 +1050,7 @@ impl TerminalView {
 
     fn selection_deletion(&self) -> Option<Vec<u8>> {
         let terminal = self.terminal.as_ref()?;
-        if terminal.at_prompt() && self.shell_in_front() {
+        if terminal.shell_editing(self.shell_in_front()) {
             terminal.delete_selection_keys()
         } else {
             None
@@ -1276,7 +1283,7 @@ impl TerminalView {
                 let mods = &event.modifiers;
                 let plain =
                     event.click_count == 1 && !(mods.shift || mods.platform || mods.control);
-                if plain && (terminal.at_prompt() && shell_in_front || mods.alt) {
+                if plain && (terminal.shell_editing(shell_in_front) || mods.alt) {
                     let (col, row) = self.cell_position(event.position);
                     let terminal = self.terminal.as_ref().expect("checked above");
                     let (point, side) = terminal.point_at(col, row);
@@ -1293,8 +1300,26 @@ impl TerminalView {
                 && !text.trim().is_empty()
             {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.flash_copied(cx);
             }
         }
+    }
+
+    fn flash_copied(&mut self, cx: &mut Context<Self>) {
+        self.copied_generation += 1;
+        let generation = self.copied_generation;
+        self.copied = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FLASH).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_generation == generation {
+                    this.copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1929,9 +1954,29 @@ impl Render for TerminalView {
             div()
                 .flex_1()
                 .min_h_0()
+                .relative()
                 .p(px(8.))
                 .pl(px(PROMPT_GUTTER))
-                .child(TerminalElement::new(cx.entity(), focused)),
+                .child(TerminalElement::new(cx.entity(), focused))
+                .when(self.copied, |d| {
+                    let t = cx.theme();
+                    d.child(
+                        div()
+                            .absolute()
+                            .bottom(px(10.))
+                            .right(px(12.))
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(t.color.surface)
+                            .border_1()
+                            .border_color(t.color.border)
+                            .rounded(t.shape.radius_control)
+                            .shadow_md()
+                            .text_size(t.typography.caption)
+                            .text_color(t.color.content_muted)
+                            .child("Copied"),
+                    )
+                }),
         )
         .children(self.render_status(cx))
         .children(self.render_lease(cx))
