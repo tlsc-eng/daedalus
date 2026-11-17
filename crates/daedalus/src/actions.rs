@@ -194,6 +194,11 @@ pub struct SelectTab(pub usize);
 #[action(namespace = daedalus, no_json)]
 pub struct OpenRecentProject(pub PathBuf);
 
+/// Switches terminal panes to a colour theme.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = daedalus, no_json)]
+pub struct SetTerminalTheme(pub daedalus_ui::TerminalTheme);
+
 /// The entry of the open code action menu to run.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = daedalus, no_json)]

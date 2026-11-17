@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use daedalus_editor::EditorView;
 use daedalus_lsp::{Position, Symbol, symbol_kind_label};
 use daedalus_ui::motion::{self, Closing, Glide};
-use daedalus_ui::{ActiveTheme, InputEvent, TextInput};
+use daedalus_ui::{ActiveTheme, InputEvent, TerminalTheme, TextInput};
 use gpui::{
     Action, Animation, AnyElement, ClickEvent, Context, Entity, Focusable, FontWeight,
     HighlightStyle, MouseButton, SharedString, StyledText, Subscription, Task, Window, div,
@@ -636,6 +636,30 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ),
         ("Theme: light", Box::new(actions::ThemeLight)),
         ("Theme: dark", Box::new(actions::ThemeDark)),
+        (
+            "Terminal theme: tlsc",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::Tlsc)),
+        ),
+        (
+            "Terminal theme: Catppuccin",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::Catppuccin)),
+        ),
+        (
+            "Terminal theme: Tokyo Night",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::TokyoNight)),
+        ),
+        (
+            "Terminal theme: Gruvbox",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::Gruvbox)),
+        ),
+        (
+            "Terminal theme: Dracula (dark only)",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::Dracula)),
+        ),
+        (
+            "Terminal theme: Nord (dark only)",
+            Box::new(actions::SetTerminalTheme(TerminalTheme::Nord)),
+        ),
         ("Open settings", Box::new(actions::OpenSettings)),
         ("Open settings (JSON)", Box::new(actions::OpenSettingsJson)),
         (
@@ -2170,6 +2194,19 @@ mod tests {
             "daedalus::WindowZoomReset",
         ] {
             assert!(names.contains(&action), "{action}");
+        }
+    }
+
+    #[test]
+    fn every_terminal_theme_has_a_palette_command() {
+        let commands = commands();
+        for t in TerminalTheme::ALL {
+            assert!(
+                commands
+                    .iter()
+                    .any(|(_, a)| a.partial_eq(&actions::SetTerminalTheme(t))),
+                "{t:?}"
+            );
         }
     }
 

@@ -1332,6 +1332,7 @@ Daedalus applies it as soon as you save:
   },
   "[markdown]": { "trim_trailing_whitespace": false },   // per language, by VS Code's id
   "theme": "system",                 // "system", "light" or "dark"
+  "terminal.theme": "tlsc",          // terminal colours, see below
   "ide_integration": false,
   "git": { "autofetch": true },      // fetch every three minutes; off by default, as in VS Code
   "git.inline_blame": false,         // hide the blame caption on the cursor line; on by default
@@ -1362,6 +1363,11 @@ once the file has it. Each `lsp` entry goes to that server as its `initializatio
 object), and is sent again with `workspace/didChangeConfiguration` when the file changes.
 Problems (an unknown key, a wrong type) are listed in a toast and in `app.log` while the rest
 applies; a file that is not valid JSON leaves the settings in force as they were.
+
+`terminal.theme` sets the terminal colours: `tlsc` (the default), `catppuccin`, `tokyo-night`,
+`gruvbox`, `dracula` or `nord`. Pick one in the Settings tab or with the palette's `Terminal
+theme:` commands, which edit settings.json. Each follows the light or dark appearance, except
+Dracula and Nord, which stay dark.
 
 While settings.json, a project's `.daedalus/settings.json` or keymap.json is open in an editor,
 Daedalus checks it as you type and shows each problem beside the language servers' diagnostics: a

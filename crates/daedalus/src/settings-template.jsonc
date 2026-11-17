@@ -32,6 +32,7 @@
   // "explorer": { "confirmDragAndDrop": false }, // move tree entries without asking
   // "explorer.excludeGitIgnore": true, // hide git-ignored entries rather than dim them
   // "terminal": { "copy_on_select": false }, // selecting in a terminal no longer copies; ⌘C still does
+  // "terminal.theme": "catppuccin",  // terminal colours: tlsc, catppuccin, tokyo-night, gruvbox, dracula, nord
   // "window": { "zoom_level": 1 },     // interface size in 10% steps, from -3 to 5
   // "eslint": { "fixOnSave": true },   // ⌘S applies ESLint's fixes; needs the project's server
   // // "hooks": false keeps Daedalus's hooks out of Claude Code's settings.json, and its tabs

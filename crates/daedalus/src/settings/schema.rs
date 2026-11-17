@@ -142,6 +142,7 @@ impl Setting {
             ["eslint", "fixOnSave"] => flag(s.eslint_fix_on_save),
             ["claude", "hooks"] => flag(s.claude_hooks),
             ["terminal", "copy_on_select"] => flag(s.terminal_copy_on_select),
+            ["terminal", "theme"] => s.terminal_theme.map(|t| Value::from(t.id())),
             ["companion", "enabled"] => flag(s.companion_enabled),
             ["companion", "push_url"] => s.companion_push_url.clone().map(Value::from),
             ["claude", "profiles"] => (!s.claude_profiles.is_empty()).then(|| {
@@ -537,6 +538,27 @@ pub static SETTINGS: &[Setting] = &[
         also: None,
     },
     Setting {
+        keys: &["terminal", "theme"],
+        aliases: &[],
+        title: "Terminal Theme",
+        description: "Colours for terminal text. Each follows the light or dark appearance; \
+                      dark-only themes stay dark.",
+        group: Group::Workbench,
+        kind: Kind::Choice {
+            options: &[
+                ("tlsc", "tlsc"),
+                ("catppuccin", "Catppuccin"),
+                ("tokyo-night", "Tokyo Night"),
+                ("gruvbox", "Gruvbox"),
+                ("dracula", "Dracula (dark only)"),
+                ("nord", "Nord (dark only)"),
+            ],
+            default: "tlsc",
+        },
+        user_only: true,
+        also: None,
+    },
+    Setting {
         keys: &["companion", "enabled"],
         aliases: &[],
         title: "Phone Companion (Daedalus for iPhone)",
@@ -860,6 +882,7 @@ mod tests {
             format!("hooks {}", s.claude_hooks()),
             format!("companion {}", s.companion_enabled()),
             format!("copy on select {}", s.terminal_copy_on_select()),
+            format!("terminal theme {:?}", s.terminal_theme()),
         ]
     }
 
@@ -898,5 +921,21 @@ mod tests {
                 .unwrap()
                 .ends_with("user's settings.json only.")
         );
+    }
+
+    #[test]
+    fn terminal_theme_choices_list_every_theme() {
+        use daedalus_ui::TerminalTheme;
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.keys == ["terminal", "theme"])
+            .unwrap();
+        let Kind::Choice { options, default } = &setting.kind else {
+            panic!("not a choice");
+        };
+        let ids: Vec<&str> = options.iter().map(|(id, _)| *id).collect();
+        let all: Vec<&str> = TerminalTheme::ALL.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, all);
+        assert_eq!(*default, TerminalTheme::default().id());
     }
 }

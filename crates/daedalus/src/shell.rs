@@ -964,6 +964,11 @@ impl Render for Shell {
                 this.set_theme_choice(daedalus_workspace::ThemeChoice::Dark, w, cx)
             }))
             .on_action(
+                cx.listener(|this, a: &crate::actions::SetTerminalTheme, _, cx| {
+                    this.write_setting_strict(&["terminal", "theme"], a.0.id().into(), cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::actions::OpenKeyboardShortcuts, w, cx| {
                     this.open_shortcuts_ui(w, cx)
                 }),
