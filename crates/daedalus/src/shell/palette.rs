@@ -653,11 +653,11 @@ pub(super) fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
             Box::new(actions::SetTerminalTheme(TerminalTheme::Gruvbox)),
         ),
         (
-            "Terminal theme: Dracula",
+            "Terminal theme: Dracula (dark only)",
             Box::new(actions::SetTerminalTheme(TerminalTheme::Dracula)),
         ),
         (
-            "Terminal theme: Nord",
+            "Terminal theme: Nord (dark only)",
             Box::new(actions::SetTerminalTheme(TerminalTheme::Nord)),
         ),
         ("Open settings", Box::new(actions::OpenSettings)),

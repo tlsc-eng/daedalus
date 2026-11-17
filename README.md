@@ -1355,7 +1355,7 @@ save, word wrap, inlay hints, minimap, theme, Claude Code integration) write onl
 file, changing that key's value where the parser reads it (the last one, if it is spelled twice)
 or adding it at the end of its object, so comments and layout stay. A file Daedalus cannot read
 (a missing comma, a bare `tru`) is never rewritten: the toggle still takes effect, kept in
-`workspace.json`, and a toast says settings.json was not updated. `terminal.theme` picks the terminal colours (`tlsc`, `catppuccin`, `tokyo-night`, `gruvbox`, `dracula` or `nord`) from the Settings tab or the palette's `Terminal theme:` commands; each follows the light or dark appearance, except Dracula and Nord, which stay dark. A key left
+`workspace.json`, and a toast says settings.json was not updated. A key left
 out falls back to the choice `workspace.json` already held, so nothing set before settings.json
 existed is lost. ⌘= and ⌘- write `editor.font_size`, and ⌥⌘= and ⌥⌘- `window.zoom_level`, only
 once the file has it. Each `lsp` entry goes to that server as its `initializationOptions` when it starts, answers its
@@ -1363,6 +1363,11 @@ once the file has it. Each `lsp` entry goes to that server as its `initializatio
 object), and is sent again with `workspace/didChangeConfiguration` when the file changes.
 Problems (an unknown key, a wrong type) are listed in a toast and in `app.log` while the rest
 applies; a file that is not valid JSON leaves the settings in force as they were.
+
+`terminal.theme` sets the terminal colours: `tlsc` (the default), `catppuccin`, `tokyo-night`,
+`gruvbox`, `dracula` or `nord`. Pick one in the Settings tab or with the palette's `Terminal
+theme:` commands, which edit settings.json. Each follows the light or dark appearance, except
+Dracula and Nord, which stay dark.
 
 While settings.json, a project's `.daedalus/settings.json` or keymap.json is open in an editor,
 Daedalus checks it as you type and shows each problem beside the language servers' diagnostics: a
