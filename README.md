@@ -112,6 +112,7 @@ sessions alive:
     trap '__daedalus_preexec' DEBUG
   fi
   ```
+- New shells get `CLICOLOR=1` (coloured `ls`) unless it is already set; an rc file can still change it.
 - If a new version cannot attach to the shells of an older session daemon, their tabs are marked
   **stale**: **Restart sessions** ends those shells and starts new ones, **Keep** leaves them
   running and reconnects once the old daemon exits.
