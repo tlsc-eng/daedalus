@@ -184,6 +184,7 @@ impl Shell {
             },
             cx,
         );
+        daedalus_ui::set_terminal_theme(self.settings.file.terminal_theme(), cx);
     }
 
     /// The changes to settings.json or keymap.json, for the one loop that applies the file.

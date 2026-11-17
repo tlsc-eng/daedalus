@@ -1332,6 +1332,7 @@ Daedalus applies it as soon as you save:
   },
   "[markdown]": { "trim_trailing_whitespace": false },   // per language, by VS Code's id
   "theme": "system",                 // "system", "light" or "dark"
+  "terminal.theme": "tlsc",          // terminal colours, see below
   "ide_integration": false,
   "git": { "autofetch": true },      // fetch every three minutes; off by default, as in VS Code
   "git.inline_blame": false,         // hide the blame caption on the cursor line; on by default
@@ -1354,7 +1355,7 @@ save, word wrap, inlay hints, minimap, theme, Claude Code integration) write onl
 file, changing that key's value where the parser reads it (the last one, if it is spelled twice)
 or adding it at the end of its object, so comments and layout stay. A file Daedalus cannot read
 (a missing comma, a bare `tru`) is never rewritten: the toggle still takes effect, kept in
-`workspace.json`, and a toast says settings.json was not updated. A key left
+`workspace.json`, and a toast says settings.json was not updated. `terminal.theme` picks the terminal colours (`tlsc`, `catppuccin`, `tokyo-night`, `gruvbox`, `dracula` or `nord`) from the Settings tab or the palette's `Terminal theme:` commands; each follows the light or dark appearance, except Dracula and Nord, which stay dark. A key left
 out falls back to the choice `workspace.json` already held, so nothing set before settings.json
 existed is lost. ⌘= and ⌘- write `editor.font_size`, and ⌥⌘= and ⌥⌘- `window.zoom_level`, only
 once the file has it. Each `lsp` entry goes to that server as its `initializationOptions` when it starts, answers its

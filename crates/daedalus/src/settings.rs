@@ -50,6 +50,8 @@ pub struct Settings {
     pub claude_hooks: Option<bool>,
     /// `terminal.copy_on_select`: copies a terminal selection to the clipboard on mouse-up; on unless turned off.
     pub terminal_copy_on_select: Option<bool>,
+    /// `terminal.theme`: the colour palette terminal panes use; tlsc unless set.
+    pub terminal_theme: Option<daedalus_ui::TerminalTheme>,
     /// `companion.enabled`: lets a paired iPhone reach this Mac over Tailscale; off unless turned on.
     pub companion_enabled: Option<bool>,
     /// `companion.push_url`: the ntfy topic URL that gets a push when Claude needs input; unset sends nothing.
@@ -242,6 +244,10 @@ impl Settings {
 
     pub fn terminal_copy_on_select(&self) -> bool {
         self.terminal_copy_on_select.unwrap_or(true)
+    }
+
+    pub fn terminal_theme(&self) -> daedalus_ui::TerminalTheme {
+        self.terminal_theme.unwrap_or_default()
     }
 
     pub fn companion_enabled(&self) -> bool {
@@ -543,6 +549,7 @@ pub fn parse_project(text: &str) -> Result<(Settings, Vec<String>), String> {
             "terminal.copy_on_select",
             s.terminal_copy_on_select.take().is_some(),
         ),
+        ("terminal.theme", s.terminal_theme.take().is_some()),
         ("companion.enabled", s.companion_enabled.take().is_some()),
         ("companion.push_url", s.companion_push_url.take().is_some()),
         (
@@ -799,10 +806,13 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         .iter()
                         .try_for_each(|(name, value)| match name.as_str() {
                             "copy_on_select" => terminal_copy_on_select(&mut settings, value),
+                            "theme" => terminal_theme(&mut settings, value),
                             _ => Err(format!("has no setting \"{name}\"")),
                         })
                 }
-                _ => Err("must be {\"copy_on_select\": true or false}".into()),
+                _ => {
+                    Err("must be {\"copy_on_select\": true or false, \"theme\": \"<name>\"}".into())
+                }
             },
             "companion" => match value.as_object() {
                 Some(block) if !block.is_empty() => {
@@ -865,6 +875,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 Some(("terminal", "copy_on_select")) => {
                     terminal_copy_on_select(&mut settings, value)
                 }
+                Some(("terminal", "theme")) => terminal_theme(&mut settings, value),
                 Some(("companion", "enabled")) => companion_enabled(&mut settings, value),
                 Some(("companion", "push_url")) => companion_push_url(&mut settings, value),
                 _ => Err("is not a setting".into()),
@@ -889,6 +900,20 @@ fn terminal_copy_on_select(settings: &mut Settings, value: &Value) -> Result<(),
         .as_bool()
         .map(|on| settings.terminal_copy_on_select = Some(on))
         .ok_or_else(|| "must be true or false".to_string())
+}
+
+fn terminal_theme(settings: &mut Settings, value: &Value) -> Result<(), String> {
+    value
+        .as_str()
+        .and_then(daedalus_ui::TerminalTheme::from_id)
+        .map(|t| settings.terminal_theme = Some(t))
+        .ok_or_else(|| {
+            let ids: Vec<_> = daedalus_ui::TerminalTheme::ALL
+                .iter()
+                .map(|t| format!("\"{}\"", t.id()))
+                .collect();
+            format!("must be one of {}", ids.join(", "))
+        })
 }
 
 fn companion_enabled(settings: &mut Settings, value: &Value) -> Result<(), String> {
@@ -1742,6 +1767,29 @@ pub(crate) mod tests {
             let (s, problems) = parse(bad).unwrap();
             assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
             assert!(s.terminal_copy_on_select(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn terminal_theme_reads_in_either_spelling() {
+        use daedalus_ui::TerminalTheme;
+        assert_eq!(Settings::default().terminal_theme(), TerminalTheme::Tlsc);
+        for ok in [
+            r#"{"terminal": {"theme": "nord"}}"#,
+            r#"{"terminal.theme": "nord"}"#,
+        ] {
+            let (s, problems) = parse(ok).unwrap();
+            assert!(problems.is_empty(), "{ok}: {problems:?}");
+            assert_eq!(s.terminal_theme(), TerminalTheme::Nord, "{ok}");
+        }
+        for bad in [
+            r#"{"terminal": {"theme": "solarized"}}"#,
+            r#"{"terminal.theme": 3}"#,
+            r#"{"terminal": {"theme": "Nord"}}"#,
+        ] {
+            let (s, problems) = parse(bad).unwrap();
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert_eq!(s.terminal_theme(), TerminalTheme::Tlsc, "{bad}");
         }
     }
 
@@ -2651,11 +2699,12 @@ pub(crate) mod tests {
                 "theme": "dark", "window.zoom_level": 2,
                 "claude": {"hooks": false}, "companion.enabled": true,
                 "companion.push_url": "https://x",
-                "terminal": {"copy_on_select": false}}"#,
+                "terminal": {"copy_on_select": false}, "terminal.theme": "nord"}"#,
         )
         .unwrap();
-        assert_eq!(problems.len(), 6, "{problems:?}");
+        assert_eq!(problems.len(), 7, "{problems:?}");
         assert_eq!(project.terminal_copy_on_select, None);
+        assert_eq!(project.terminal_theme, None);
         assert_eq!(project.companion_enabled, None);
         assert_eq!(project.companion_push_url, None);
         assert_eq!(project.theme, None);

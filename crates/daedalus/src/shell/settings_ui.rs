@@ -304,6 +304,11 @@ impl SettingsView {
             };
             daedalus_ui::set_appearance(super::appearance::resolve(choice, window), cx);
         }
+        if SETTINGS[i].keys == ["terminal", "theme"]
+            && let Some(t) = daedalus_ui::TerminalTheme::from_id(value)
+        {
+            daedalus_ui::set_terminal_theme(t, cx);
+        }
         self.set(self.scope, i, json!(value), cx);
     }
 
