@@ -508,6 +508,76 @@ fn the_prompt_shows_a_worktree_branch() {
 }
 
 #[test]
+fn daedalus_prompt_0_in_the_daemon_environment_keeps_the_stock_prompt() {
+    let daemon = Daemon::start_with("prompt-env", &[("DAEDALUS_PROMPT", "0")]);
+    let out = run_in_pane(
+        &daemon,
+        std::path::Path::new("/tmp"),
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(!out.contains("%F{4}"), "{out}");
+}
+
+#[test]
+fn a_hostile_branch_name_is_sanitised() {
+    let daemon = Daemon::start("prompt-evil");
+    std::fs::write(daemon.home.join(".zshrc"), "setopt prompt_subst\n").unwrap();
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let pwned = daemon.home.join("pwned");
+    std::fs::write(
+        repo.join(".git/HEAD"),
+        format!("ref: refs/heads/$(touch {})%F{{1}}\n", pwned.display()),
+    )
+    .unwrap();
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("??touch?"), "{out}");
+    assert!(!out.contains("%F{1}"), "{out}");
+    assert!(!pwned.exists(), "branch name was executed");
+}
+
+#[test]
+fn a_prompt_set_after_the_first_prompt_is_kept() {
+    let daemon = Daemon::start("prompt-late");
+    let (conn, mut reader) = daemon.connect();
+    let pane = spawn_pane(&conn, &mut reader);
+    conn.send(&ClientMsg::Attach { pane }).unwrap();
+    for line in ["PROMPT='x> '", "true", r#"print -r -- "p=[$PROMPT]""#] {
+        conn.send(&ClientMsg::Input {
+            pane,
+            data: format!("{line}\r").into_bytes(),
+        })
+        .unwrap();
+    }
+    read_until(&mut reader, "p=[x> ]");
+}
+
+#[test]
+fn a_detached_head_shows_seven_characters() {
+    let daemon = Daemon::start("prompt-detached");
+    let repo = daemon.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".git/HEAD"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .unwrap();
+    let out = run_in_pane(
+        &daemon,
+        &repo,
+        r#"print -r -- "p=[$PROMPT]$((6*7))""#,
+        "]42",
+    );
+    assert!(out.contains("%F{5}0123456%f"), "{out}");
+}
+
+#[test]
 fn notices_wait_for_a_subscriber() {
     let daemon = Daemon::start("backlog");
     let (sender, _r) = daemon.connect();

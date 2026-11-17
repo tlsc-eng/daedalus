@@ -35,7 +35,7 @@ if [[ -o interactive ]]; then
       gitdir=$(<$gitdir); gitdir=${gitdir#gitdir: }
       [[ $gitdir == /* ]] || gitdir=$dir/$gitdir
     fi
-    [[ -r $gitdir/HEAD ]] || return 1
+    [[ -f $gitdir/HEAD ]] || return 1
     head=$(<$gitdir/HEAD)
     if [[ $head == 'ref: refs/heads/'* ]]; then
       REPLY=${head#ref: refs/heads/}
